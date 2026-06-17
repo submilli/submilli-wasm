@@ -1,0 +1,298 @@
+//! Instantiation: link imports, allocate the defined entities, initialize the
+//! active element/data segments, and run the start function.
+
+use crate::exec;
+use crate::extern_::{Extern, Global, Memory, Table};
+use crate::func::Func;
+use crate::instance::Instance;
+use crate::module::inner::{ConstExpr, DataMode, ElemItems, ElemMode, ImportKind};
+use crate::module::Module;
+use crate::store::{
+    FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, StoreInner, TableEntity,
+};
+use crate::trap::Trap;
+use crate::value::{GlobalType, HeapType, MemoryType, Ref, RefType, TableType, Val};
+use crate::{Error, Result};
+
+/// Index spaces built from a module's imports.
+type Imported = (Vec<Func>, Vec<Memory>, Vec<Global>, Vec<Table>);
+
+/// Instantiates `module` against `imports` (positional, matching the module's
+/// import declarations), returning the new instance handle.
+pub(crate) fn instantiate(
+    inner: &mut StoreInner,
+    module: &Module,
+    imports: &[Extern],
+) -> Result<Instance> {
+    let m = module.inner();
+    if m.imports.len() != imports.len() {
+        return Err(Error::msg("wrong number of imports"));
+    }
+
+    let (mut funcs, mut memories, mut globals, mut tables) = link_imports(inner, module, imports)?;
+    for mt in &m.memories {
+        memories.push(inner.alloc_memory(MemoryEntity::new(mt.clone())));
+    }
+    for tt in &m.tables {
+        tables.push(inner.alloc_table(TableEntity::new(tt.clone(), null_ref(tt.element()))));
+    }
+    for g in &m.globals {
+        let value = eval_const(inner, &globals, &g.init)?;
+        globals.push(inner.alloc_global(GlobalEntity {
+            value,
+            ty: g.ty.clone(),
+        }));
+    }
+
+    let instance = inner.reserve_instance();
+    for i in 0..m.functions.len() as u32 {
+        funcs.push(inner.alloc_func(FuncEntity {
+            instance,
+            func_index: m.num_imported_funcs + i,
+        }));
+    }
+
+    // Active/declared element segments are unusable by `table.init` (dropped);
+    // only passive segments remain live.
+    let dropped_elems = m
+        .elems
+        .iter()
+        .map(|e| !matches!(e.mode, ElemMode::Passive))
+        .collect();
+    let allocated = inner.alloc_instance(InstanceEntity {
+        module: module.clone(),
+        funcs: funcs.clone(),
+        memories: memories.clone(),
+        globals: globals.clone(),
+        tables: tables.clone(),
+        dropped_data: vec![false; m.datas.len()],
+        dropped_elems,
+    });
+    debug_assert_eq!(allocated.index, instance.index);
+
+    init_elems(inner, module, &funcs, &tables, &globals)?;
+    init_datas(inner, module, instance, &memories, &globals)?;
+    run_start(inner, module, &funcs)?;
+    Ok(instance)
+}
+
+fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Result<Imported> {
+    let mut spaces: Imported = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (imp, ext) in module.inner().imports.iter().zip(imports) {
+        match (&imp.kind, ext) {
+            (ImportKind::Func(t), Extern::Func(f)) => {
+                check_func(inner, module, *t, *f)?;
+                spaces.0.push(*f);
+            }
+            (ImportKind::Memory(mt), Extern::Memory(mem)) => {
+                check_memory(inner, mt, *mem)?;
+                spaces.1.push(*mem);
+            }
+            (ImportKind::Global(gt), Extern::Global(g)) => {
+                check_global(inner, gt, *g)?;
+                spaces.2.push(*g);
+            }
+            (ImportKind::Table(tt), Extern::Table(t)) => {
+                check_table(inner, tt, *t)?;
+                spaces.3.push(*t);
+            }
+            _ => return Err(Error::msg("import kind mismatch")),
+        }
+    }
+    Ok(spaces)
+}
+
+fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Result<()> {
+    let fe = inner.func(f);
+    let actual = inner
+        .instance(fe.instance)
+        .module
+        .inner()
+        .func_type(fe.func_index);
+    if module.inner().types[type_idx as usize] == *actual {
+        Ok(())
+    } else {
+        Err(Error::msg("imported function signature mismatch"))
+    }
+}
+
+fn check_memory(inner: &StoreInner, declared: &MemoryType, m: Memory) -> Result<()> {
+    let actual = &inner.memory(m).ty;
+    if limits_ok(
+        actual.minimum(),
+        actual.maximum(),
+        declared.minimum(),
+        declared.maximum(),
+    ) {
+        Ok(())
+    } else {
+        Err(Error::msg("imported memory limits mismatch"))
+    }
+}
+
+fn check_table(inner: &StoreInner, declared: &TableType, t: Table) -> Result<()> {
+    let actual = &inner.table(t).ty;
+    let ok = actual.element() == declared.element()
+        && limits_ok(
+            actual.minimum(),
+            actual.maximum(),
+            declared.minimum(),
+            declared.maximum(),
+        );
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::msg("imported table type mismatch"))
+    }
+}
+
+fn check_global(inner: &StoreInner, declared: &GlobalType, g: Global) -> Result<()> {
+    let actual = &inner.global(g).ty;
+    if actual.content() == declared.content() && actual.mutability() == declared.mutability() {
+        Ok(())
+    } else {
+        Err(Error::msg("imported global type mismatch"))
+    }
+}
+
+/// An actual `{amin, amax}` satisfies an import requiring `{imin, imax}`.
+fn limits_ok(amin: u64, amax: Option<u64>, imin: u64, imax: Option<u64>) -> bool {
+    amin >= imin && imax.is_none_or(|im| amax.is_some_and(|am| am <= im))
+}
+
+fn init_elems(
+    inner: &mut StoreInner,
+    module: &Module,
+    funcs: &[Func],
+    tables: &[Table],
+    globals: &[Global],
+) -> Result<()> {
+    for seg in &module.inner().elems {
+        let ElemMode::Active { table, offset } = &seg.mode else {
+            continue;
+        };
+        let dst = const_to_usize(eval_const(inner, globals, offset)?)?;
+        let refs = elem_refs(inner, globals, funcs, &seg.items)?;
+        let handle = tables[*table as usize];
+        let size = inner.table(handle).size() as usize;
+        if dst.checked_add(refs.len()).is_none_or(|end| end > size) {
+            return Err(Trap::TableOutOfBounds.into());
+        }
+        for (i, r) in refs.into_iter().enumerate() {
+            inner.table_mut(handle).set((dst + i) as u64, r);
+        }
+    }
+    Ok(())
+}
+
+fn elem_refs(
+    inner: &StoreInner,
+    globals: &[Global],
+    funcs: &[Func],
+    items: &ElemItems,
+) -> Result<Vec<Ref>> {
+    match items {
+        ElemItems::Funcs(idxs) => Ok(idxs
+            .iter()
+            .map(|&i| Ref::Func(Some(funcs[i as usize])))
+            .collect()),
+        ElemItems::Exprs(exprs) => exprs
+            .iter()
+            .map(|e| eval_const_ref(inner, globals, funcs, e))
+            .collect(),
+    }
+}
+
+fn init_datas(
+    inner: &mut StoreInner,
+    module: &Module,
+    instance: Instance,
+    memories: &[Memory],
+    globals: &[Global],
+) -> Result<()> {
+    for (seg_idx, seg) in module.inner().datas.iter().enumerate() {
+        let DataMode::Active { memory, offset } = &seg.mode else {
+            continue;
+        };
+        let dst = const_to_usize(eval_const(inner, globals, offset)?)?;
+        let mem = memories[*memory as usize];
+        let len = seg.bytes.len();
+        let mem_len = inner.memory(mem).bytes.len();
+        if dst.checked_add(len).is_none_or(|end| end > mem_len) {
+            return Err(Trap::MemoryOutOfBounds.into());
+        }
+        inner.memory_mut(mem).bytes[dst..dst + len].copy_from_slice(&seg.bytes);
+        inner.instance_mut(instance).dropped_data[seg_idx] = true;
+    }
+    Ok(())
+}
+
+fn run_start(inner: &mut StoreInner, module: &Module, funcs: &[Func]) -> Result<()> {
+    let Some(idx) = module.inner().start else {
+        return Ok(());
+    };
+    let (def_inst, code) = exec::resolve_func(inner, funcs[idx as usize]);
+    exec::execute(inner, def_inst, code, Vec::new()).map(|_| ())
+}
+
+fn eval_const(inner: &StoreInner, globals: &[Global], e: &ConstExpr) -> Result<Val> {
+    Ok(match e {
+        ConstExpr::I32(v) => Val::I32(*v),
+        ConstExpr::I64(v) => Val::I64(*v),
+        ConstExpr::F32(v) => Val::F32(*v),
+        ConstExpr::F64(v) => Val::F64(*v),
+        ConstExpr::RefNull(rt) => null_val(rt),
+        ConstExpr::GlobalGet(g) => inner.global(globals[*g as usize]).value,
+        ConstExpr::RefFunc(_) => return Err(Error::msg("ref.func outside element segment")),
+    })
+}
+
+fn eval_const_ref(
+    inner: &StoreInner,
+    globals: &[Global],
+    funcs: &[Func],
+    e: &ConstExpr,
+) -> Result<Ref> {
+    Ok(match e {
+        ConstExpr::RefFunc(i) => Ref::Func(Some(funcs[*i as usize])),
+        ConstExpr::RefNull(rt) => null_ref(rt),
+        ConstExpr::GlobalGet(g) => val_to_ref(inner.global(globals[*g as usize]).value)?,
+        _ => return Err(Error::msg("non-reference element expression")),
+    })
+}
+
+fn const_to_usize(v: Val) -> Result<usize> {
+    match v {
+        Val::I32(x) => Ok(x as u32 as usize),
+        Val::I64(x) => Ok(x as u64 as usize),
+        _ => Err(Error::msg("segment offset is not an integer")),
+    }
+}
+
+fn null_ref(rt: &RefType) -> Ref {
+    match rt.heap_type() {
+        HeapType::Func | HeapType::NoFunc => Ref::Func(None),
+        HeapType::Extern | HeapType::NoExtern => Ref::Extern(None),
+        HeapType::Exn | HeapType::NoExn => Ref::Exn(None),
+        _ => Ref::Any(None),
+    }
+}
+
+fn null_val(rt: &RefType) -> Val {
+    match rt.heap_type() {
+        HeapType::Func | HeapType::NoFunc => Val::FuncRef(None),
+        HeapType::Extern | HeapType::NoExtern => Val::ExternRef(None),
+        HeapType::Exn | HeapType::NoExn => Val::ExnRef(None),
+        _ => Val::AnyRef(None),
+    }
+}
+
+fn val_to_ref(v: Val) -> Result<Ref> {
+    match v {
+        Val::FuncRef(f) => Ok(Ref::Func(f)),
+        Val::ExternRef(e) => Ok(Ref::Extern(e)),
+        Val::AnyRef(a) => Ok(Ref::Any(a)),
+        Val::ExnRef(x) => Ok(Ref::Exn(x)),
+        _ => Err(Error::msg("global is not a reference")),
+    }
+}

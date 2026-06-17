@@ -1,0 +1,13 @@
+# Stable rustfmt options only (CI runs on stable `cargo fmt --check`).
+# See docs/STYLE.md.
+
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Unix"
+
+# Nightly-only niceties (uncomment if/when running `cargo +nightly fmt`):
+# imports_granularity = "Module"
+# group_imports = "StdExternalCrate"
+# wrap_comments = true
+# format_code_in_doc_comments = true

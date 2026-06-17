@@ -1,0 +1,11 @@
+# Clean-code thresholds. See docs/STYLE.md.
+# Lint *levels* live in Cargo.toml [lints.clippy]; this file tunes the
+# configurable thresholds for those lints.
+
+too-many-lines-threshold = 50          # functions over 50 lines warn (dispatch loop is #[allow]'d)
+too-many-arguments-threshold = 6       # bundle into a context struct beyond this
+cognitive-complexity-threshold = 20    # flatten with early returns / helpers
+type-complexity-threshold = 250        # alias complex types
+
+# Don't suggest changes that would break the wasmtime-compatible public API.
+avoid-breaking-exported-api = true

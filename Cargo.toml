@@ -1,0 +1,49 @@
+[package]
+name = "submilli-wasm"
+version = "0.0.0"
+edition = "2021"
+description = "A WebAssembly interpreter with a wasmtime-compatible API"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/submilli/submilli-wasm"
+
+[lib]
+name = "submilli_wasm"
+
+[features]
+default = []
+async = []
+
+[dependencies]
+wasmparser = "0.252"
+anyhow = "1.0"
+
+[dev-dependencies]
+wast = "252"
+wat = "1"
+wasmtime = "=45.0.2"
+
+[lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+too_many_lines = "warn"
+too_many_arguments = "warn"
+type_complexity = "warn"
+cognitive_complexity = "warn"
+unwrap_used = "warn"
+dbg_macro = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_lossless = "allow"
