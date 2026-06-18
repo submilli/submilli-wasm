@@ -1,7 +1,6 @@
-//! Instantiation: link imports, allocate the defined entities, initialize the
-//! active element/data segments, and run the start function.
+//! Instantiation: link imports, allocate the defined entities, and initialize the
+//! active element/data segments. (The start function is run by `Instance::new`.)
 
-use crate::exec;
 use crate::extern_::{Extern, Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
@@ -46,7 +45,7 @@ pub(crate) fn instantiate(
 
     let instance = inner.reserve_instance();
     for i in 0..m.functions.len() as u32 {
-        funcs.push(inner.alloc_func(FuncEntity {
+        funcs.push(inner.alloc_func(FuncEntity::Wasm {
             instance,
             func_index: m.num_imported_funcs + i,
         }));
@@ -72,7 +71,8 @@ pub(crate) fn instantiate(
 
     init_elems(inner, module, &funcs, &tables, &globals)?;
     init_datas(inner, module, instance, &memories, &globals)?;
-    run_start(inner, module, &funcs)?;
+    // The start function is run by `Instance::new` (it needs the typed `Store<T>`
+    // so a host-imported start can build a `Caller`).
     Ok(instance)
 }
 
@@ -103,13 +103,19 @@ fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Resu
 }
 
 fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Result<()> {
-    let fe = inner.func(f);
-    let actual = inner
-        .instance(fe.instance)
-        .module
-        .inner()
-        .func_type(fe.func_index);
-    if module.inner().types[type_idx as usize] == *actual {
+    let actual = match inner.func(f) {
+        FuncEntity::Wasm {
+            instance,
+            func_index,
+        } => inner
+            .instance(*instance)
+            .module
+            .inner()
+            .func_type(*func_index)
+            .clone(),
+        FuncEntity::Host { ty, .. } => ty.clone(),
+    };
+    if module.inner().types[type_idx as usize] == actual {
         Ok(())
     } else {
         Err(Error::msg("imported function signature mismatch"))
@@ -225,14 +231,6 @@ fn init_datas(
         inner.instance_mut(instance).dropped_data[seg_idx] = true;
     }
     Ok(())
-}
-
-fn run_start(inner: &mut StoreInner, module: &Module, funcs: &[Func]) -> Result<()> {
-    let Some(idx) = module.inner().start else {
-        return Ok(());
-    };
-    let (def_inst, code) = exec::resolve_func(inner, funcs[idx as usize]);
-    exec::execute(inner, def_inst, code, Vec::new()).map(|_| ())
 }
 
 fn eval_const(inner: &StoreInner, globals: &[Global], e: &ConstExpr) -> Result<Val> {

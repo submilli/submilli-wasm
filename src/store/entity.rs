@@ -9,7 +9,7 @@ use crate::extern_::{Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::Module;
-use crate::value::{GlobalType, MemoryType, Ref, TableType, Val};
+use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, Val};
 
 /// Size of a WebAssembly memory page, in bytes.
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
@@ -37,12 +37,13 @@ pub(crate) struct TableEntity {
     pub ty: TableType,
 }
 
-/// Runtime data backing a [`Func`](crate::Func): a defined wasm function
-/// (host functions arrive in Phase 2).
+/// Runtime data backing a [`Func`](crate::Func): either a defined wasm function
+/// (its defining instance + module-space index) or a host function (its dynamic
+/// signature + an index into the owning `Store<T>`'s typed `host_funcs`).
 #[derive(Debug)]
-pub(crate) struct FuncEntity {
-    pub instance: Instance,
-    pub func_index: u32,
+pub(crate) enum FuncEntity {
+    Wasm { instance: Instance, func_index: u32 },
+    Host { ty: FuncType, host_index: u32 },
 }
 
 /// Runtime data backing an [`Instance`](crate::Instance): its resolved index

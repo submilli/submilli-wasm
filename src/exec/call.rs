@@ -1,10 +1,10 @@
-//! `call_indirect`: table-element lookup, signature check, then a tail call.
+//! `call_indirect`: table-element lookup, signature check, then a (wasm or host) call.
 
-use super::{resolve_func, CallReq, Execution, StepOutcome};
+use super::{resolve, CallReq, Execution, ResolvedCall, StepOutcome};
 use crate::instance::Instance;
-use crate::store::StoreInner;
+use crate::store::{FuncEntity, StoreInner};
 use crate::trap::Trap;
-use crate::value::Ref;
+use crate::value::{FuncType, Ref};
 use crate::Result;
 
 impl Execution {
@@ -25,17 +25,37 @@ impl Execution {
             None => return Err(Trap::TableOutOfBounds.into()),
         };
 
-        let (def_inst, code) = resolve_func(inner, f);
         let expected = &inner.instance(instance).module.inner().types[type_idx as usize];
-        let actual = &inner.instance(def_inst).module.inner().types[code.type_idx as usize];
-        if expected != actual {
-            return Err(Trap::BadSignature.into());
+        match resolve(inner, f) {
+            ResolvedCall::Wasm(def_inst, code) => {
+                let actual = &inner.instance(def_inst).module.inner().types[code.type_idx as usize];
+                if expected != actual {
+                    return Err(Trap::BadSignature.into());
+                }
+                Ok(StepOutcome::DoCall(CallReq {
+                    return_ip,
+                    instance: def_inst,
+                    code,
+                }))
+            }
+            ResolvedCall::Host(func) => {
+                if expected != host_ty(inner, func) {
+                    return Err(Trap::BadSignature.into());
+                }
+                Ok(StepOutcome::DoHostCall {
+                    func,
+                    instance,
+                    return_ip,
+                })
+            }
         }
+    }
+}
 
-        Ok(StepOutcome::DoCall(CallReq {
-            return_ip,
-            instance: def_inst,
-            code,
-        }))
+/// The dynamic signature of a host function handle.
+fn host_ty(inner: &StoreInner, f: crate::func::Func) -> &FuncType {
+    match inner.func(f) {
+        FuncEntity::Host { ty, .. } => ty,
+        FuncEntity::Wasm { .. } => unreachable!("resolve returned Host"),
     }
 }

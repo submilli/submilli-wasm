@@ -51,10 +51,12 @@ pub struct Memory {
 
 impl Memory {
     pub fn new(mut store: impl AsContextMut, ty: MemoryType) -> Result<Memory> {
-        Ok(store
-            .as_context_mut()
-            .inner_mut()
-            .alloc_memory(MemoryEntity::new(ty)))
+        let mut ctx = store.as_context_mut();
+        let s = ctx.store_mut();
+        if !s.limiter_allows_memory(ty.minimum(), ty.maximum())? {
+            return Err(Error::msg("memory minimum size exceeds the store limit"));
+        }
+        Ok(s.inner.alloc_memory(MemoryEntity::new(ty)))
     }
 
     pub fn ty(&self, store: impl AsContext) -> MemoryType {
@@ -93,12 +95,14 @@ impl Memory {
     }
 
     pub fn grow(&self, mut store: impl AsContextMut, delta: u64) -> Result<u64> {
-        store
+        match store
             .as_context_mut()
-            .inner_mut()
-            .memory_mut(*self)
-            .grow(delta)
-            .ok_or_else(|| Error::msg("failed to grow memory"))
+            .store_mut()
+            .grow_memory(*self, delta)?
+        {
+            Some(old) => Ok(old),
+            None => Err(Error::msg("failed to grow memory")),
+        }
     }
 
     pub fn read(
@@ -201,10 +205,12 @@ pub struct Table {
 
 impl Table {
     pub fn new(mut store: impl AsContextMut, ty: TableType, init: Ref) -> Result<Table> {
-        Ok(store
-            .as_context_mut()
-            .inner_mut()
-            .alloc_table(TableEntity::new(ty, init)))
+        let mut ctx = store.as_context_mut();
+        let s = ctx.store_mut();
+        if !s.limiter_allows_table(ty.minimum(), ty.maximum())? {
+            return Err(Error::msg("table minimum size exceeds the store limit"));
+        }
+        Ok(s.inner.alloc_table(TableEntity::new(ty, init)))
     }
 
     pub fn ty(&self, store: impl AsContext) -> TableType {
@@ -233,12 +239,14 @@ impl Table {
     }
 
     pub fn grow(&self, mut store: impl AsContextMut, delta: u64, init: Ref) -> Result<u64> {
-        store
+        match store
             .as_context_mut()
-            .inner_mut()
-            .table_mut(*self)
-            .grow(delta, init)
-            .ok_or_else(|| Error::msg("failed to grow table"))
+            .store_mut()
+            .grow_table(*self, delta, init)?
+        {
+            Some(old) => Ok(old),
+            None => Err(Error::msg("failed to grow table")),
+        }
     }
 
     pub fn fill(&self, mut store: impl AsContextMut, dst: u64, val: Ref, len: u64) -> Result<()> {

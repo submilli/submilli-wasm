@@ -47,6 +47,10 @@ pub(crate) struct StoreInner {
     tables: Arena<TableEntity>,
     globals: Arena<GlobalEntity>,
     instances: Arena<InstanceEntity>,
+    /// Remaining fuel (meaningful only when `engine.consume_fuel()`).
+    fuel: u64,
+    /// Absolute epoch value at/after which execution interrupts (`u64::MAX` = none).
+    epoch_deadline: u64,
 }
 
 impl StoreInner {
@@ -58,11 +62,40 @@ impl StoreInner {
             tables: Arena::default(),
             globals: Arena::default(),
             instances: Arena::default(),
+            fuel: 0,
+            epoch_deadline: u64::MAX,
         }
     }
 
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub(crate) fn fuel(&self) -> u64 {
+        self.fuel
+    }
+
+    pub(crate) fn set_fuel(&mut self, fuel: u64) {
+        self.fuel = fuel;
+    }
+
+    /// Charges one unit of fuel; returns false (without underflowing) if empty.
+    pub(crate) fn try_consume_fuel(&mut self) -> bool {
+        if self.fuel == 0 {
+            false
+        } else {
+            self.fuel -= 1;
+            true
+        }
+    }
+
+    pub(crate) fn set_epoch_deadline(&mut self, deadline: u64) {
+        self.epoch_deadline = deadline;
+    }
+
+    /// True once the engine's epoch has reached this store's deadline.
+    pub(crate) fn epoch_deadline_reached(&self) -> bool {
+        self.engine.current_epoch() >= self.epoch_deadline
     }
 
     pub(crate) fn alloc_func(&mut self, entity: FuncEntity) -> Func {
@@ -135,6 +168,18 @@ impl StoreInner {
 
     pub(crate) fn instance(&self, handle: Instance) -> &InstanceEntity {
         self.instances.get(handle.index)
+    }
+
+    pub(crate) fn memory_count(&self) -> usize {
+        self.memories.len() as usize
+    }
+
+    pub(crate) fn table_count(&self) -> usize {
+        self.tables.len() as usize
+    }
+
+    pub(crate) fn instance_count(&self) -> usize {
+        self.instances.len() as usize
     }
 
     pub(crate) fn instance_mut(&mut self, handle: Instance) -> &mut InstanceEntity {

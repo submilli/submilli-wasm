@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use super::execute;
+use super::host;
 use crate::engine::Engine;
 use crate::instance::Instance;
 use crate::module::compile::{translate_function, CompileCtx};
 use crate::module::Module;
-use crate::store::StoreInner;
+use crate::store::Store;
 use crate::trap::Trap;
 use crate::value::{FuncType, Val, ValType};
 use crate::Result;
@@ -31,9 +31,9 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
             code = Some(translate_function(&ctx, 0, &body)?);
         }
     }
-    let mut inner = StoreInner::new(engine);
-    execute(
-        &mut inner,
+    let mut store = Store::new(&engine, ());
+    host::execute(
+        &mut store,
         Instance { index: 0 },
         Arc::new(code.unwrap()),
         args,

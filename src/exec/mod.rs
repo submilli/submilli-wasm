@@ -9,6 +9,7 @@ mod arith;
 mod call;
 mod convert;
 mod frame;
+pub(crate) mod host;
 mod memory;
 mod numeric;
 mod table;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::op::{BranchTarget, CompiledFunc, Op};
-use crate::store::StoreInner;
+use crate::store::{FuncEntity, StoreInner};
 use crate::trap::Trap;
 use crate::value::Val;
 use crate::Result;
@@ -32,31 +33,46 @@ struct Execution {
     frames: Vec<Frame>,
 }
 
+/// Why [`Execution::run`] returned: either the call finished or it suspended on a
+/// host function the (generic) driver in [`host`] must invoke.
+pub(crate) enum Outcome {
+    Finished,
+    HostCall {
+        func: Func,
+        instance: Instance,
+    },
+    EpochDeadline,
+    Grow {
+        memory: crate::extern_::Memory,
+        delta: u64,
+    },
+}
+
 enum StepOutcome {
     Advance(u32),
     DoCall(CallReq),
+    DoHostCall {
+        func: Func,
+        instance: Instance,
+        return_ip: u32,
+    },
+    DoGrow {
+        memory: crate::extern_::Memory,
+        delta: u64,
+        return_ip: u32,
+    },
+}
+
+/// A resolved callee: a wasm body to push a frame for, or a host func to suspend on.
+enum ResolvedCall {
+    Wasm(Instance, Arc<CompiledFunc>),
+    Host(Func),
 }
 
 struct CallReq {
     return_ip: u32,
     instance: Instance,
     code: Arc<CompiledFunc>,
-}
-
-/// Runs `code` (a function of `instance`) with `args`, returning its results.
-pub(crate) fn execute(
-    inner: &mut StoreInner,
-    instance: Instance,
-    code: Arc<CompiledFunc>,
-    args: Vec<Val>,
-) -> Result<Vec<Val>> {
-    let mut exec = Execution {
-        values: args,
-        frames: Vec::new(),
-    };
-    exec.push_call(instance, code);
-    exec.run(inner)?;
-    Ok(exec.values)
 }
 
 impl Execution {
@@ -114,8 +130,11 @@ impl Execution {
         self.frames.is_empty()
     }
 
-    fn run(&mut self, inner: &mut StoreInner) -> Result<()> {
+    #[allow(clippy::too_many_lines)] // the resumable dispatch loop; arms are short
+    fn run(&mut self, inner: &mut StoreInner) -> Result<Outcome> {
         let stack_limit = inner.engine().max_wasm_stack();
+        let fuel_enabled = inner.engine().consume_fuel();
+        let epoch_enabled = inner.engine().epoch_interruption();
         let frame = self.frames.last().expect("no initial frame");
         let mut code = frame.code.clone();
         let mut ip = frame.ip;
@@ -124,7 +143,7 @@ impl Execution {
         loop {
             if ip as usize >= code.ops.len() {
                 if self.do_return(code.n_results) {
-                    return Ok(());
+                    return Ok(Outcome::Finished);
                 }
                 let f = self.frames.last().expect("caller frame");
                 code = f.code.clone();
@@ -132,6 +151,13 @@ impl Execution {
                 base = f.locals_base;
                 instance = f.instance;
                 continue;
+            }
+            if fuel_enabled && !inner.try_consume_fuel() {
+                return Err(Trap::OutOfFuel.into());
+            }
+            if epoch_enabled && inner.epoch_deadline_reached() {
+                self.frames.last_mut().expect("current frame").ip = ip;
+                return Ok(Outcome::EpochDeadline);
             }
             match self.step(inner, &code, ip, base, instance)? {
                 StepOutcome::Advance(next) => ip = next,
@@ -145,6 +171,22 @@ impl Execution {
                     ip = 0;
                     base = self.frames.last().expect("callee frame").locals_base;
                     instance = req.instance;
+                }
+                StepOutcome::DoHostCall {
+                    func,
+                    instance,
+                    return_ip,
+                } => {
+                    self.frames.last_mut().expect("caller frame").ip = return_ip;
+                    return Ok(Outcome::HostCall { func, instance });
+                }
+                StepOutcome::DoGrow {
+                    memory,
+                    delta,
+                    return_ip,
+                } => {
+                    self.frames.last_mut().expect("caller frame").ip = return_ip;
+                    return Ok(Outcome::Grow { memory, delta });
                 }
             }
         }
@@ -221,41 +263,54 @@ impl Execution {
                 return Ok(StepOutcome::Advance(t.ip));
             }
             Op::Call(f) => {
-                let (callee_instance, callee_code) = self.resolve_call(inner, instance, *f);
-                return Ok(StepOutcome::DoCall(CallReq {
-                    return_ip: next,
-                    instance: callee_instance,
-                    code: callee_code,
-                }));
+                let callee = inner.instance(instance).funcs[*f as usize];
+                return Ok(match resolve(inner, callee) {
+                    ResolvedCall::Wasm(callee_instance, code) => StepOutcome::DoCall(CallReq {
+                        return_ip: next,
+                        instance: callee_instance,
+                        code,
+                    }),
+                    ResolvedCall::Host(func) => StepOutcome::DoHostCall {
+                        func,
+                        instance,
+                        return_ip: next,
+                    },
+                });
             }
             Op::CallIndirect { type_idx, table } => {
                 return self.do_call_indirect(inner, instance, *type_idx, *table, next)
+            }
+            Op::MemoryGrow => {
+                // Routed through the driver so the (T-generic) limiter is consulted.
+                let memory = inner.instance(instance).memories[0];
+                let delta = u64::from(self.pop_i32() as u32);
+                return Ok(StepOutcome::DoGrow {
+                    memory,
+                    delta,
+                    return_ip: next,
+                });
             }
             other => self.exec_numeric(inner, other, instance)?,
         }
         Ok(StepOutcome::Advance(next))
     }
-
-    fn resolve_call(
-        &self,
-        inner: &StoreInner,
-        instance: Instance,
-        func_idx: u32,
-    ) -> (Instance, Arc<CompiledFunc>) {
-        let f = inner.instance(instance).funcs[func_idx as usize];
-        resolve_func(inner, f)
-    }
 }
 
-/// Follows a function handle to its defining instance and compiled body. Imported
-/// functions resolve transparently: the handle already points at the defining
-/// instance's `FuncEntity`.
-pub(crate) fn resolve_func(inner: &StoreInner, f: Func) -> (Instance, Arc<CompiledFunc>) {
-    let fe = inner.func(f);
-    let def_inst = fe.instance;
-    let func_index = fe.func_index;
-    let module = inner.instance(def_inst).module.clone();
-    (def_inst, module.inner().compiled(func_index))
+/// Resolves a function handle to a wasm body (defining instance + compiled code)
+/// or a host func. Imported functions resolve transparently — the handle already
+/// points at the defining instance's `FuncEntity`.
+fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
+    match inner.func(f) {
+        FuncEntity::Wasm {
+            instance,
+            func_index,
+        } => {
+            let def_inst = *instance;
+            let module = inner.instance(def_inst).module.clone();
+            ResolvedCall::Wasm(def_inst, module.inner().compiled(*func_index))
+        }
+        FuncEntity::Host { .. } => ResolvedCall::Host(f),
+    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,33 @@ use crate::func::{Func, TypedFunc, WasmParams, WasmResults};
 use crate::module::inner::ExportKind;
 use crate::module::Module;
 use crate::store::{AsContextMut, StoreInner};
-use crate::Result;
+use crate::{Error, Result};
+
+/// Rejects instantiation if it would push the store past the limiter's entity caps.
+fn check_limits<T: 'static>(
+    store: &mut impl AsContextMut<Data = T>,
+    module: &Module,
+) -> Result<()> {
+    let mut ctx = store.as_context_mut();
+    let s = ctx.store_mut();
+    let m = module.inner();
+    if let Some(max) = s.limiter_instances() {
+        if s.inner.instance_count() + 1 > max {
+            return Err(Error::msg("instance count exceeds the store limit"));
+        }
+    }
+    if let Some(max) = s.limiter_memories() {
+        if s.inner.memory_count() + m.memories.len() > max {
+            return Err(Error::msg("memory count exceeds the store limit"));
+        }
+    }
+    if let Some(max) = s.limiter_tables() {
+        if s.inner.table_count() + m.tables.len() > max {
+            return Err(Error::msg("table count exceeds the store limit"));
+        }
+    }
+    Ok(())
+}
 
 /// An instantiated WebAssembly module. Lightweight, store-bound handle.
 #[derive(Copy, Clone, Debug)]
@@ -25,8 +51,15 @@ impl Instance {
         module: &Module,
         imports: &[Extern],
     ) -> Result<Instance> {
-        let inner = store.as_context_mut().into_inner_mut();
-        init::instantiate(inner, module, imports)
+        check_limits(&mut store, module)?;
+        let instance = init::instantiate(store.as_context_mut().into_inner_mut(), module, imports)?;
+        // The start function runs before any export is callable; a trap aborts
+        // instantiation. Routed through `Func::call` so it handles wasm/host starts.
+        if let Some(start_idx) = module.inner().start {
+            let func = store.as_context_mut().inner().instance(instance).funcs[start_idx as usize];
+            func.call(&mut store, &[], &mut [])?;
+        }
+        Ok(instance)
     }
 
     pub fn get_func(&self, mut store: impl AsContextMut, name: &str) -> Option<Func> {
@@ -77,7 +110,7 @@ impl Instance {
     }
 
     /// Resolves a named export to its store handle via the instance's index spaces.
-    fn export(self, inner: &StoreInner, name: &str) -> Option<Extern> {
+    pub(crate) fn export(self, inner: &StoreInner, name: &str) -> Option<Extern> {
         let entity = inner.instance(self);
         let export = entity
             .module

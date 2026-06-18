@@ -77,6 +77,11 @@ impl<'a, T: 'static> StoreContextMut<'a, T> {
         &mut self.0.inner
     }
 
+    /// The underlying `Store<T>` (for host-function storage + the generic driver).
+    pub(crate) fn store_mut(&mut self) -> &mut Store<T> {
+        self.0
+    }
+
     /// Consumes the context to yield the full-`'a` mutable borrow (for `Memory::data_mut`).
     pub(crate) fn into_inner_mut(self) -> &'a mut StoreInner {
         &mut self.0.inner

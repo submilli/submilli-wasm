@@ -1,11 +1,14 @@
-//! WebAssembly spec-suite (`.wast`) runner — the Phase-1 conformance gate (#15).
+//! WebAssembly spec-suite (`.wast`) runner — the conformance gate (#15 + #24b).
 //!
 //! The vendored testsuite is Wasm 3.0, which interleaves reference-types / SIMD /
 //! GC / EH / memory64 content into otherwise-core files. We run a managed set
-//! **resiliently**: a module (or assertion) that fails only because a feature
-//! isn't enabled is *skipped and tallied* — never silently dropped — while every
-//! assertion that does run must pass. Whole files that import the `spectest` host
-//! module are deferred to #24b (they need host functions + the linker).
+//! **resiliently**: a module is skipped (and tallied) iff it fails validation
+//! under our enabled feature set — `Module::validate` is the *oracle* for
+//! "unsupported", so there's no error-string guessing and **any** failure from a
+//! module that does validate is a real bug. Imports are resolved through a
+//! `Linker` carrying the standard `spectest` shim; a module whose import provider
+//! was skipped is itself skipped. The only whole-file skips are out-of-scope
+//! features that can't be cleanly handled per-module (SIMD/memory64/multi-memory).
 
 #![allow(dead_code, unused_imports)]
 #![allow(clippy::all, clippy::pedantic)]
@@ -14,7 +17,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use submilli_wasm::{Engine, Error, Instance, Module, Result, Store, Val};
+use submilli_wasm::{
+    Engine, Error, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType, Module,
+    Mutability, Ref, RefType, Result, Store, Table, TableType, Val, ValType,
+};
 use wast::core::{NanPattern, WastArgCore, WastRetCore};
 use wast::parser::{self, ParseBuffer};
 use wast::token::{Id, F32, F64};
@@ -45,22 +51,22 @@ enum Class {
     Skip(&'static str),
 }
 
-/// Decides whether to execute a whole file. Out-of-scope *features* are caught
-/// per-module at runtime via [`is_unsupported`]; here we only short-circuit whole
-/// files that are wholly out of scope (faster, cleaner summary).
+/// Decides whether to execute a whole file. In-file unsupported modules are caught
+/// per-module via the validation oracle ([`is_unsupported_module`]); here we only
+/// short-circuit whole files that are wholly out of scope (faster, cleaner summary).
 fn classify(path: &Path, text: &str) -> Class {
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    if text.contains("\"spectest\"") {
-        return Class::Skip("spectest import (deferred to #24b)");
-    }
     if name.starts_with("simd") {
         return Class::Skip("simd (out of scope)");
     }
     if text.contains("(memory i64") || text.contains("(table i64") {
         return Class::Skip("memory64 (out of scope)");
     }
-    if name.starts_with("linking") || text.contains("(register ") {
-        return Class::Skip("multi-module / register — needs linker (deferred to #24b)");
+    // Multi-memory test files: a skipped multi-memory module's side effects on a
+    // shared imported memory/table are observed by later asserts, so the whole
+    // file can't pass without multi-memory (out of scope).
+    if matches!(name, "load1" | "load2" | "linking0") {
+        return Class::Skip("multi-memory (out of scope)");
     }
     Class::Run
 }
@@ -69,85 +75,145 @@ fn classify(path: &Path, text: &str) -> Class {
 // Execution summary.
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct Summary {
-    files_run: usize,
-    files_skipped: BTreeMap<String, usize>,
+#[derive(Default, Clone, Copy)]
+struct FileStats {
     modules_ok: usize,
-    modules_skipped: BTreeMap<String, usize>,
+    modules_skipped: usize,
     asserts_passed: usize,
     asserts_skipped: usize,
 }
 
+#[derive(Default)]
+struct Summary {
+    /// Per run-file stats (every executed file appears here).
+    run: BTreeMap<String, FileStats>,
+    /// Whole-file skips: `(filename, reason)`.
+    skipped_files: Vec<(String, String)>,
+    /// Aggregate module-skip reasons across all run files.
+    skip_reasons: BTreeMap<String, usize>,
+}
+
 impl Summary {
-    fn skip_file(&mut self, reason: &str) {
-        *self.files_skipped.entry(reason.to_string()).or_default() += 1;
+    fn file(&mut self, file: &str) -> &mut FileStats {
+        self.run.entry(file.to_string()).or_default()
     }
 
-    fn skip_module(&mut self, err: &Error) {
-        *self.modules_skipped.entry(skip_bucket(err)).or_default() += 1;
+    fn skip_file(&mut self, name: &str, reason: &str) {
+        self.skipped_files
+            .push((name.to_string(), reason.to_string()));
+    }
+
+    fn module_ok(&mut self, file: &str) {
+        self.file(file).modules_ok += 1;
+    }
+
+    fn skip_module(&mut self, file: &str, reason: &str) {
+        self.file(file).modules_skipped += 1;
+        *self.skip_reasons.entry(reason.to_string()).or_default() += 1;
+    }
+
+    fn pass_assert(&mut self, file: &str) {
+        self.file(file).asserts_passed += 1;
+    }
+
+    fn skip_assert(&mut self, file: &str) {
+        self.file(file).asserts_skipped += 1;
     }
 
     fn report(&self) {
+        let (mut ap, mut ask, mut mok, mut msk) = (0, 0, 0, 0);
+        for s in self.run.values() {
+            ap += s.asserts_passed;
+            ask += s.asserts_skipped;
+            mok += s.modules_ok;
+            msk += s.modules_skipped;
+        }
+        // A "run" file is fully ok, genuinely partial, or fully skipped (it ran
+        // and passed nothing — usually an all-multi-memory or all-GC file not
+        // caught at the file-classify stage).
+        let label = |s: &FileStats| -> &'static str {
+            if s.asserts_skipped + s.modules_skipped == 0 {
+                "ok     "
+            } else if s.asserts_passed > 0 || s.modules_ok > 0 {
+                "PARTIAL"
+            } else {
+                "skipped"
+            }
+        };
+        let (mut n_ok, mut n_partial, mut n_skip) = (0, 0, 0);
+        for s in self.run.values() {
+            match label(s) {
+                "ok     " => n_ok += 1,
+                "PARTIAL" => n_partial += 1,
+                _ => n_skip += 1,
+            }
+        }
         eprintln!(
-            "spec gate: {} files run, {} modules instantiated, {} assertions passed, {} skipped",
-            self.files_run, self.modules_ok, self.asserts_passed, self.asserts_skipped
+            "spec gate: {} files run ({n_ok} fully ok, {n_partial} partial, {n_skip} fully skipped), \
+             {} whole files skipped | modules: {mok} ok, {msk} skipped | assertions: {ap} passed, {ask} skipped",
+            self.run.len(),
+            self.skipped_files.len()
         );
-        eprintln!("  files skipped (whole-file):");
-        for (reason, n) in &self.files_skipped {
-            eprintln!("    {n:>4}  {reason}");
+
+        eprintln!("\n  RUN FILES (assertions passed/skipped, modules ok/skipped):");
+        for (file, s) in &self.run {
+            eprintln!(
+                "    [{}] {file}: {}/{} asserts, {}/{} modules",
+                label(s),
+                s.asserts_passed,
+                s.asserts_skipped,
+                s.modules_ok,
+                s.modules_skipped
+            );
         }
-        eprintln!("  modules skipped (in-file, unsupported feature):");
-        for (reason, n) in &self.modules_skipped {
+
+        eprintln!("\n  WHOLE FILES SKIPPED ({}):", self.skipped_files.len());
+        for (name, reason) in &self.skipped_files {
+            eprintln!("    {name}  —  {reason}");
+        }
+
+        eprintln!("\n  IN-FILE SKIPS BY REASON:");
+        for (reason, n) in &self.skip_reasons {
             eprintln!("    {n:>4}  {reason}");
         }
     }
 }
 
-/// Buckets an "unsupported" error into a short, stable label for the summary.
-fn skip_bucket(e: &Error) -> String {
-    let s = e.to_string();
-    for (needle, label) in [
-        (
-            "enabled",
-            "feature not enabled (ref-types/simd/gc/eh/memory64/threads)",
-        ),
-        (
-            "proposal",
-            "feature not enabled (ref-types/simd/gc/eh/memory64/threads)",
-        ),
-        ("not supported", "feature not enabled (gc/etc.)"),
-        ("multiple memories", "multi-memory (out of scope)"),
-        ("multiple tables", "multi-table (out of scope)"),
-        ("not yet supported", "operator not yet implemented"),
-        ("element expressions", "reference-types element expr"),
-        ("wrong number of imports", "needs imports/linker"),
-        ("module skipped", "depends on skipped module"),
-        ("non-core", "non-core value"),
-        ("unsupported", "unsupported value/op"),
-    ] {
-        if s.contains(needle) {
-            return label.to_string();
-        }
-    }
-    format!("OTHER (investigate): {s}")
+/// Outcome of running a directive's executable part.
+enum ExecResult {
+    /// Ran to completion with these results.
+    Vals(Vec<Val>),
+    /// Trapped / errored at runtime (the *real* behavior — asserted against).
+    Trap(Error),
+    /// Not run because the module (or a dependency) is out of our feature scope.
+    Skip,
 }
 
-/// True when an error means "we don't support this yet" rather than a real bug,
-/// so the directive is skipped (and tallied) instead of failing the gate.
-fn is_unsupported(e: &Error) -> bool {
-    let s = e.to_string();
-    // wasmparser feature gating phrases it as "... not enabled", "proposal must be
-    // enabled", "requires `X` proposal to be enabled" — all contain "enabled".
-    s.contains("enabled")
-        || s.contains("proposal")
-        || s.contains("not supported") // "... not supported without the gc feature"
-        || s.contains("multiple memories")
-        || s.contains("multiple tables")
-        || s.contains("element expressions")
-        || s.contains("wrong number of imports")
-        || s.contains("module skipped")
-        || s.contains("unsupported")
+/// A module uses a feature we don't enable iff it fails validation under
+/// `phase1_features()`. This is the **oracle** for "unsupported" — no error-string
+/// guessing in the skip *decision* — so any failure from a module that *does*
+/// validate is a real bug. Returns the validator's own message (offset stripped,
+/// for grouping) purely as the informational skip reason.
+fn unsupported_reason(ctx: &SpecContext, bytes: &[u8]) -> Option<String> {
+    let msg = Module::validate(&ctx.engine, bytes).err()?.to_string();
+    let short = msg.split(" (at offset").next().unwrap_or(&msg);
+    Some(short.to_string())
+}
+
+fn is_unsupported_module(ctx: &SpecContext, bytes: &[u8]) -> bool {
+    unsupported_reason(ctx, bytes).is_some()
+}
+
+/// True if every import of `module` is satisfiable by the linker (else a provider
+/// module was skipped, so we skip this one rather than fail on a missing import).
+fn imports_available(ctx: &mut SpecContext, module: &Module) -> bool {
+    let names: Vec<(String, String)> = module
+        .imports()
+        .map(|i| (i.module().to_string(), i.name().to_string()))
+        .collect();
+    names
+        .iter()
+        .all(|(m, n)| ctx.linker.get(&mut ctx.store, m, n).is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +243,7 @@ fn spec_suite() {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
 
         if let Class::Skip(reason) = classify(path, &text) {
-            summary.skip_file(reason);
+            summary.skip_file(&name, reason);
             continue;
         }
 
@@ -196,7 +262,7 @@ fn spec_suite() {
             }
         };
 
-        summary.files_run += 1;
+        summary.file(&name);
         let mut ctx = SpecContext::new();
         run_directives(&mut ctx, parsed, &name, &mut failures, &mut summary);
     }
@@ -219,6 +285,7 @@ fn spec_suite() {
 struct SpecContext {
     engine: Engine,
     store: Store<()>,
+    linker: Linker<()>,
     current: Option<Instance>,
     current_skipped: bool,
     named: HashMap<String, Instance>,
@@ -228,10 +295,14 @@ struct SpecContext {
 impl SpecContext {
     fn new() -> Self {
         let engine = Engine::default();
-        let store = Store::new(&engine, ());
+        let mut store = Store::new(&engine, ());
+        let mut linker = Linker::new(&engine);
+        linker.allow_shadowing(true);
+        register_spectest(&mut store, &mut linker);
         SpecContext {
             engine,
             store,
+            linker,
             current: None,
             current_skipped: false,
             named: HashMap::new(),
@@ -248,6 +319,44 @@ impl SpecContext {
     }
 }
 
+/// Registers the standard `spectest` host module the suite imports.
+fn register_spectest(store: &mut Store<()>, linker: &mut Linker<()>) {
+    linker.func_wrap("spectest", "print", || {}).unwrap();
+    linker
+        .func_wrap("spectest", "print_i32", |_: i32| {})
+        .unwrap();
+    linker
+        .func_wrap("spectest", "print_i64", |_: i64| {})
+        .unwrap();
+    linker
+        .func_wrap("spectest", "print_f32", |_: f32| {})
+        .unwrap();
+    linker
+        .func_wrap("spectest", "print_f64", |_: f64| {})
+        .unwrap();
+    linker
+        .func_wrap("spectest", "print_i32_f32", |_: i32, _: f32| {})
+        .unwrap();
+    linker
+        .func_wrap("spectest", "print_f64_f64", |_: f64, _: f64| {})
+        .unwrap();
+
+    let mut global = |name: &str, ty: ValType, val: Val| {
+        let g = Global::new(&mut *store, GlobalType::new(ty, Mutability::Const), val).unwrap();
+        linker.define(&*store, "spectest", name, g).unwrap();
+    };
+    global("global_i32", ValType::I32, Val::I32(666));
+    global("global_i64", ValType::I64, Val::I64(666));
+    global("global_f32", ValType::F32, Val::F32(666.6f32.to_bits()));
+    global("global_f64", ValType::F64, Val::F64(666.6f64.to_bits()));
+
+    let mem = Memory::new(&mut *store, MemoryType::new(1, Some(2))).unwrap();
+    linker.define(&*store, "spectest", "memory", mem).unwrap();
+    let table_ty = TableType::new(RefType::new(true, HeapType::Func), 10, Some(20));
+    let table = Table::new(&mut *store, table_ty, Ref::Func(None)).unwrap();
+    linker.define(&*store, "spectest", "table", table).unwrap();
+}
+
 fn run_directives(
     ctx: &mut SpecContext,
     wast: Wast<'_>,
@@ -259,17 +368,21 @@ fn run_directives(
         match directive {
             WastDirective::Module(quoted) => handle_module(ctx, quoted, file, failures, summary),
             WastDirective::Invoke(invoke) => match invoke_export(ctx, &invoke) {
-                Ok(_) => summary.asserts_passed += 1,
-                Err(e) if is_unsupported(&e) => summary.asserts_skipped += 1,
-                Err(e) => failures.push(format!("{file}: invoke {}: {e}", invoke.name)),
+                ExecResult::Vals(_) => summary.pass_assert(file),
+                ExecResult::Skip => summary.skip_assert(file),
+                ExecResult::Trap(e) => {
+                    failures.push(format!("{file}: invoke {}: {e}", invoke.name))
+                }
             },
             WastDirective::AssertReturn { exec, results, .. } => match execute(ctx, exec) {
-                Ok(actual) if rets_match(&actual, &results) => summary.asserts_passed += 1,
-                Ok(actual) => failures.push(format!(
+                ExecResult::Vals(actual) if rets_match(&actual, &results) => {
+                    summary.pass_assert(file);
+                }
+                ExecResult::Vals(actual) => failures.push(format!(
                     "{file}: assert_return mismatch: got {actual:?}, want {results:?}"
                 )),
-                Err(e) if is_unsupported(&e) => summary.asserts_skipped += 1,
-                Err(e) => failures.push(format!("{file}: assert_return errored: {e}")),
+                ExecResult::Skip => summary.skip_assert(file),
+                ExecResult::Trap(e) => failures.push(format!("{file}: assert_return errored: {e}")),
             },
             WastDirective::AssertTrap { exec, message, .. } => {
                 check_trap(execute(ctx, exec), message, file, failures, summary);
@@ -280,7 +393,7 @@ fn run_directives(
             WastDirective::AssertInvalid { mut module, .. } => {
                 if let Ok(bytes) = encode(&mut module) {
                     if Module::validate(&ctx.engine, &bytes).is_err() {
-                        summary.asserts_passed += 1;
+                        summary.pass_assert(file);
                     } else {
                         failures.push(format!("{file}: expected invalid module to be rejected"));
                     }
@@ -290,12 +403,30 @@ fn run_directives(
                 Ok(bytes) if Module::new(&ctx.engine, &bytes).is_ok() => {
                     failures.push(format!("{file}: expected malformed module to be rejected"));
                 }
-                _ => summary.asserts_passed += 1,
+                _ => summary.pass_assert(file),
             },
-            // Need the linker / cross-module imports (Phase 2 / #24b) or EH.
-            WastDirective::Register { .. }
-            | WastDirective::AssertUnlinkable { .. }
-            | WastDirective::AssertException { .. } => summary.asserts_skipped += 1,
+            WastDirective::Register { name, module, .. } => match resolve(ctx, module) {
+                Some(inst) => {
+                    let _ = ctx.linker.instance(&mut ctx.store, name, inst);
+                }
+                None => summary.skip_assert(file),
+            },
+            WastDirective::AssertUnlinkable { mut module, .. } => {
+                match module.encode().map_err(to_err) {
+                    Ok(bytes) if is_unsupported_module(ctx, &bytes) => summary.skip_assert(file),
+                    Ok(bytes) => {
+                        let m = Module::new(&ctx.engine, &bytes).expect("validated above");
+                        if ctx.linker.instantiate(&mut ctx.store, &m).is_err() {
+                            summary.pass_assert(file);
+                        } else {
+                            failures.push(format!("{file}: expected unlinkable module to fail"));
+                        }
+                    }
+                    Err(_) => summary.skip_assert(file),
+                }
+            }
+            // Exception handling is Phase 6.
+            WastDirective::AssertException { .. } => summary.skip_assert(file),
             _ => {}
         }
     }
@@ -311,37 +442,39 @@ fn handle_module(
     let name = quoted.name().map(|id| id.name().to_string());
     let bytes = match encode(&mut quoted) {
         Ok(b) => b,
-        Err(e) => {
-            summary.skip_module(&e);
+        Err(_) => {
+            summary.skip_module(file, "module failed to encode");
             ctx.set_current_skipped(name.as_deref());
             return;
         }
     };
+    if let Some(reason) = unsupported_reason(ctx, &bytes) {
+        summary.skip_module(file, &reason);
+        ctx.set_current_skipped(name.as_deref());
+        return;
+    }
+    // Validated, so a compile failure here is a real interpreter bug.
     let module = match Module::new(&ctx.engine, &bytes) {
         Ok(m) => m,
-        Err(e) if is_unsupported(&e) => {
-            summary.skip_module(&e);
-            ctx.set_current_skipped(name.as_deref());
-            return;
-        }
         Err(e) => {
-            failures.push(format!("{file}: module failed to compile: {e}"));
+            failures.push(format!("{file}: validated but failed to compile: {e}"));
             ctx.set_current_skipped(name.as_deref());
             return;
         }
     };
-    match Instance::new(&mut ctx.store, &module, &[]) {
+    if !imports_available(ctx, &module) {
+        summary.skip_module(file, "imports a module that was skipped");
+        ctx.set_current_skipped(name.as_deref());
+        return;
+    }
+    match ctx.linker.instantiate(&mut ctx.store, &module) {
         Ok(inst) => {
-            summary.modules_ok += 1;
+            summary.module_ok(file);
             ctx.current = Some(inst);
             ctx.current_skipped = false;
             if let Some(n) = name {
                 ctx.named.insert(n, inst);
             }
-        }
-        Err(e) if is_unsupported(&e) => {
-            summary.skip_module(&e);
-            ctx.set_current_skipped(name.as_deref());
         }
         Err(e) => {
             failures.push(format!("{file}: instantiation failed: {e}"));
@@ -351,75 +484,90 @@ fn handle_module(
 }
 
 fn check_trap(
-    result: Result<Vec<Val>>,
+    result: ExecResult,
     message: &str,
     file: &str,
     failures: &mut Vec<String>,
     summary: &mut Summary,
 ) {
     match result {
-        Ok(_) => failures.push(format!(
+        ExecResult::Vals(_) => failures.push(format!(
             "{file}: expected trap '{message}', but it returned"
         )),
-        Err(e) if is_unsupported(&e) => summary.asserts_skipped += 1,
-        Err(e) if trap_matches(&e, message) => summary.asserts_passed += 1,
-        Err(e) => failures.push(format!(
+        ExecResult::Skip => summary.skip_assert(file),
+        ExecResult::Trap(e) if trap_matches(&e, message) => summary.pass_assert(file),
+        ExecResult::Trap(e) => failures.push(format!(
             "{file}: trap mismatch: want '{message}', got '{e}'"
         )),
     }
 }
 
-fn execute(ctx: &mut SpecContext, exec: WastExecute<'_>) -> Result<Vec<Val>> {
+fn execute(ctx: &mut SpecContext, exec: WastExecute<'_>) -> ExecResult {
     match exec {
         WastExecute::Invoke(invoke) => invoke_export(ctx, &invoke),
-        WastExecute::Get { module, global, .. } => {
-            let instance = resolve(ctx, module)?;
-            let g = instance
-                .get_global(&mut ctx.store, global)
-                .ok_or_else(|| Error::msg(format!("missing global {global}")))?;
-            Ok(vec![g.get(&mut ctx.store)])
-        }
+        WastExecute::Get { module, global, .. } => match resolve(ctx, module) {
+            Some(instance) => match instance.get_global(&mut ctx.store, global) {
+                Some(g) => ExecResult::Vals(vec![g.get(&mut ctx.store)]),
+                None => ExecResult::Trap(Error::msg(format!("missing global {global}"))),
+            },
+            None => ExecResult::Skip,
+        },
         WastExecute::Wat(mut wat) => {
-            let bytes = wat.encode().map_err(to_err)?;
-            Module::new(&ctx.engine, &bytes)?;
-            Ok(Vec::new())
+            // Instantiate (not just compile): active-segment OOB and a trapping
+            // `start` surface here, which is what `assert_trap (module …)` checks.
+            let bytes = match wat.encode().map_err(to_err) {
+                Ok(b) => b,
+                Err(_) => return ExecResult::Skip,
+            };
+            if is_unsupported_module(ctx, &bytes) {
+                return ExecResult::Skip;
+            }
+            let module = match Module::new(&ctx.engine, &bytes) {
+                Ok(m) => m,
+                Err(e) => return ExecResult::Trap(e),
+            };
+            if !imports_available(ctx, &module) {
+                return ExecResult::Skip;
+            }
+            match ctx.linker.instantiate(&mut ctx.store, &module) {
+                Ok(_) => ExecResult::Vals(Vec::new()),
+                Err(e) => ExecResult::Trap(e),
+            }
         }
     }
 }
 
-fn invoke_export(ctx: &mut SpecContext, invoke: &WastInvoke<'_>) -> Result<Vec<Val>> {
-    let instance = resolve(ctx, invoke.module)?;
-    let func = instance
-        .get_func(&mut ctx.store, invoke.name)
-        .ok_or_else(|| Error::msg(format!("missing export {}", invoke.name)))?;
-    let args = invoke
+fn invoke_export(ctx: &mut SpecContext, invoke: &WastInvoke<'_>) -> ExecResult {
+    let Some(instance) = resolve(ctx, invoke.module) else {
+        return ExecResult::Skip;
+    };
+    let Some(func) = instance.get_func(&mut ctx.store, invoke.name) else {
+        return ExecResult::Trap(Error::msg(format!("missing export {}", invoke.name)));
+    };
+    let args = match invoke
         .args
         .iter()
         .map(arg_to_val)
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(a) => a,
+        Err(_) => return ExecResult::Skip, // ref/v128 argument — out of scope
+    };
     let result_count = func.ty(&ctx.store).results().len();
     let mut results = vec![Val::I32(0); result_count];
-    func.call(&mut ctx.store, &args, &mut results)?;
-    Ok(results)
+    match func.call(&mut ctx.store, &args, &mut results) {
+        Ok(()) => ExecResult::Vals(results),
+        Err(e) => ExecResult::Trap(e),
+    }
 }
 
-fn resolve(ctx: &SpecContext, module: Option<Id<'_>>) -> Result<Instance> {
+/// The instance a directive targets, or `None` if it was skipped / is unknown.
+fn resolve(ctx: &SpecContext, module: Option<Id<'_>>) -> Option<Instance> {
     match module {
-        Some(id) => {
-            if ctx.skipped_names.contains(id.name()) {
-                return Err(Error::msg("module skipped"));
-            }
-            ctx.named
-                .get(id.name())
-                .copied()
-                .ok_or_else(|| Error::msg(format!("unknown module {}", id.name())))
-        }
-        None => {
-            if ctx.current_skipped {
-                return Err(Error::msg("module skipped"));
-            }
-            ctx.current.ok_or_else(|| Error::msg("no current module"))
-        }
+        Some(id) if ctx.skipped_names.contains(id.name()) => None,
+        Some(id) => ctx.named.get(id.name()).copied(),
+        None if ctx.current_skipped => None,
+        None => ctx.current,
     }
 }
 

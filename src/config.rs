@@ -22,10 +22,20 @@ impl Config {
         self
     }
 
+    /// Whether fuel metering is enabled.
+    pub(crate) fn consume_fuel_enabled(&self) -> bool {
+        self.consume_fuel
+    }
+
     /// Enables epoch-based interruption. Off by default.
     pub fn epoch_interruption(&mut self, enable: bool) -> &mut Self {
         self.epoch_interruption = enable;
         self
+    }
+
+    /// Whether epoch-based interruption is enabled.
+    pub(crate) fn epoch_interruption_enabled(&self) -> bool {
+        self.epoch_interruption
     }
 
     /// Sets the maximum wasm operand-stack size, in bytes.

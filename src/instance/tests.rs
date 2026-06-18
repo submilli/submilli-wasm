@@ -4,7 +4,6 @@
 
 use super::Instance;
 use crate::engine::Engine;
-use crate::exec;
 use crate::extern_::Extern;
 use crate::module::Module;
 use crate::store::Store;
@@ -17,14 +16,14 @@ fn module(engine: &Engine, wat: &str) -> Module {
     Module::new(engine, &bytes).unwrap()
 }
 
-/// Resolves `name` on `instance` and runs it via the internal executor.
+/// Resolves `name` on `instance` and runs it through the public `Func::call`.
 fn call(store: &mut Store<()>, instance: Instance, name: &str, args: Vec<Val>) -> Result<Vec<Val>> {
     let f = instance
         .get_func(&mut *store, name)
         .ok_or_else(|| Error::msg("no such export"))?;
-    let inner = store.as_context_mut().into_inner_mut();
-    let (def_inst, code) = exec::resolve_func(inner, f);
-    exec::execute(inner, def_inst, code, args)
+    let mut results = vec![Val::I32(0); f.ty(&*store).results().len()];
+    f.call(&mut *store, &args, &mut results)?;
+    Ok(results)
 }
 
 fn trap_of(r: Result<Vec<Val>>) -> Trap {
@@ -257,4 +256,121 @@ fn unbounded_recursion_traps_stack_overflow() {
     let inst = Instance::new(&mut store, &m, &[]).unwrap();
     let r = call(&mut store, inst, "run", vec![]);
     assert_eq!(trap_of(r), Trap::StackOverflow);
+}
+
+// --- fuel metering (#21) ---
+
+use crate::Config;
+
+/// `count(n)` loops n times and returns n; each iteration runs a fixed op count.
+const COUNTER: &str = "(module (func (export \"count\") (param i32) (result i32)
+    (local i32)
+    (block $b (loop $l
+        local.get 0 i32.eqz br_if $b
+        local.get 0 i32.const 1 i32.sub local.set 0
+        local.get 1 i32.const 1 i32.add local.set 1
+        br $l))
+    local.get 1))";
+
+fn fuel_engine() -> Engine {
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    Engine::new(&config).unwrap()
+}
+
+#[test]
+fn fuel_requires_config() {
+    let mut store = Store::new(&Engine::default(), ());
+    assert!(store.set_fuel(100).is_err());
+    assert!(store.get_fuel().is_err());
+}
+
+#[test]
+fn fuel_completes_and_decreases_deterministically() {
+    let engine = fuel_engine();
+    let m = module(&engine, COUNTER);
+
+    let run_once = || {
+        let mut store = Store::new(&engine, ());
+        store.set_fuel(1_000_000).unwrap();
+        let inst = Instance::new(&mut store, &m, &[]).unwrap();
+        let r = call(&mut store, inst, "count", vec![Val::I32(20)]).unwrap();
+        assert_eq!(r[0].unwrap_i32(), 20);
+        store.get_fuel().unwrap()
+    };
+    let a = run_once();
+    let b = run_once();
+    assert!(a < 1_000_000); // fuel was consumed
+    assert_eq!(a, b); // deterministic
+}
+
+#[test]
+fn fuel_exhaustion_traps() {
+    let engine = fuel_engine();
+    let m = module(&engine, COUNTER);
+    let mut store = Store::new(&engine, ());
+    store.set_fuel(50).unwrap();
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let r = call(&mut store, inst, "count", vec![Val::I32(1_000_000)]);
+    assert_eq!(trap_of(r), Trap::OutOfFuel);
+}
+
+// --- epoch interruption (#22) ---
+
+use crate::UpdateDeadline;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+const SEVEN: &str = "(module (func (export \"f\") (result i32) i32.const 7))";
+
+fn epoch_engine() -> Engine {
+    let mut config = Config::new();
+    config.epoch_interruption(true);
+    Engine::new(&config).unwrap()
+}
+
+#[test]
+fn epoch_deadline_not_reached_completes() {
+    let engine = epoch_engine();
+    let m = module(&engine, SEVEN);
+    let mut store = Store::new(&engine, ());
+    store.set_epoch_deadline(1); // deadline 1, current epoch 0
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    assert_eq!(
+        call(&mut store, inst, "f", vec![]).unwrap()[0].unwrap_i32(),
+        7
+    );
+}
+
+#[test]
+fn epoch_deadline_reached_traps() {
+    let engine = epoch_engine();
+    let m = module(&engine, SEVEN);
+    let mut store = Store::new(&engine, ());
+    store.set_epoch_deadline(0); // current epoch already at the deadline
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    assert_eq!(
+        trap_of(call(&mut store, inst, "f", vec![])),
+        Trap::Interrupt
+    );
+}
+
+#[test]
+fn epoch_callback_continue_resumes() {
+    let engine = epoch_engine();
+    let m = module(&engine, SEVEN);
+    let mut store = Store::new(&engine, ());
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    store.epoch_deadline_callback(move |_| {
+        c.fetch_add(1, Ordering::Relaxed);
+        Ok(UpdateDeadline::Continue(1_000_000))
+    });
+    store.set_epoch_deadline(0);
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    assert_eq!(
+        call(&mut store, inst, "f", vec![]).unwrap()[0].unwrap_i32(),
+        7
+    );
+    assert!(count.load(Ordering::Relaxed) >= 1);
 }

@@ -1,5 +1,9 @@
 //! Resource limiting: the `ResourceLimiter` trait and `StoreLimits[Builder]`.
 
+#[cfg(test)]
+#[path = "limits_tests.rs"]
+mod tests;
+
 use crate::{Error, Result};
 
 const DEFAULT_LIMIT: usize = 10_000;
@@ -86,6 +90,22 @@ impl ResourceLimiter for StoreLimits {
         let within_config = self.table_elements.is_none_or(|limit| desired <= limit);
         let within_max = maximum.is_none_or(|max| desired <= max);
         Ok(within_config && within_max)
+    }
+
+    fn memory_grow_failed(&mut self, error: Error) -> Result<()> {
+        if self.trap_on_grow_failure {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn table_grow_failed(&mut self, error: Error) -> Result<()> {
+        if self.trap_on_grow_failure {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     fn instances(&self) -> usize {

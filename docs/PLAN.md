@@ -31,7 +31,7 @@ Legend: **Deliverable** = what exists at the end; **Done when** = acceptance cri
 
 **Scope**
 - Compile pass (`compile.rs`): wasmparser validation + single-pass pre-decode to `Vec<Op>`; control stack; forward/backward branch resolution with `keep`/`pop`; dead-code elision; constant folding.
-- Internal `Op` set for: numeric (i32/i64/f32/f64 full set incl. sign-extension ops), parametric (`drop`, `select`/`select t`), variable (`local.*`, `global.*`), memory (all loads/stores, `memory.size/grow`, `memory.init/copy/fill`, `data.drop`), control (`block/loop/if/else/end/br/br_if/br_table/return/call/call_indirect/unreachable/nop`).
+- Internal `Op` set for: numeric (i32/i64/f32/f64 full set incl. **sign-extension ops** and **non-trapping/saturating float→int** `trunc_sat`), parametric (`drop`, `select`/`select t`), variable (`local.*`, `global.*`), memory (all loads/stores, `memory.size/grow`, `memory.init/copy/fill`, `data.drop`), control (`block/loop/if/else/end/br/br_if/br_table/return/call/call_indirect/unreachable/nop`).
 - Runtime: operand stack + frame stack + the `run` loop; zero-copy call args; multi-value blocks/calls/returns; the folded-branch executor.
 - Entities: `Memory` (Vec<u8> + bounds checks + grow), `Global` (incl. mutable, imported/exported), `Table`, `Func` (wasm only).
 - Instantiation: imports (positional), active/passive data & elem segments, `start` function.
@@ -54,7 +54,7 @@ Legend: **Deliverable** = what exists at the end; **Done when** = acceptance cri
 - `Linker<T>`: `define`, `func_wrap`, `func_new`, `instance`, `module`, `instantiate`, `get`; multi-module instantiation; imported mutable globals aliasing the same store cell.
 - Typed calls: `IntoFunc`, `WasmParams`/`WasmResults`, `Func::wrap`, `Func::typed`, `TypedFunc::call`, `Instance::get_typed_func`. Macro-generated tuple impls.
 - Sync host functions: `Func::new`/`wrap`, `Caller<'_,T>` with `data()/data_mut()/get_export()`; host `Err` → trap.
-- **Fuel**: block-batched charging in the compile pass/loop; `Config::consume_fuel`, `Store::set_fuel/get_fuel`; `Trap::OutOfFuel`.
+- **Fuel**: per-executed-op charging in the run loop (1 unit per internal `Op`; structural ops compiled away); `Config::consume_fuel`, `Store::set_fuel/get_fuel`; `Trap::OutOfFuel`. (Deterministic; not compiler-injected block batches — runtime speed is secondary, so the simpler precise model wins.)
 - **Epoch**: `AtomicU64` on `Engine`, `increment_epoch`, `Store::set_epoch_deadline`, deadline checks at back-edges/calls, `Trap::Interrupt`; ticker helper using a weak engine handle.
 - **Limits**: `ResourceLimiter` trait + `StoreLimitsBuilder`, `Store::limiter`; enforce on memory/table grow and instance/entity counts.
 - **Stack-size limit**: enforce `Config::max_wasm_stack` — wasmtime's only stack knob and, like wasmtime, measured in **bytes** (not a frame-count depth; the spec defines no stack bound at all). Since we use no native stack for wasm calls (explicit heap `Vec<Frame>`/`Vec<Val>`), account those stacks' estimated byte footprint (frames × overhead + operand slots × `size_of::<Val>()`) against the budget; exceed → `Trap::StackOverflow` ("call stack exhausted"). The third execution-control limit alongside fuel and epoch; hardening/verification is Phase 8.
@@ -212,6 +212,30 @@ Several primitives are *designed* in earlier phases — the limiter (Phase 2), f
 
 ---
 
+## Phase 9 — Remaining standardized proposals (complete Wasm 2.0 + 3.0)
+
+**Goal:** implement every remaining *finished* proposal so the vendored Wasm-3.0 spec suite runs with **zero whole-file skips, zero in-file (module/assertion) skips, and zero partials** — every file, module, and assertion executes and passes. Phases 4/5/6 already cover reference-types/function-references, GC, and exception-handling (which also bring **multi-table** for free via the per-instance table index space); this phase adds the rest. The interpreter was designed for this: the `Value` enum already carries `V128`, and the flat `Op` table absorbs new opcodes without structural change.
+
+The remaining gaps are exactly the spec-runner's current skip buckets (`cargo test --test spec -- --nocapture`): `multiple memories`, `SIMD`, `memory64`, `extended-const`, `tail calls`, plus the relaxed-SIMD files.
+
+**Scope** (each bullet is roughly its own milestone-sized deliverable):
+- **Fixed-width SIMD (`v128`)** — *Wasm 2.0.* The full 236-instruction `v128` set on the existing `Val::V128` cell: every lane shape (`i8x16`…`f64x2`), splat/extract/replace_lane, arithmetic/saturating/comparison/shift/bitwise/bitmask, narrow/widen/extend/extmul/extadd/dot/q15mulr, and all `v128.load*`/`store*` (incl. `_lane`, `_splat`, `_zero`, extend variants). Enable `WasmFeatures::SIMD`. This is breadth, not depth — generate the per-op handlers systematically.
+- **Relaxed SIMD** — *Wasm 3.0.* The `relaxed_*` ops (fma/fnma, relaxed swizzle/trunc/laneselect/min-max/dot/q15mulr); pick and **document** a fixed deterministic lowering (the spec permits one). Depends on SIMD.
+- **Tail calls** — `return_call`/`return_call_indirect` (and `return_call_ref` with function-references): reposition args into the current frame and jump instead of pushing a frame. Enable `TAIL_CALL`.
+- **Extended const** — const-expr `global.get` of prior immutable globals (incl. locally-defined) + `i32`/`i64` `add`/`sub`/`mul`: extend the owned `ConstExpr` (`module/inner.rs`) + its evaluator (`instance/init.rs`). Enable `EXTENDED_CONST`.
+- **Multiple memories** — carry an explicit memory index on every memory op (`load`/`store`/`size`/`grow`/`fill`/`copy`/`init`) and resolve `instance.memories[idx]` instead of hard-coded memory 0. Enable `MULTI_MEMORY`.
+- **Memory64** — honor `MemoryType::is_64`/`TableType::table64`: `i64` index type, `memory.size`/`grow` return `i64`; bounds checks already use `u64`. Enable `MEMORY64`.
+
+(Out of scope: **threads/atomics** — a separate proposal, not part of Wasm 3.0 — and **custom-page-sizes**; see non-goals in ARCHITECTURE §1.)
+
+**Done when:**
+- `cargo test --test spec -- --nocapture` reports **0 whole-file skips, 0 module skips, 0 assertion skips, 0 `[PARTIAL]`** across the vendored suite (legacy EH under `legacy/` excepted) — every assertion passes. The runner's `classify`/skip machinery becomes a no-op (retained only for any genuinely non-API construct).
+- The proposal suites pass: `simd_*`, `relaxed_*`, `tail_call*`, the `*64`/multi-memory files (`memory_grow`, `memory_trap1`, `address0/1`, `align0`, `memory_size*`, `load0/1/2`, `linking0`, …), and the extended-const cases in `data`/`elem`/`global`.
+
+**Risks:** SIMD's breadth (mechanize the handlers, lean on the spec suite). Memory64/multi-memory touch the hot memory path — thread the index/index-type without slowing the common single-32-bit-memory case. Relaxed-SIMD's nondeterminism choice must be documented and stable. Any feature added here must also re-pass the Phase-8 gates.
+
+---
+
 ## Cross-cutting workstreams (run continuously)
 
 - **Conformance:** keep the `.wast` runner green for every enabled proposal; treat the spec suite as the definition of done per phase. Per-phase file targets are in [TESTING.md §5](./TESTING.md).
@@ -229,6 +253,7 @@ Several primitives are *designed* in earlier phases — the limiter (Phase 2), f
 - **M4 (Phases 5–6):** GC + exception handling — feature-complete against the target set.
 - **M5 (Phase 7):** DWARF-symbolicated trap/exception backtraces; exception-propagation backtrace correctness verified.
 - **M6 (Phase 8):** multi-tenant-safe — bounded resources, panic-free on validated input, store isolation verified, fuzzers green, threat model published.
+- **M7 (Phase 9):** full Wasm 2.0 + 3.0 — the vendored spec suite runs with **zero skips/partials** (SIMD, relaxed-SIMD, tail-calls, extended-const, multi-memory, memory64).
 
 ## Sequencing notes
 
@@ -237,4 +262,5 @@ Several primitives are *designed* in earlier phases — the limiter (Phase 2), f
 - Phase 7 (DWARF/backtraces) comes last of the feature phases: the exception-backtrace deliverable depends on Phase 6's unwinder, though the bare frame-walking capture already exists from Phase 1's error model and can be symbolicated incrementally.
 - Phase 8 (security) is the final consolidation gate, but it is **not** purely terminal: its enforcement primitives (stack-size limit, limiter wiring) live in Phase 2 and are **prerequisites for any real multi-tenant deployment** — pull them forward and run the fuzzers continuously rather than deferring all of Phase 8 to the end.
 - Within a phase, land the compile-pass + interpreter support first, then the spec suite, then the embedder API niceties.
+- Phase 9 (remaining proposals) depends on 4/5/6 for the *full* zero-skip suite (refs/GC/EH supply their share of the currently-skipped modules), but its own items (SIMD, tail-calls, extended-const, multi-memory, memory64, …) are independent and can land in any order. Any feature added in Phase 9 must also pass the Phase-8 gates (limiter coverage, panic-safety, fuzzing) — run them over the new surface rather than treating Phase 8 as strictly prior.
 ```

@@ -11,11 +11,12 @@ pub use into_func::IntoFunc;
 pub use wasm_ty::{WasmParams, WasmResults, WasmRet, WasmTy};
 
 use core::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::engine::Engine;
 use crate::extern_::Extern;
 use crate::instance::Instance;
-use crate::store::{AsContext, AsContextMut, StoreContext, StoreContextMut};
+use crate::store::{AsContext, AsContextMut, FuncEntity, StoreContext, StoreContextMut};
 use crate::value::{FuncType, Val};
 use crate::Result;
 
@@ -25,25 +26,39 @@ pub struct Func {
     pub(crate) index: u32,
 }
 
+/// The resolved kind of a callee, with the entity's Copy fields extracted.
+enum Callee {
+    Wasm(Instance, u32),
+    Host(u32),
+}
+
 impl Func {
     /// Creates a host function with a dynamic signature.
     pub fn new<T: 'static>(
-        store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data = T>,
         ty: FuncType,
         func: impl Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
     ) -> Func {
-        todo!()
+        let mut ctx = store.as_context_mut();
+        let host_index = ctx.store_mut().push_host_func(Arc::new(func));
+        ctx.inner_mut()
+            .alloc_func(FuncEntity::Host { ty, host_index })
     }
 
     /// Creates a host function from a typed Rust closure.
     pub fn wrap<T, Params, Results>(
-        store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data = T>,
         func: impl IntoFunc<T, Params, Results>,
     ) -> Func
     where
         T: 'static,
     {
-        todo!()
+        let engine = store.as_context().engine().clone();
+        let (ty, cb) = func.into_func(&engine);
+        let mut ctx = store.as_context_mut();
+        let host_index = ctx.store_mut().push_host_func(cb);
+        ctx.inner_mut()
+            .alloc_func(FuncEntity::Host { ty, host_index })
     }
 
     /// Calls this function with dynamically-typed arguments.
@@ -53,19 +68,41 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        let inner = store.as_context_mut().into_inner_mut();
-        let fe = inner.func(*self);
-        let (def_inst, func_index) = (fe.instance, fe.func_index);
-        let module = inner.instance(def_inst).module.clone();
-        let ty = module.inner().func_type(func_index).clone();
-
+        let ty = self.ty(&store);
         check_args(params, &ty)?;
         if results.len() != ty.results().len() {
             return Err(crate::Error::msg("wrong number of results"));
         }
-
-        let code = module.inner().compiled(func_index);
-        let out = crate::exec::execute(inner, def_inst, code, params.to_vec())?;
+        // Copy out the entity's Copy fields, releasing the borrow before we
+        // re-borrow the store mutably for the call.
+        let kind = match store.as_context_mut().inner().func(*self) {
+            FuncEntity::Wasm {
+                instance,
+                func_index,
+            } => Callee::Wasm(*instance, *func_index),
+            FuncEntity::Host { host_index, .. } => Callee::Host(*host_index),
+        };
+        let out = match kind {
+            Callee::Wasm(instance, func_index) => {
+                let mut ctx = store.as_context_mut();
+                let code = ctx
+                    .inner()
+                    .instance(instance)
+                    .module
+                    .inner()
+                    .compiled(func_index);
+                crate::exec::host::execute(ctx.store_mut(), instance, code, params.to_vec())?
+            }
+            Callee::Host(host_index) => {
+                let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();
+                let mut out = ty
+                    .results()
+                    .map(|t| Val::default_for(&t))
+                    .collect::<Vec<_>>();
+                cb(Caller::new(store.as_context_mut(), None), params, &mut out)?;
+                out
+            }
+        };
         results.clone_from_slice(&out);
         Ok(())
     }
@@ -79,19 +116,34 @@ impl Func {
         Params: WasmParams,
         Results: WasmResults,
     {
-        todo!()
+        let ty = self.ty(&store);
+        let params_match = ty.params().eq(wasm_ty::valtypes_of::<Params>());
+        let results_match = ty.results().eq(wasm_ty::valtypes_of::<Results>());
+        if params_match && results_match {
+            Ok(TypedFunc {
+                func: *self,
+                _marker: PhantomData,
+            })
+        } else {
+            Err(crate::Error::msg("typed function signature mismatch"))
+        }
     }
 
     /// Returns this function's signature.
     pub fn ty(&self, store: impl AsContext) -> FuncType {
         let inner = store.as_context().inner();
-        let fe = inner.func(*self);
-        inner
-            .instance(fe.instance)
-            .module
-            .inner()
-            .func_type(fe.func_index)
-            .clone()
+        match inner.func(*self) {
+            FuncEntity::Wasm {
+                instance,
+                func_index,
+            } => inner
+                .instance(*instance)
+                .module
+                .inner()
+                .func_type(*func_index)
+                .clone(),
+            FuncEntity::Host { ty, .. } => ty.clone(),
+        }
     }
 }
 
@@ -134,8 +186,12 @@ where
     Results: WasmResults,
 {
     /// Calls this function with statically-typed arguments.
-    pub fn call(&self, store: impl AsContextMut, params: Params) -> Result<Results> {
-        todo!()
+    pub fn call(&self, mut store: impl AsContextMut, params: Params) -> Result<Results> {
+        let mut args = Vec::new();
+        params.into_vals(&mut args);
+        let mut results = vec![Val::I32(0); wasm_ty::valtypes_of::<Results>().len()];
+        self.func.call(&mut store, &args, &mut results)?;
+        Ok(Results::from_vals(&results))
     }
 
     /// The underlying untyped [`Func`].
@@ -145,9 +201,18 @@ where
 }
 
 /// Context passed to host functions, giving access to the caller's store and exports.
+///
+/// `instance` is the *calling* wasm instance (for `get_export`), or `None` when the
+/// host function is invoked at the top level via [`Func::call`].
 pub struct Caller<'a, T: 'static> {
     store: StoreContextMut<'a, T>,
-    instance: Instance,
+    instance: Option<Instance>,
+}
+
+impl<'a, T: 'static> Caller<'a, T> {
+    pub(crate) fn new(store: StoreContextMut<'a, T>, instance: Option<Instance>) -> Self {
+        Caller { store, instance }
+    }
 }
 
 impl<T: 'static> core::fmt::Debug for Caller<'_, T> {
@@ -166,7 +231,8 @@ impl<T: 'static> Caller<'_, T> {
     }
 
     pub fn get_export(&mut self, name: &str) -> Option<Extern> {
-        todo!()
+        let instance = self.instance?;
+        instance.export(self.store.inner(), name)
     }
 
     pub fn engine(&self) -> &Engine {

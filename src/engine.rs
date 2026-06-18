@@ -22,6 +22,8 @@ const DEFAULT_MAX_WASM_STACK: usize = 512 * 1024;
 struct EngineInner {
     epoch: AtomicU64,
     max_wasm_stack: usize,
+    consume_fuel: bool,
+    epoch_interruption: bool,
 }
 
 impl Engine {
@@ -33,13 +35,25 @@ impl Engine {
                 max_wasm_stack: config
                     .max_wasm_stack_bytes()
                     .unwrap_or(DEFAULT_MAX_WASM_STACK),
+                consume_fuel: config.consume_fuel_enabled(),
+                epoch_interruption: config.epoch_interruption_enabled(),
             }),
         })
+    }
+
+    /// Whether epoch-based interruption is enabled (`Config::epoch_interruption`).
+    pub(crate) fn epoch_interruption(&self) -> bool {
+        self.inner.epoch_interruption
     }
 
     /// The wasm execution-stack byte budget (`Config::max_wasm_stack`).
     pub(crate) fn max_wasm_stack(&self) -> usize {
         self.inner.max_wasm_stack
+    }
+
+    /// Whether fuel metering is enabled (`Config::consume_fuel`).
+    pub(crate) fn consume_fuel(&self) -> bool {
+        self.inner.consume_fuel
     }
 
     /// Bumps the epoch counter; pairs with `Store::set_epoch_deadline`.
