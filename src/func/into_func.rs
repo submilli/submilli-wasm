@@ -13,6 +13,11 @@ use crate::func::Caller;
 use crate::store::HostFunc;
 use crate::value::{FuncType, ValType};
 
+#[cfg(feature = "async")]
+use crate::func::wasm_ty::WasmResults;
+#[cfg(feature = "async")]
+use crate::store::AsyncHostFunc;
+
 /// Conversion of a Rust closure into a host function's signature + callback.
 pub trait IntoFunc<T, Params, Results>: Send + Sync + 'static {
     fn into_func(self, engine: &Engine) -> (FuncType, HostFunc<T>);
@@ -23,6 +28,37 @@ fn make_ty<R: WasmRet>(engine: &Engine, params: Vec<ValType>) -> FuncType {
     let mut results = Vec::new();
     R::valtypes(&mut results);
     FuncType::new(engine, params, results)
+}
+
+/// Builds an [`AsyncHostFunc`] from a typed async closure `Fn(Caller, P) -> Future<R>`.
+/// Mirrors [`IntoFunc::into_func`] for the async path (no arity macro: `P` is one tuple).
+/// Shared by `Func::wrap_async` and `Linker::func_wrap_async`.
+#[cfg(feature = "async")]
+pub(crate) fn into_async_func<T, F, P, R>(engine: &Engine, func: F) -> (FuncType, AsyncHostFunc<T>)
+where
+    F: for<'a> Fn(
+            Caller<'a, T>,
+            P,
+        ) -> std::boxed::Box<dyn std::future::Future<Output = R> + Send + 'a>
+        + Send
+        + Sync
+        + 'static,
+    P: WasmResults,
+    R: WasmRet + 'static,
+    T: Send + 'static,
+{
+    let mut params = Vec::new();
+    P::valtypes(&mut params);
+    let ty = make_ty::<R>(engine, params);
+    let cb: AsyncHostFunc<T> = Arc::new(move |caller, vals, results| {
+        let p = P::from_vals(vals);
+        let user_fut = func(caller, p);
+        std::boxed::Box::new(async move {
+            let r = std::boxed::Box::into_pin(user_fut).await;
+            r.into_results(results)
+        })
+    });
+    (ty, cb)
 }
 
 macro_rules! impl_into_func {

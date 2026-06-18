@@ -19,19 +19,29 @@ use std::sync::Arc;
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::op::{BranchTarget, CompiledFunc, Op};
-use crate::store::{FuncEntity, StoreInner};
+use crate::store::{FuelStep, FuncEntity, StoreInner};
 use crate::trap::Trap;
 use crate::value::Val;
 use crate::Result;
 
 use self::frame::Frame;
 
-/// Transient interpreter state for one top-level call. (Resumable state held in
-/// the `Store` arrives in Phase 3.)
+/// Transient interpreter state for one top-level call. Self-contained: it owns its
+/// operand/frame stacks and holds no borrow into the `Store` across an [`Outcome`]
+/// suspend, so it can be *parked* between resumptions — the basis for async
+/// (Phase 3) where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
 struct Execution {
     values: Vec<Val>,
     frames: Vec<Frame>,
 }
+
+// Parkability: keep `Execution` `Send` so async can await with it at rest and the
+// executor can move it between tasks. Compile-time check — if a future field adds a
+// non-`Send` member (e.g. an `Rc`), this fails here rather than at an `.await`.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Execution>();
+};
 
 /// Why [`Execution::run`] returned: either the call finished or it suspended on a
 /// host function the (generic) driver in [`host`] must invoke.
@@ -41,6 +51,16 @@ pub(crate) enum Outcome {
         func: Func,
         instance: Instance,
     },
+    /// Suspended on an async host function; only the async driver can service it.
+    #[cfg(feature = "async")]
+    HostAsync {
+        func: Func,
+        instance: Instance,
+    },
+    /// The active fuel slice was exhausted with reserve remaining: yield to the
+    /// executor, refuel, and resume. Only produced under an async fuel-yield interval.
+    #[cfg(feature = "async")]
+    FuelYield,
     EpochDeadline,
     Grow {
         memory: crate::extern_::Memory,
@@ -56,6 +76,12 @@ enum StepOutcome {
         instance: Instance,
         return_ip: u32,
     },
+    #[cfg(feature = "async")]
+    DoHostAsyncCall {
+        func: Func,
+        instance: Instance,
+        return_ip: u32,
+    },
     DoGrow {
         memory: crate::extern_::Memory,
         delta: u64,
@@ -67,6 +93,8 @@ enum StepOutcome {
 enum ResolvedCall {
     Wasm(Instance, Arc<CompiledFunc>),
     Host(Func),
+    #[cfg(feature = "async")]
+    HostAsync(Func),
 }
 
 struct CallReq {
@@ -152,8 +180,22 @@ impl Execution {
                 instance = f.instance;
                 continue;
             }
-            if fuel_enabled && !inner.try_consume_fuel() {
-                return Err(Trap::OutOfFuel.into());
+            if fuel_enabled {
+                match inner.consume_fuel_step() {
+                    FuelStep::Ran => {}
+                    FuelStep::Exhausted => return Err(Trap::OutOfFuel.into()),
+                    FuelStep::NeedYield => {
+                        #[cfg(feature = "async")]
+                        {
+                            self.frames.last_mut().expect("current frame").ip = ip;
+                            return Ok(Outcome::FuelYield);
+                        }
+                        // Unreachable without async (an interval requires an async store),
+                        // but keep the match total.
+                        #[cfg(not(feature = "async"))]
+                        return Err(Trap::OutOfFuel.into());
+                    }
+                }
             }
             if epoch_enabled && inner.epoch_deadline_reached() {
                 self.frames.last_mut().expect("current frame").ip = ip;
@@ -179,6 +221,15 @@ impl Execution {
                 } => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::HostCall { func, instance });
+                }
+                #[cfg(feature = "async")]
+                StepOutcome::DoHostAsyncCall {
+                    func,
+                    instance,
+                    return_ip,
+                } => {
+                    self.frames.last_mut().expect("caller frame").ip = return_ip;
+                    return Ok(Outcome::HostAsync { func, instance });
                 }
                 StepOutcome::DoGrow {
                     memory,
@@ -275,6 +326,12 @@ impl Execution {
                         instance,
                         return_ip: next,
                     },
+                    #[cfg(feature = "async")]
+                    ResolvedCall::HostAsync(func) => StepOutcome::DoHostAsyncCall {
+                        func,
+                        instance,
+                        return_ip: next,
+                    },
                 });
             }
             Op::CallIndirect { type_idx, table } => {
@@ -310,6 +367,8 @@ fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
             ResolvedCall::Wasm(def_inst, module.inner().compiled(*func_index))
         }
         FuncEntity::Host { .. } => ResolvedCall::Host(f),
+        #[cfg(feature = "async")]
+        FuncEntity::HostAsync { .. } => ResolvedCall::HostAsync(f),
     }
 }
 

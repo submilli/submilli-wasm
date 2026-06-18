@@ -11,16 +11,18 @@ name = "submilli_wasm"
 
 [features]
 default = []
-async = []
+async = ["dep:async-trait"]
 
 [dependencies]
 wasmparser = "0.252"
 anyhow = "1.0"
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 wast = "252"
 wat = "1"
 wasmtime = "=45.0.2"
+pollster = "0.3"
 
 [lints.rust]
 unsafe_code = "warn"

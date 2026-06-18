@@ -32,30 +32,125 @@ pub(crate) fn execute<T>(
         match exec.run(&mut store.inner)? {
             Outcome::Finished => return Ok(exec.values),
             Outcome::HostCall { func, instance } => exec.invoke_host(store, func, instance)?,
+            #[cfg(feature = "async")]
+            Outcome::HostAsync { .. } => {
+                return Err(crate::Error::msg(
+                    "async host function called from a synchronous context",
+                ))
+            }
+            #[cfg(feature = "async")]
+            Outcome::FuelYield => {
+                return Err(crate::Error::msg("fuel yield requires an async store"))
+            }
             Outcome::EpochDeadline => apply_epoch_deadline(store)?,
             Outcome::Grow { memory, delta } => exec.do_grow(store, memory, delta)?,
         }
     }
 }
 
-/// Applies the store's epoch-deadline policy: trap (no callback) or invoke the
-/// callback and act on its `UpdateDeadline` (extend-and-continue, or trap).
-fn apply_epoch_deadline<T>(store: &mut Store<T>) -> Result<()> {
+/// Async sibling of [`execute`]: drives the same resumable core to completion as a
+/// `Future`, so the call can be parked under an executor. Mirrors `execute`'s loop and
+/// reuses the same (sync) servicing helpers; async host calls are awaited here.
+#[cfg(feature = "async")]
+pub(crate) async fn execute_async<T>(
+    store: &mut Store<T>,
+    instance: Instance,
+    code: Arc<CompiledFunc>,
+    args: Vec<Val>,
+) -> Result<Vec<Val>> {
+    let mut exec = Execution {
+        values: args,
+        frames: Vec::new(),
+    };
+    exec.push_call(instance, code);
+    loop {
+        match exec.run(&mut store.inner)? {
+            Outcome::Finished => return Ok(exec.values),
+            Outcome::HostCall { func, instance } => exec.invoke_host(store, func, instance)?,
+            Outcome::HostAsync { func, instance } => {
+                exec.invoke_host_async(store, func, instance).await?;
+            }
+            Outcome::FuelYield => {
+                yield_now().await;
+                store.inner.refuel_from_reserve();
+            }
+            Outcome::EpochDeadline => apply_epoch_deadline_async(store).await?,
+            Outcome::Grow { memory, delta } => exec.do_grow_async(store, memory, delta).await?,
+        }
+    }
+}
+
+/// A one-shot yield to the async executor: returns `Pending` once (waking immediately),
+/// then `Ready`, giving the executor a chance to poll other tasks.
+#[cfg(feature = "async")]
+async fn yield_now() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct YieldNow(bool);
+    impl Future for YieldNow {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    YieldNow(false).await;
+}
+
+/// Invokes the store's epoch-deadline callback (defaulting to `Interrupt`), leaving it
+/// reinstalled. The returned `UpdateDeadline` is acted on by the (sync/async) caller.
+fn take_epoch_action<T>(store: &mut Store<T>) -> Result<UpdateDeadline> {
     let mut cb = store.epoch_callback.take();
     let action = match cb.as_mut() {
-        Some(f) => f(store.as_context_mut())?,
-        None => UpdateDeadline::Interrupt,
+        Some(f) => f(store.as_context_mut()),
+        None => Ok(UpdateDeadline::Interrupt),
     };
     store.epoch_callback = cb;
-    match action {
+    action
+}
+
+/// Extends the epoch deadline by `delta` ticks beyond the current epoch.
+fn extend_epoch_deadline<T>(store: &mut Store<T>, delta: u64) {
+    let next = store.inner.engine().current_epoch().saturating_add(delta);
+    store.inner.set_epoch_deadline(next);
+}
+
+/// Applies the store's epoch-deadline policy in a *sync* context: trap, or
+/// extend-and-continue. `Yield` requires async, so it traps here.
+fn apply_epoch_deadline<T>(store: &mut Store<T>) -> Result<()> {
+    match take_epoch_action(store)? {
         UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
         UpdateDeadline::Continue(delta) => {
-            let next = store.inner.engine().current_epoch().saturating_add(delta);
-            store.inner.set_epoch_deadline(next);
+            extend_epoch_deadline(store, delta);
             Ok(())
         }
         #[cfg(feature = "async")]
         UpdateDeadline::Yield(_) => Err(Trap::Interrupt.into()),
+    }
+}
+
+/// Async epoch-deadline policy: like [`apply_epoch_deadline`] but `Yield(delta)` yields
+/// to the executor and then extends the deadline (rather than trapping).
+#[cfg(feature = "async")]
+async fn apply_epoch_deadline_async<T>(store: &mut Store<T>) -> Result<()> {
+    match take_epoch_action(store)? {
+        UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
+        UpdateDeadline::Continue(delta) => {
+            extend_epoch_deadline(store, delta);
+            Ok(())
+        }
+        UpdateDeadline::Yield(delta) => {
+            yield_now().await;
+            extend_epoch_deadline(store, delta);
+            Ok(())
+        }
     }
 }
 
@@ -77,7 +172,11 @@ impl Execution {
                     .collect::<Vec<_>>(),
                 *host_index,
             ),
-            FuncEntity::Wasm { .. } => unreachable!("run only suspends on host funcs"),
+            FuncEntity::Wasm { .. } => unreachable!("HostCall only suspends on sync host funcs"),
+            #[cfg(feature = "async")]
+            FuncEntity::HostAsync { .. } => {
+                unreachable!("HostCall only suspends on sync host funcs")
+            }
         };
         let params = self.values.split_off(self.values.len() - n_params);
         let cb = store.host_funcs[host_index as usize].clone();
@@ -90,10 +189,57 @@ impl Execution {
         Ok(())
     }
 
+    /// Async sibling of [`invoke_host`](Self::invoke_host): runs the suspended async host
+    /// closure and awaits its future before pushing results. Args/results are owned locals,
+    /// so no store borrow is held across the `.await`.
+    #[cfg(feature = "async")]
+    async fn invoke_host_async<T>(
+        &mut self,
+        store: &mut Store<T>,
+        func: Func,
+        instance: Instance,
+    ) -> Result<()> {
+        let (n_params, mut results, host_index) = match store.inner.func(func) {
+            FuncEntity::HostAsync { ty, host_index } => (
+                ty.params().len(),
+                ty.results()
+                    .map(|t| Val::default_for(&t))
+                    .collect::<Vec<_>>(),
+                *host_index,
+            ),
+            _ => unreachable!("HostAsync only suspends on async host funcs"),
+        };
+        let params = self.values.split_off(self.values.len() - n_params);
+        let cb = store.async_host_funcs[host_index as usize].clone();
+        {
+            let caller = Caller::new(store.as_context_mut(), Some(instance));
+            let fut = cb(caller, &params, &mut results);
+            std::boxed::Box::into_pin(fut).await?;
+        }
+        self.values.extend(results);
+        Ok(())
+    }
+
     /// Services a suspended `memory.grow`: consults the limiter and pushes the new
     /// page count, or `-1` on a soft failure (a trap propagates from `grow_memory`).
     fn do_grow<T>(&mut self, store: &mut Store<T>, memory: Memory, delta: u64) -> Result<()> {
         let result = match store.grow_memory(memory, delta)? {
+            Some(old) => old as i32,
+            None => -1,
+        };
+        self.push(Val::I32(result));
+        Ok(())
+    }
+
+    /// Async sibling of [`do_grow`](Self::do_grow): awaits an async resource limiter.
+    #[cfg(feature = "async")]
+    async fn do_grow_async<T>(
+        &mut self,
+        store: &mut Store<T>,
+        memory: Memory,
+        delta: u64,
+    ) -> Result<()> {
+        let result = match store.grow_memory_async(memory, delta).await? {
             Some(old) => old as i32,
             None => -1,
         };

@@ -24,6 +24,7 @@ struct EngineInner {
     max_wasm_stack: usize,
     consume_fuel: bool,
     epoch_interruption: bool,
+    is_async: bool,
 }
 
 impl Engine {
@@ -37,6 +38,7 @@ impl Engine {
                     .unwrap_or(DEFAULT_MAX_WASM_STACK),
                 consume_fuel: config.consume_fuel_enabled(),
                 epoch_interruption: config.epoch_interruption_enabled(),
+                is_async: config.async_support_enabled(),
             }),
         })
     }
@@ -54,6 +56,11 @@ impl Engine {
     /// Whether fuel metering is enabled (`Config::consume_fuel`).
     pub(crate) fn consume_fuel(&self) -> bool {
         self.inner.consume_fuel
+    }
+
+    /// Whether async execution is enabled (`Config::async_support`).
+    pub(crate) fn is_async(&self) -> bool {
+        self.inner.is_async
     }
 
     /// Bumps the epoch counter; pairs with `Store::set_epoch_deadline`.

@@ -59,6 +59,21 @@ impl Memory {
         Ok(s.inner.alloc_memory(MemoryEntity::new(ty)))
     }
 
+    /// Async sibling of [`new`](Memory::new): awaits an async resource limiter on the
+    /// initial-allocation check.
+    #[cfg(feature = "async")]
+    pub async fn new_async(mut store: impl AsContextMut, ty: MemoryType) -> Result<Memory> {
+        let mut ctx = store.as_context_mut();
+        let s = ctx.store_mut();
+        if !s
+            .limiter_allows_memory_async(ty.minimum(), ty.maximum())
+            .await?
+        {
+            return Err(Error::msg("memory minimum size exceeds the store limit"));
+        }
+        Ok(s.inner.alloc_memory(MemoryEntity::new(ty)))
+    }
+
     pub fn ty(&self, store: impl AsContext) -> MemoryType {
         store.as_context().inner().memory(*self).ty.clone()
     }
@@ -208,6 +223,25 @@ impl Table {
         let mut ctx = store.as_context_mut();
         let s = ctx.store_mut();
         if !s.limiter_allows_table(ty.minimum(), ty.maximum())? {
+            return Err(Error::msg("table minimum size exceeds the store limit"));
+        }
+        Ok(s.inner.alloc_table(TableEntity::new(ty, init)))
+    }
+
+    /// Async sibling of [`new`](Table::new): awaits an async resource limiter on the
+    /// initial-allocation check.
+    #[cfg(feature = "async")]
+    pub async fn new_async(
+        mut store: impl AsContextMut,
+        ty: TableType,
+        init: Ref,
+    ) -> Result<Table> {
+        let mut ctx = store.as_context_mut();
+        let s = ctx.store_mut();
+        if !s
+            .limiter_allows_table_async(ty.minimum(), ty.maximum())
+            .await?
+        {
             return Err(Error::msg("table minimum size exceeds the store limit"));
         }
         Ok(s.inner.alloc_table(TableEntity::new(ty, init)))

@@ -18,6 +18,18 @@ fn instantiate(wat: &str) -> (Store<()>, Instance) {
     (store, inst)
 }
 
+#[cfg(feature = "async")]
+#[path = "async_tests.rs"]
+mod async_tests;
+
+#[cfg(feature = "async")]
+#[path = "async_yield_tests.rs"]
+mod async_yield_tests;
+
+#[cfg(feature = "async")]
+#[path = "async_limiter_tests.rs"]
+mod async_limiter_tests;
+
 #[test]
 fn untyped_call_returns_result() {
     let (mut store, inst) = instantiate(

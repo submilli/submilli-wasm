@@ -48,14 +48,27 @@ impl Execution {
                     return_ip,
                 })
             }
+            #[cfg(feature = "async")]
+            ResolvedCall::HostAsync(func) => {
+                if expected != host_ty(inner, func) {
+                    return Err(Trap::BadSignature.into());
+                }
+                Ok(StepOutcome::DoHostAsyncCall {
+                    func,
+                    instance,
+                    return_ip,
+                })
+            }
         }
     }
 }
 
-/// The dynamic signature of a host function handle.
+/// The dynamic signature of a host function handle (sync or async).
 fn host_ty(inner: &StoreInner, f: crate::func::Func) -> &FuncType {
     match inner.func(f) {
         FuncEntity::Host { ty, .. } => ty,
-        FuncEntity::Wasm { .. } => unreachable!("resolve returned Host"),
+        #[cfg(feature = "async")]
+        FuncEntity::HostAsync { ty, .. } => ty,
+        FuncEntity::Wasm { .. } => unreachable!("resolve returned a host func"),
     }
 }

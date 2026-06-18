@@ -45,6 +45,46 @@ pub trait ResourceLimiter {
     }
 }
 
+/// Async sibling of [`ResourceLimiter`]: growth decisions may `.await` (e.g. consult an
+/// async quota service). Used via [`Store::limiter_async`](crate::Store::limiter_async).
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+pub trait ResourceLimiterAsync: Send {
+    async fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool>;
+
+    async fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool>;
+
+    fn memory_grow_failed(&mut self, error: Error) -> Result<()> {
+        Ok(())
+    }
+
+    fn table_grow_failed(&mut self, error: Error) -> Result<()> {
+        Ok(())
+    }
+
+    fn instances(&self) -> usize {
+        DEFAULT_LIMIT
+    }
+
+    fn tables(&self) -> usize {
+        DEFAULT_LIMIT
+    }
+
+    fn memories(&self) -> usize {
+        DEFAULT_LIMIT
+    }
+}
+
 /// A ready-made [`ResourceLimiter`] configured by [`StoreLimitsBuilder`].
 #[derive(Clone, Debug)]
 pub struct StoreLimits {

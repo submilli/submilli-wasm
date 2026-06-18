@@ -8,6 +8,7 @@ pub struct Config {
     max_wasm_stack: Option<usize>,
     collector: Collector,
     gc_memory_threshold: Option<usize>,
+    async_support: bool,
 }
 
 impl Config {
@@ -106,11 +107,22 @@ impl Config {
         self
     }
 
+    /// Enables async execution (`Func::call_async`, async host fns, yields).
+    /// Off by default. Once enabled, the sync entry points reject this store.
     #[cfg(feature = "async")]
     pub fn async_support(&mut self, enable: bool) -> &mut Self {
+        self.async_support = enable;
         self
     }
 
+    /// Whether async support is enabled (`Config::async_support`).
+    pub(crate) fn async_support_enabled(&self) -> bool {
+        self.async_support
+    }
+
+    /// Accepted for wasmtime API parity but a **no-op** for this interpreter:
+    /// suspend/resume is just parking the `Execution` state machine (no native
+    /// fiber stack to size — see ARCHITECTURE §2.4), so there is no async stack.
     #[cfg(feature = "async")]
     pub fn async_stack_size(&mut self, size: usize) -> &mut Self {
         self

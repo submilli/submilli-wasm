@@ -42,8 +42,21 @@ pub(crate) struct TableEntity {
 /// signature + an index into the owning `Store<T>`'s typed `host_funcs`).
 #[derive(Debug)]
 pub(crate) enum FuncEntity {
-    Wasm { instance: Instance, func_index: u32 },
-    Host { ty: FuncType, host_index: u32 },
+    Wasm {
+        instance: Instance,
+        func_index: u32,
+    },
+    Host {
+        ty: FuncType,
+        host_index: u32,
+    },
+    /// An async host function: signature + index into the store's `async_host_funcs`.
+    /// The closure returns a future the async driver awaits before resuming.
+    #[cfg(feature = "async")]
+    HostAsync {
+        ty: FuncType,
+        host_index: u32,
+    },
 }
 
 /// Runtime data backing an [`Instance`](crate::Instance): its resolved index

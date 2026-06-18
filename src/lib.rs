@@ -65,6 +65,8 @@ pub use crate::func::{
 pub use crate::instance::Instance;
 pub use crate::linker::Linker;
 pub use crate::module::Module;
+#[cfg(feature = "async")]
+pub use crate::store::ResourceLimiterAsync;
 pub use crate::store::{
     AsContext, AsContextMut, CallHook, ResourceLimiter, Store, StoreContext, StoreContextMut,
     StoreLimits, StoreLimitsBuilder, UpdateDeadline,

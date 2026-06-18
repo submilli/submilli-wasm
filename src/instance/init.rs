@@ -114,6 +114,8 @@ fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Re
             .func_type(*func_index)
             .clone(),
         FuncEntity::Host { ty, .. } => ty.clone(),
+        #[cfg(feature = "async")]
+        FuncEntity::HostAsync { ty, .. } => ty.clone(),
     };
     if module.inner().types[type_idx as usize] == actual {
         Ok(())

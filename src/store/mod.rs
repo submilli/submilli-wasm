@@ -2,6 +2,7 @@
 
 mod context;
 mod entity;
+mod grow;
 mod inner;
 mod limits;
 
@@ -9,28 +10,43 @@ pub use context::{AsContext, AsContextMut, StoreContext, StoreContextMut};
 pub(crate) use entity::{
     FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, PAGE_SIZE,
 };
-pub(crate) use inner::StoreInner;
+pub(crate) use inner::{FuelStep, StoreInner};
+#[cfg(feature = "async")]
+pub use limits::ResourceLimiterAsync;
 pub use limits::{ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 
 use std::sync::Arc;
 
 use crate::engine::Engine;
-use crate::extern_::{Memory, Table};
 use crate::func::Caller;
-use crate::value::{Ref, Val};
+use crate::value::Val;
 use crate::{Error, Result};
 
-/// The store's resource limiter: projects host state `T` to a `ResourceLimiter`.
-pub(crate) type Limiter<T> = Box<dyn FnMut(&mut T) -> &mut (dyn ResourceLimiter) + Send + Sync>;
-
-/// Wasm pages → bytes (the limiter works in bytes for memory).
-fn bytes(pages: u64) -> usize {
-    pages as usize * PAGE_SIZE
+/// The store's resource limiter — a sync or (under `async`) async projection of host
+/// state `T` to a limiter trait object. One slot: setting one kind replaces the other.
+pub(crate) enum ResourceLimiterInner<T> {
+    Sync(Box<dyn FnMut(&mut T) -> &mut (dyn ResourceLimiter) + Send + Sync>),
+    #[cfg(feature = "async")]
+    Async(Box<dyn FnMut(&mut T) -> &mut (dyn ResourceLimiterAsync) + Send + Sync>),
 }
 
 /// A host-function closure, type-erased only over arity — kept generic in `T`.
 pub(crate) type HostFunc<T> =
     Arc<dyn Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync>;
+
+/// An async host-function closure: returns a boxed future the async driver awaits.
+/// Well-formed for any `T` (the `Send` bounds sit on the `dyn Fn`/future, not `T`).
+#[cfg(feature = "async")]
+pub(crate) type AsyncHostFunc<T> = Arc<
+    dyn for<'a> Fn(
+            Caller<'a, T>,
+            &'a [Val],
+            &'a mut [Val],
+        )
+            -> std::boxed::Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>
+        + Send
+        + Sync,
+>;
 
 /// An epoch-deadline callback (`None` = trap on deadline). `T`-generic, so it
 /// lives on `Store<T>` and is applied by the generic execution driver.
@@ -43,11 +59,14 @@ pub struct Store<T: 'static> {
     pub(crate) data: T,
     /// Host closures created via `Func::new`/`wrap`; `FuncEntity::Host` indexes here.
     pub(crate) host_funcs: Vec<HostFunc<T>>,
+    /// Async host closures (`Func::new_async`/`wrap_async`); `FuncEntity::HostAsync` indexes here.
+    #[cfg(feature = "async")]
+    pub(crate) async_host_funcs: Vec<AsyncHostFunc<T>>,
     /// Action when the epoch deadline is reached; `None` traps.
     pub(crate) epoch_callback: Option<EpochCallback<T>>,
     /// Resource limiter (memory/table growth + entity counts); `None` = no limits
     /// beyond module-declared maxima.
-    pub(crate) limiter: Option<Limiter<T>>,
+    pub(crate) limiter: Option<ResourceLimiterInner<T>>,
 }
 
 impl<T: 'static> core::fmt::Debug for Store<T> {
@@ -63,6 +82,8 @@ impl<T: 'static> Store<T> {
             inner: StoreInner::new(engine.clone()),
             data,
             host_funcs: Vec::new(),
+            #[cfg(feature = "async")]
+            async_host_funcs: Vec::new(),
             epoch_callback: None,
             limiter: None,
         }
@@ -72,6 +93,14 @@ impl<T: 'static> Store<T> {
     pub(crate) fn push_host_func(&mut self, f: HostFunc<T>) -> u32 {
         let index = self.host_funcs.len() as u32;
         self.host_funcs.push(f);
+        index
+    }
+
+    /// Registers an async host closure, returning its index (in `FuncEntity::HostAsync`).
+    #[cfg(feature = "async")]
+    pub(crate) fn push_async_host_func(&mut self, f: AsyncHostFunc<T>) -> u32 {
+        let index = self.async_host_funcs.len() as u32;
+        self.async_host_funcs.push(f);
         index
     }
 
@@ -134,92 +163,20 @@ impl<T: 'static> Store<T> {
         &mut self,
         limiter: impl (FnMut(&mut T) -> &mut dyn ResourceLimiter) + Send + Sync + 'static,
     ) {
-        self.limiter = Some(Box::new(limiter));
+        self.limiter = Some(ResourceLimiterInner::Sync(Box::new(limiter)));
     }
 
-    /// Runs `f` against the installed limiter, if any (splits the disjoint
-    /// `limiter`/`data` fields).
-    fn with_limiter<R>(&mut self, f: impl FnOnce(&mut dyn ResourceLimiter) -> R) -> Option<R> {
-        self.limiter.as_mut().map(|l| f(l(&mut self.data)))
-    }
-
-    pub(crate) fn limiter_memories(&mut self) -> Option<usize> {
-        self.with_limiter(|l| l.memories())
-    }
-
-    pub(crate) fn limiter_tables(&mut self) -> Option<usize> {
-        self.with_limiter(|l| l.tables())
-    }
-
-    pub(crate) fn limiter_instances(&mut self) -> Option<usize> {
-        self.with_limiter(|l| l.instances())
-    }
-
-    /// Grows memory `handle` by `delta` pages, consulting the limiter and the
-    /// declared/architectural maximum. `Ok(Some(old))` grew; `Ok(None)` is a soft
-    /// failure (return `-1`); `Err` is a trap (`trap_on_grow_failure`).
-    pub(crate) fn grow_memory(&mut self, handle: Memory, delta: u64) -> Result<Option<u64>> {
-        let (current, max) = {
-            let e = self.inner.memory(handle);
-            (e.size_pages(), e.ty.maximum())
-        };
-        let desired = current.saturating_add(delta);
-        let allowed = self
-            .with_limiter(|l| l.memory_growing(bytes(current), bytes(desired), max.map(bytes)))
-            .transpose()?
-            .unwrap_or(true);
-        if allowed {
-            if let Some(old) = self.inner.memory_mut(handle).grow(delta) {
-                return Ok(Some(old));
-            }
-        }
-        self.with_limiter(|l| l.memory_grow_failed(Error::msg("failed to grow memory")))
-            .transpose()?;
-        Ok(None)
-    }
-
-    /// Grows table `handle` by `delta` elements (filled with `init`); same result
-    /// convention as [`grow_memory`](Self::grow_memory).
-    pub(crate) fn grow_table(
+    /// Installs an async resource limiter (growth decisions may `.await`). Replaces any
+    /// sync limiter; sync grow/alloc paths then error (use the async entry points).
+    #[cfg(feature = "async")]
+    pub fn limiter_async(
         &mut self,
-        handle: Table,
-        delta: u64,
-        init: Ref,
-    ) -> Result<Option<u64>> {
-        let (current, max) = {
-            let e = self.inner.table(handle);
-            (e.size() as usize, e.ty.maximum().map(|m| m as usize))
-        };
-        let desired = current.saturating_add(delta as usize);
-        let allowed = self
-            .with_limiter(|l| l.table_growing(current, desired, max))
-            .transpose()?
-            .unwrap_or(true);
-        if allowed {
-            if let Some(old) = self.inner.table_mut(handle).grow(delta, init) {
-                return Ok(Some(old));
-            }
-        }
-        self.with_limiter(|l| l.table_grow_failed(Error::msg("failed to grow table")))
-            .transpose()?;
-        Ok(None)
+        limiter: impl (FnMut(&mut T) -> &mut dyn ResourceLimiterAsync) + Send + Sync + 'static,
+    ) {
+        self.limiter = Some(ResourceLimiterInner::Async(Box::new(limiter)));
     }
 
-    /// Checks the limiter for a brand-new memory of `initial` pages (`Memory::new`).
-    pub(crate) fn limiter_allows_memory(&mut self, initial: u64, max: Option<u64>) -> Result<bool> {
-        Ok(self
-            .with_limiter(|l| l.memory_growing(0, bytes(initial), max.map(bytes)))
-            .transpose()?
-            .unwrap_or(true))
-    }
-
-    /// Checks the limiter for a brand-new table of `initial` elements (`Table::new`).
-    pub(crate) fn limiter_allows_table(&mut self, initial: u64, max: Option<u64>) -> Result<bool> {
-        Ok(self
-            .with_limiter(|l| l.table_growing(0, initial as usize, max.map(|m| m as usize)))
-            .transpose()?
-            .unwrap_or(true))
-    }
+    // Limiter consultation + memory/table growth live in `grow.rs`.
 
     pub fn as_context(&self) -> StoreContext<'_, T> {
         StoreContext(self)
@@ -229,9 +186,33 @@ impl<T: 'static> Store<T> {
         StoreContextMut(self)
     }
 
+    /// Configures the store to yield to the async executor every `interval` fuel units
+    /// (rather than trapping). Total fuel (`set_fuel`) still bounds the run. Requires
+    /// `consume_fuel` and an async store; `Some(0)` is rejected.
     #[cfg(feature = "async")]
     pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
-        todo!()
+        if !self.inner.engine().consume_fuel() {
+            return Err(Error::msg(
+                "fuel is not configured; set `Config::consume_fuel(true)`",
+            ));
+        }
+        if interval == Some(0) {
+            return Err(Error::msg("fuel_async_yield_interval must not be 0"));
+        }
+        if !self.inner.engine().is_async() {
+            return Err(Error::msg(
+                "fuel_async_yield_interval requires `Config::async_support(true)`",
+            ));
+        }
+        self.inner.set_fuel_yield_interval(interval);
+        Ok(())
+    }
+
+    /// Configures the epoch deadline to yield to the async executor and then extend the
+    /// deadline by `delta` ticks (instead of trapping). Requires an async store at run time.
+    #[cfg(feature = "async")]
+    pub fn epoch_deadline_async_yield_and_update(&mut self, delta: u64) {
+        self.epoch_callback = Some(Box::new(move |_| Ok(UpdateDeadline::Yield(delta))));
     }
 }
 

@@ -1,12 +1,25 @@
 //! `StoreInner` — the non-generic entity storage the runtime operates on, plus a
 //! simple index arena. Public handles (`Memory`/`Global`/… ) are indices into these.
 
+use std::num::NonZeroU64;
+
 use crate::engine::Engine;
 use crate::extern_::{Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
 
 use super::{FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity};
+
+/// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
+pub(crate) enum FuelStep {
+    /// Fuel was available and charged; keep running.
+    Ran,
+    /// Active fuel is exhausted but reserve remains: the async driver should yield
+    /// to the executor, then [`refuel_from_reserve`](StoreInner::refuel_from_reserve).
+    NeedYield,
+    /// No fuel left at all → `Trap::OutOfFuel`.
+    Exhausted,
+}
 
 /// An index-keyed arena; a handle is a `u32` index into the backing `Vec`.
 #[derive(Debug)]
@@ -47,8 +60,13 @@ pub(crate) struct StoreInner {
     tables: Arena<TableEntity>,
     globals: Arena<GlobalEntity>,
     instances: Arena<InstanceEntity>,
-    /// Remaining fuel (meaningful only when `engine.consume_fuel()`).
+    /// Active fuel — charged per op (meaningful only when `engine.consume_fuel()`).
+    /// With an async yield interval this is the current slice; total = `fuel + fuel_reserve`.
     fuel: u64,
+    /// Fuel held back from the active slice, released on each async yield.
+    fuel_reserve: u64,
+    /// Async fuel-yield granularity: yield to the executor every this-many units.
+    fuel_yield_interval: Option<NonZeroU64>,
     /// Absolute epoch value at/after which execution interrupts (`u64::MAX` = none).
     epoch_deadline: u64,
 }
@@ -63,6 +81,8 @@ impl StoreInner {
             globals: Arena::default(),
             instances: Arena::default(),
             fuel: 0,
+            fuel_reserve: 0,
+            fuel_yield_interval: None,
             epoch_deadline: u64::MAX,
         }
     }
@@ -71,22 +91,49 @@ impl StoreInner {
         &self.engine
     }
 
+    /// Total remaining fuel (active slice + reserve).
     pub(crate) fn fuel(&self) -> u64 {
-        self.fuel
+        self.fuel + self.fuel_reserve
     }
 
-    pub(crate) fn set_fuel(&mut self, fuel: u64) {
-        self.fuel = fuel;
+    /// Sets total fuel, splitting it into the active slice + reserve per the yield
+    /// interval (no interval ⇒ all active, reserve 0 — identical to plain metering).
+    pub(crate) fn set_fuel(&mut self, total: u64) {
+        let active = self
+            .fuel_yield_interval
+            .map_or(total, |i| total.min(i.get()));
+        self.fuel = active;
+        self.fuel_reserve = total - active;
     }
 
-    /// Charges one unit of fuel; returns false (without underflowing) if empty.
-    pub(crate) fn try_consume_fuel(&mut self) -> bool {
-        if self.fuel == 0 {
-            false
-        } else {
+    /// Sets the async fuel-yield interval, then re-splits the current total fuel.
+    pub(crate) fn set_fuel_yield_interval(&mut self, interval: Option<u64>) {
+        self.fuel_yield_interval = interval.and_then(NonZeroU64::new);
+        self.set_fuel(self.fuel());
+    }
+
+    /// Charges one unit from the active slice. `NeedYield` when the slice is empty
+    /// but reserve remains (async yield point); `Exhausted` when no fuel is left.
+    pub(crate) fn consume_fuel_step(&mut self) -> FuelStep {
+        if self.fuel > 0 {
             self.fuel -= 1;
-            true
+            FuelStep::Ran
+        } else if self.fuel_reserve > 0 {
+            FuelStep::NeedYield
+        } else {
+            FuelStep::Exhausted
         }
+    }
+
+    /// Moves up to one interval's worth of fuel from reserve into the active slice
+    /// (after an async yield). No-op without an interval.
+    pub(crate) fn refuel_from_reserve(&mut self) {
+        let take = self
+            .fuel_yield_interval
+            .map_or(0, NonZeroU64::get)
+            .min(self.fuel_reserve);
+        self.fuel += take;
+        self.fuel_reserve -= take;
     }
 
     pub(crate) fn set_epoch_deadline(&mut self, deadline: u64) {

@@ -39,6 +39,23 @@ fn check_limits<T: 'static>(
     Ok(())
 }
 
+/// Shared instantiation core: enforces limits, builds the instance, and resolves the
+/// optional `start` function — leaving the caller to run it sync ([`Instance::new`]) or
+/// async ([`Instance::new_async`]).
+fn instantiate_resolve_start(
+    store: &mut impl AsContextMut,
+    module: &Module,
+    imports: &[Extern],
+) -> Result<(Instance, Option<Func>)> {
+    check_limits(store, module)?;
+    let instance = init::instantiate(store.as_context_mut().into_inner_mut(), module, imports)?;
+    let start = module
+        .inner()
+        .start
+        .map(|idx| store.as_context_mut().inner().instance(instance).funcs[idx as usize]);
+    Ok((instance, start))
+}
+
 /// An instantiated WebAssembly module. Lightweight, store-bound handle.
 #[derive(Copy, Clone, Debug)]
 pub struct Instance {
@@ -51,13 +68,36 @@ impl Instance {
         module: &Module,
         imports: &[Extern],
     ) -> Result<Instance> {
-        check_limits(&mut store, module)?;
-        let instance = init::instantiate(store.as_context_mut().into_inner_mut(), module, imports)?;
+        if store.as_context().engine().is_async() {
+            return Err(Error::msg(
+                "cannot use `new` on an async store; use `new_async`",
+            ));
+        }
+        let (instance, start) = instantiate_resolve_start(&mut store, module, imports)?;
         // The start function runs before any export is callable; a trap aborts
         // instantiation. Routed through `Func::call` so it handles wasm/host starts.
-        if let Some(start_idx) = module.inner().start {
-            let func = store.as_context_mut().inner().instance(instance).funcs[start_idx as usize];
+        if let Some(func) = start {
             func.call(&mut store, &[], &mut [])?;
+        }
+        Ok(instance)
+    }
+
+    /// Async sibling of [`new`](Instance::new): runs the `start` function as a `Future`
+    /// (so an async host fn it calls can suspend). Requires an async store.
+    #[cfg(feature = "async")]
+    pub async fn new_async(
+        mut store: impl AsContextMut,
+        module: &Module,
+        imports: &[Extern],
+    ) -> Result<Instance> {
+        if !store.as_context().engine().is_async() {
+            return Err(Error::msg(
+                "cannot use `new_async` without `Config::async_support(true)`",
+            ));
+        }
+        let (instance, start) = instantiate_resolve_start(&mut store, module, imports)?;
+        if let Some(func) = start {
+            func.call_async(&mut store, &[], &mut []).await?;
         }
         Ok(instance)
     }

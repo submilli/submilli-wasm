@@ -1,5 +1,7 @@
 //! `Func`, `TypedFunc`, `Caller`, and the host-function traits.
 
+#[cfg(feature = "async")]
+mod async_func;
 mod into_func;
 mod wasm_ty;
 
@@ -7,6 +9,8 @@ mod wasm_ty;
 #[path = "tests.rs"]
 mod tests;
 
+#[cfg(feature = "async")]
+pub(crate) use into_func::into_async_func;
 pub use into_func::IntoFunc;
 pub use wasm_ty::{WasmParams, WasmResults, WasmRet, WasmTy};
 
@@ -16,7 +20,9 @@ use std::sync::Arc;
 use crate::engine::Engine;
 use crate::extern_::Extern;
 use crate::instance::Instance;
-use crate::store::{AsContext, AsContextMut, FuncEntity, StoreContext, StoreContextMut};
+use crate::store::{
+    AsContext, AsContextMut, FuncEntity, StoreContext, StoreContextMut, StoreInner,
+};
 use crate::value::{FuncType, Val};
 use crate::Result;
 
@@ -30,6 +36,8 @@ pub struct Func {
 enum Callee {
     Wasm(Instance, u32),
     Host(u32),
+    #[cfg(feature = "async")]
+    HostAsync(u32),
 }
 
 impl Func {
@@ -68,6 +76,11 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
+        if store.as_context().engine().is_async() {
+            return Err(crate::Error::msg(
+                "cannot use `call` on an async store; use `call_async`",
+            ));
+        }
         let ty = self.ty(&store);
         check_args(params, &ty)?;
         if results.len() != ty.results().len() {
@@ -75,13 +88,7 @@ impl Func {
         }
         // Copy out the entity's Copy fields, releasing the borrow before we
         // re-borrow the store mutably for the call.
-        let kind = match store.as_context_mut().inner().func(*self) {
-            FuncEntity::Wasm {
-                instance,
-                func_index,
-            } => Callee::Wasm(*instance, *func_index),
-            FuncEntity::Host { host_index, .. } => Callee::Host(*host_index),
-        };
+        let kind = self.resolve_callee(store.as_context().inner());
         let out = match kind {
             Callee::Wasm(instance, func_index) => {
                 let mut ctx = store.as_context_mut();
@@ -95,16 +102,32 @@ impl Func {
             }
             Callee::Host(host_index) => {
                 let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();
-                let mut out = ty
-                    .results()
-                    .map(|t| Val::default_for(&t))
-                    .collect::<Vec<_>>();
+                let mut out = default_results(&ty);
                 cb(Caller::new(store.as_context_mut(), None), params, &mut out)?;
                 out
+            }
+            #[cfg(feature = "async")]
+            Callee::HostAsync(_) => {
+                return Err(crate::Error::msg(
+                    "cannot call an async host function synchronously; use `call_async`",
+                ));
             }
         };
         results.clone_from_slice(&out);
         Ok(())
+    }
+
+    /// Extracts the callee's `Copy` fields, releasing the entity borrow before the call.
+    fn resolve_callee(self, inner: &StoreInner) -> Callee {
+        match inner.func(self) {
+            FuncEntity::Wasm {
+                instance,
+                func_index,
+            } => Callee::Wasm(*instance, *func_index),
+            FuncEntity::Host { host_index, .. } => Callee::Host(*host_index),
+            #[cfg(feature = "async")]
+            FuncEntity::HostAsync { host_index, .. } => Callee::HostAsync(*host_index),
+        }
     }
 
     /// Obtains a statically-typed handle to this function.
@@ -143,8 +166,15 @@ impl Func {
                 .func_type(*func_index)
                 .clone(),
             FuncEntity::Host { ty, .. } => ty.clone(),
+            #[cfg(feature = "async")]
+            FuncEntity::HostAsync { ty, .. } => ty.clone(),
         }
     }
+}
+
+/// A zero/default-initialized results buffer sized to `ty`'s results.
+fn default_results(ty: &FuncType) -> Vec<Val> {
+    ty.results().map(|t| Val::default_for(&t)).collect()
 }
 
 /// Checks the argument count and per-value types against `ty`'s parameters.
