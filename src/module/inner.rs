@@ -22,7 +22,7 @@ pub(crate) struct ModuleInner {
     pub exports: Vec<Export>,
     /// *Defined* memory/table/global descriptors (imported ones live in `imports`).
     pub memories: Vec<MemoryType>,
-    pub tables: Vec<TableType>,
+    pub tables: Vec<TableDef>,
     pub globals: Vec<GlobalDef>,
     pub datas: Vec<DataSegment>,
     pub elems: Vec<ElemSegment>,
@@ -58,6 +58,14 @@ pub(crate) enum ExportKind {
     Table(u32),
     Memory(u32),
     Global(u32),
+}
+
+/// A defined table: its type plus an optional constant initializer expression
+/// (function-references; `None` means default-null per the reference-types form).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TableDef {
+    pub ty: TableType,
+    pub init: Option<ConstExpr>,
 }
 
 /// A defined global: its type plus the constant initializer expression.
@@ -171,7 +179,7 @@ impl ModuleInner {
                 n += 1;
             }
         }
-        self.tables[(idx - n) as usize].clone()
+        self.tables[(idx - n) as usize].ty.clone()
     }
 
     fn nth_global(&self, idx: u32) -> GlobalType {

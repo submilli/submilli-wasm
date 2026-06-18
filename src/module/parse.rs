@@ -16,7 +16,7 @@ use crate::engine::Engine;
 use crate::module::compile::{conv_valtype, translate_function, CompileCtx};
 use crate::module::inner::{
     ConstExpr, DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export, ExportKind,
-    GlobalDef, Import, ImportKind, ModuleInner,
+    GlobalDef, Import, ImportKind, ModuleInner, TableDef,
 };
 use crate::module::op::CompiledFunc;
 use crate::value::{FuncType, GlobalType, MemoryType, Mutability, RefType, TableType, ValType};
@@ -42,7 +42,13 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
             }
             Payload::TableSection(r) => {
                 for t in r {
-                    m.tables.push(conv_tabletype(t.map_err(wp_err)?.ty)?);
+                    let t = t.map_err(wp_err)?;
+                    let ty = conv_tabletype(&m.types, t.ty)?;
+                    let init = match t.init {
+                        wasmparser::TableInit::RefNull => None,
+                        wasmparser::TableInit::Expr(e) => Some(parse_const_expr(&m.types, &e)?),
+                    };
+                    m.tables.push(TableDef { ty, init });
                 }
             }
             Payload::MemorySection(r) => {
@@ -50,11 +56,11 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
                     m.memories.push(conv_memtype(mt.map_err(wp_err)?));
                 }
             }
-            Payload::GlobalSection(r) => parse_globals(&mut m.globals, r)?,
+            Payload::GlobalSection(r) => parse_globals(&m.types, &mut m.globals, r)?,
             Payload::ExportSection(r) => parse_exports(&mut m.exports, r)?,
             Payload::StartSection { func, .. } => m.start = Some(func),
-            Payload::ElementSection(r) => parse_elems(&mut m.elems, r)?,
-            Payload::DataSection(r) => parse_datas(&mut m.datas, r)?,
+            Payload::ElementSection(r) => parse_elems(&m.types, &mut m.elems, r)?,
+            Payload::DataSection(r) => parse_datas(&m.types, &mut m.datas, r)?,
             Payload::CodeSectionEntry(body) => bodies.push(body),
             _ => {}
         }
@@ -91,16 +97,19 @@ fn parse_types(
             let wasmparser::CompositeInnerType::Func(ft) = sub.composite_type.inner else {
                 return Err(Error::msg("non-function composite types not supported"));
             };
-            let params = conv_valtypes(ft.params())?;
-            let results = conv_valtypes(ft.results())?;
+            let params = conv_valtypes(out, ft.params())?;
+            let results = conv_valtypes(out, ft.results())?;
             out.push(FuncType::new(engine, params, results));
         }
     }
     Ok(())
 }
 
-fn conv_valtypes(tys: &[wasmparser::ValType]) -> Result<Vec<ValType>> {
-    tys.iter().copied().map(conv_valtype).collect()
+fn conv_valtypes(types: &[FuncType], tys: &[wasmparser::ValType]) -> Result<Vec<ValType>> {
+    tys.iter()
+        .copied()
+        .map(|t| conv_valtype(types, t))
+        .collect()
 }
 
 fn parse_imports(m: &mut ModuleInner, reader: ImportSectionReader<'_>) -> Result<()> {
@@ -120,9 +129,9 @@ fn push_import(m: &mut ModuleInner, imp: &wasmparser::Import<'_>) -> Result<()> 
             m.num_imported_funcs += 1;
             ImportKind::Func(t)
         }
-        TypeRef::Table(tt) => ImportKind::Table(conv_tabletype(tt)?),
+        TypeRef::Table(tt) => ImportKind::Table(conv_tabletype(&m.types, tt)?),
         TypeRef::Memory(mt) => ImportKind::Memory(conv_memtype(mt)),
-        TypeRef::Global(gt) => ImportKind::Global(conv_globaltype(gt)?),
+        TypeRef::Global(gt) => ImportKind::Global(conv_globaltype(&m.types, gt)?),
         TypeRef::Tag(_) | TypeRef::FuncExact(_) => {
             return Err(Error::msg("unsupported import kind"))
         }
@@ -135,12 +144,16 @@ fn push_import(m: &mut ModuleInner, imp: &wasmparser::Import<'_>) -> Result<()> 
     Ok(())
 }
 
-fn parse_globals(out: &mut Vec<GlobalDef>, reader: GlobalSectionReader<'_>) -> Result<()> {
+fn parse_globals(
+    types: &[FuncType],
+    out: &mut Vec<GlobalDef>,
+    reader: GlobalSectionReader<'_>,
+) -> Result<()> {
     for g in reader {
         let g = g.map_err(wp_err)?;
         out.push(GlobalDef {
-            ty: conv_globaltype(g.ty)?,
-            init: parse_const_expr(&g.init_expr)?,
+            ty: conv_globaltype(types, g.ty)?,
+            init: parse_const_expr(types, &g.init_expr)?,
         });
     }
     Ok(())
@@ -167,6 +180,7 @@ fn parse_exports(out: &mut Vec<Export>, reader: wasmparser::ExportSectionReader<
 }
 
 fn parse_elems(
+    types: &[FuncType],
     out: &mut Vec<ElemSegment>,
     reader: wasmparser::ElementSectionReader<'_>,
 ) -> Result<()> {
@@ -180,18 +194,18 @@ fn parse_elems(
                 offset_expr,
             } => ElemMode::Active {
                 table: table_index.unwrap_or(0),
-                offset: parse_const_expr(&offset_expr)?,
+                offset: parse_const_expr(types, &offset_expr)?,
             },
         };
         out.push(ElemSegment {
             mode,
-            items: conv_elem_items(e.items)?,
+            items: conv_elem_items(types, e.items)?,
         });
     }
     Ok(())
 }
 
-fn conv_elem_items(items: ElementItems<'_>) -> Result<ElemItems> {
+fn conv_elem_items(types: &[FuncType], items: ElementItems<'_>) -> Result<ElemItems> {
     match items {
         ElementItems::Functions(r) => {
             let funcs = r
@@ -203,7 +217,7 @@ fn conv_elem_items(items: ElementItems<'_>) -> Result<ElemItems> {
         ElementItems::Expressions(_, r) => {
             let exprs = r
                 .into_iter()
-                .map(|e| parse_const_expr(&e.map_err(wp_err)?))
+                .map(|e| parse_const_expr(types, &e.map_err(wp_err)?))
                 .collect::<Result<Vec<_>>>()?;
             Ok(ElemItems::Exprs(exprs.into_boxed_slice()))
         }
@@ -211,6 +225,7 @@ fn conv_elem_items(items: ElementItems<'_>) -> Result<ElemItems> {
 }
 
 fn parse_datas(
+    types: &[FuncType],
     out: &mut Vec<DataSegment>,
     reader: wasmparser::DataSectionReader<'_>,
 ) -> Result<()> {
@@ -223,7 +238,7 @@ fn parse_datas(
                 offset_expr,
             } => DataMode::Active {
                 memory: memory_index,
-                offset: parse_const_expr(&offset_expr)?,
+                offset: parse_const_expr(types, &offset_expr)?,
             },
         };
         out.push(DataSegment {
@@ -234,7 +249,7 @@ fn parse_datas(
     Ok(())
 }
 
-fn parse_const_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
+fn parse_const_expr(types: &[FuncType], expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
     let mut ops = expr.get_operators_reader();
     let op = ops.read().map_err(wp_err)?;
     Ok(match op {
@@ -242,7 +257,7 @@ fn parse_const_expr(expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
         Operator::I64Const { value } => ConstExpr::I64(value),
         Operator::F32Const { value } => ConstExpr::F32(value.bits()),
         Operator::F64Const { value } => ConstExpr::F64(value.bits()),
-        Operator::RefNull { hty } => ConstExpr::RefNull(conv_reftype_heap(hty)?),
+        Operator::RefNull { hty } => ConstExpr::RefNull(conv_reftype_heap(types, hty)?),
         Operator::RefFunc { function_index } => ConstExpr::RefFunc(function_index),
         Operator::GlobalGet { global_index } => ConstExpr::GlobalGet(global_index),
         _ => return Err(Error::msg("unsupported constant expression")),
@@ -274,30 +289,36 @@ fn conv_memtype(mt: wasmparser::MemoryType) -> MemoryType {
     }
 }
 
-fn conv_globaltype(gt: wasmparser::GlobalType) -> Result<GlobalType> {
+fn conv_globaltype(types: &[FuncType], gt: wasmparser::GlobalType) -> Result<GlobalType> {
     let mutability = if gt.mutable {
         Mutability::Var
     } else {
         Mutability::Const
     };
-    Ok(GlobalType::new(conv_valtype(gt.content_type)?, mutability))
+    Ok(GlobalType::new(
+        conv_valtype(types, gt.content_type)?,
+        mutability,
+    ))
 }
 
-fn conv_tabletype(tt: wasmparser::TableType) -> Result<TableType> {
+fn conv_tabletype(types: &[FuncType], tt: wasmparser::TableType) -> Result<TableType> {
     Ok(TableType::new(
-        conv_reftype(tt.element_type)?,
+        conv_reftype(types, tt.element_type)?,
         tt.initial as u32,
         tt.maximum.map(|m| m as u32),
     ))
 }
 
-fn conv_reftype(rt: wasmparser::RefType) -> Result<RefType> {
-    match conv_valtype(wasmparser::ValType::Ref(rt))? {
+fn conv_reftype(types: &[FuncType], rt: wasmparser::RefType) -> Result<RefType> {
+    match conv_valtype(types, wasmparser::ValType::Ref(rt))? {
         ValType::Ref(r) => Ok(r),
         _ => unreachable!("Ref maps to Ref"),
     }
 }
 
-fn conv_reftype_heap(hty: wasmparser::HeapType) -> Result<RefType> {
-    conv_reftype(wasmparser::RefType::new(true, hty).ok_or_else(|| Error::msg("bad ref type"))?)
+fn conv_reftype_heap(types: &[FuncType], hty: wasmparser::HeapType) -> Result<RefType> {
+    conv_reftype(
+        types,
+        wasmparser::RefType::new(true, hty).ok_or_else(|| Error::msg("bad ref type"))?,
+    )
 }

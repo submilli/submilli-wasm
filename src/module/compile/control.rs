@@ -243,6 +243,36 @@ impl Translator<'_> {
         });
     }
 
+    pub(super) fn call_ref(&mut self, type_index: u32) {
+        let (params, results) = self.signature(type_index);
+        self.pop(1 + params); // callee funcref + params
+        self.push(results);
+        self.emit(Op::CallRef(type_index));
+    }
+
+    /// `br_on_null`: on the (null) branch the reference is consumed and the target
+    /// receives only its label values; on fall-through the non-null reference stays.
+    /// So the branch target is computed with the reference already popped.
+    pub(super) fn br_on_null(&mut self, depth: u32) {
+        self.pop(1); // reference (excluded from the branch target's operands)
+        let (target, patch_frame) = self.branch_target(depth);
+        let idx = self.ops.len() as u32;
+        self.emit(Op::BrOnNull(target));
+        self.register_branch(patch_frame, idx, PatchSlot::Single);
+        self.push(1); // fall-through keeps the (non-null) reference
+    }
+
+    /// `br_on_non_null`: on the (non-null) branch the reference is kept and the target's
+    /// label arity includes it; on fall-through (null) the reference is dropped. So the
+    /// branch target is computed with the reference still on the stack.
+    pub(super) fn br_on_non_null(&mut self, depth: u32) {
+        let (target, patch_frame) = self.branch_target(depth);
+        let idx = self.ops.len() as u32;
+        self.emit(Op::BrOnNonNull(target));
+        self.register_branch(patch_frame, idx, PatchSlot::Single);
+        self.pop(1); // fall-through drops the reference
+    }
+
     fn signature(&self, type_index: u32) -> (u32, u32) {
         let ty = &self.ctx.types[type_index as usize];
         (ty.params().len() as u32, ty.results().len() as u32)
@@ -279,7 +309,9 @@ impl Translator<'_> {
 
     fn patch_ip(&mut self, op: u32, slot: PatchSlot, ip: u32) {
         match &mut self.ops[op as usize] {
-            Op::Br(t) | Op::BrIf(t) | Op::BrIfNot(t) => t.ip = ip,
+            Op::Br(t) | Op::BrIf(t) | Op::BrIfNot(t) | Op::BrOnNull(t) | Op::BrOnNonNull(t) => {
+                t.ip = ip;
+            }
             Op::BrTable { targets, default } => match slot {
                 PatchSlot::TableCase(k) => targets[k as usize].ip = ip,
                 PatchSlot::TableDefault => default.ip = ip,

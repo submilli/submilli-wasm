@@ -1,9 +1,10 @@
-//! GC reference stubs. Types exist so `Val` matches wasmtime; real GC is Phase 5.
+//! GC reference handles. `externref` is real (a store-side host-payload arena, #26c);
+//! the managed-GC refs (`anyref`/struct/array/exn) stay stubs until Phase 5.
 
 use core::any::Any;
 use core::marker::PhantomData;
 
-use crate::store::{AsContext, AsContextMut};
+use crate::store::{AsContext, AsContextMut, StoreContext, StoreContextMut};
 use crate::value::gc_type::{ArrayType, StructType};
 use crate::value::Val;
 use crate::Result;
@@ -29,14 +30,30 @@ impl<T> core::fmt::Debug for Rooted<T> {
     }
 }
 
-/// A scope bounding the lifetime of [`Rooted`] references.
+/// A scope bounding the lifetime of [`Rooted`] references. It delegates store access to
+/// the wrapped store, so it's usable anywhere an `AsContext[Mut]` is. Reclamation on
+/// drop is a no-op until the GC phase (the arena is grow-only; #27g adds collection).
 pub struct RootScope<S> {
-    _store: S,
+    store: S,
 }
 
 impl<S: AsContextMut> RootScope<S> {
     pub fn new(store: S) -> Self {
-        RootScope { _store: store }
+        RootScope { store }
+    }
+}
+
+impl<S: AsContext> AsContext for RootScope<S> {
+    type Data = S::Data;
+
+    fn as_context(&self) -> StoreContext<'_, S::Data> {
+        self.store.as_context()
+    }
+}
+
+impl<S: AsContextMut> AsContextMut for RootScope<S> {
+    fn as_context_mut(&mut self) -> StoreContextMut<'_, S::Data> {
+        self.store.as_context_mut()
     }
 }
 
@@ -53,15 +70,34 @@ pub struct ExternRef {
 }
 
 impl ExternRef {
-    pub fn new<T>(store: impl AsContextMut, value: T) -> Result<Rooted<ExternRef>>
+    /// Wraps a host `value` as an `externref`, stored in the store's externref arena.
+    pub fn new<T>(mut store: impl AsContextMut, value: T) -> Result<Rooted<ExternRef>>
     where
         T: Any + Send + Sync + 'static,
     {
-        todo!()
+        let index = store
+            .as_context_mut()
+            .inner_mut()
+            .alloc_externref(Box::new(value));
+        Ok(Rooted {
+            index,
+            _marker: PhantomData,
+        })
     }
+}
 
-    pub fn data(&self, store: impl AsContext) -> Option<&dyn Any> {
-        todo!()
+impl Rooted<ExternRef> {
+    /// Borrows the host payload behind this `externref` (downcast with `Any`). `None` if
+    /// the referent carries no host data. Mirrors `wasmtime::ExternRef::data` (reached
+    /// there via `Rooted`'s `Deref`; we expose it directly to stay `unsafe`-free).
+    pub fn data<'a, T>(
+        &self,
+        store: impl Into<StoreContext<'a, T>>,
+    ) -> Result<Option<&'a (dyn Any + Send + Sync)>>
+    where
+        T: 'static,
+    {
+        Ok(store.into().inner().externref(self.index))
     }
 }
 

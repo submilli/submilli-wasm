@@ -10,7 +10,7 @@ use crate::store::{
     FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, StoreInner, TableEntity,
 };
 use crate::trap::Trap;
-use crate::value::{GlobalType, HeapType, MemoryType, Ref, RefType, TableType, Val};
+use crate::value::{GlobalType, HeapType, MemoryType, Mutability, Ref, RefType, TableType, Val};
 use crate::{Error, Result};
 
 /// Index spaces built from a module's imports.
@@ -32,22 +32,31 @@ pub(crate) fn instantiate(
     for mt in &m.memories {
         memories.push(inner.alloc_memory(MemoryEntity::new(mt.clone())));
     }
-    for tt in &m.tables {
-        tables.push(inner.alloc_table(TableEntity::new(tt.clone(), null_ref(tt.element()))));
-    }
-    for g in &m.globals {
-        let value = eval_const(inner, &globals, &g.init)?;
-        globals.push(inner.alloc_global(GlobalEntity {
-            value,
-            ty: g.ty.clone(),
-        }));
-    }
-
+    // Function handles are allocated before tables/globals so a table or global
+    // initializer can `ref.func` a defined function (reference-types / function-references).
     let instance = inner.reserve_instance();
     for i in 0..m.functions.len() as u32 {
         funcs.push(inner.alloc_func(FuncEntity::Wasm {
             instance,
             func_index: m.num_imported_funcs + i,
+        }));
+    }
+    for td in &m.tables {
+        let init = match &td.init {
+            Some(e) => eval_const_ref(inner, &globals, &funcs, e)?,
+            None => null_ref(td.ty.element()),
+        };
+        tables.push(inner.alloc_table(TableEntity::new(td.ty.clone(), init)));
+    }
+
+    for g in &m.globals {
+        let value = match &g.init {
+            ConstExpr::RefFunc(i) => Val::FuncRef(Some(funcs[*i as usize])),
+            other => eval_const(inner, &globals, other)?,
+        };
+        globals.push(inner.alloc_global(GlobalEntity {
+            value,
+            ty: g.ty.clone(),
         }));
     }
 
@@ -125,10 +134,11 @@ fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Re
 }
 
 fn check_memory(inner: &StoreInner, declared: &MemoryType, m: Memory) -> Result<()> {
-    let actual = &inner.memory(m).ty;
+    let entity = inner.memory(m);
+    // Current page count is the effective minimum (mirrors `check_table`).
     if limits_ok(
-        actual.minimum(),
-        actual.maximum(),
+        entity.size_pages(),
+        entity.ty.maximum(),
         declared.minimum(),
         declared.maximum(),
     ) {
@@ -139,11 +149,13 @@ fn check_memory(inner: &StoreInner, declared: &MemoryType, m: Memory) -> Result<
 }
 
 fn check_table(inner: &StoreInner, declared: &TableType, t: Table) -> Result<()> {
-    let actual = &inner.table(t).ty;
-    let ok = actual.element() == declared.element()
+    let entity = inner.table(t);
+    // Import matching uses the table's *current size* as its effective minimum (a table
+    // grown past its declared minimum still satisfies imports declaring that larger min).
+    let ok = entity.ty.element() == declared.element()
         && limits_ok(
-            actual.minimum(),
-            actual.maximum(),
+            entity.size(),
+            entity.ty.maximum(),
             declared.minimum(),
             declared.maximum(),
         );
@@ -156,7 +168,14 @@ fn check_table(inner: &StoreInner, declared: &TableType, t: Table) -> Result<()>
 
 fn check_global(inner: &StoreInner, declared: &GlobalType, g: Global) -> Result<()> {
     let actual = &inner.global(g).ty;
-    if actual.content() == declared.content() && actual.mutability() == declared.mutability() {
+    let ok = actual.mutability() == declared.mutability()
+        && match declared.mutability() {
+            // Immutable globals are read-only, so the export type need only be a subtype of
+            // the import type (covariant). Mutable globals are read+written, so invariant.
+            Mutability::Const => actual.content().matches(declared.content()),
+            Mutability::Var => actual.content() == declared.content(),
+        };
+    if ok {
         Ok(())
     } else {
         Err(Error::msg("imported global type mismatch"))
@@ -247,7 +266,7 @@ fn eval_const(inner: &StoreInner, globals: &[Global], e: &ConstExpr) -> Result<V
     })
 }
 
-fn eval_const_ref(
+pub(crate) fn eval_const_ref(
     inner: &StoreInner,
     globals: &[Global],
     funcs: &[Func],
@@ -271,7 +290,7 @@ fn const_to_usize(v: Val) -> Result<usize> {
 
 fn null_ref(rt: &RefType) -> Ref {
     match rt.heap_type() {
-        HeapType::Func | HeapType::NoFunc => Ref::Func(None),
+        HeapType::Func | HeapType::NoFunc | HeapType::ConcreteFunc(_) => Ref::Func(None),
         HeapType::Extern | HeapType::NoExtern => Ref::Extern(None),
         HeapType::Exn | HeapType::NoExn => Ref::Exn(None),
         _ => Ref::Any(None),
@@ -280,7 +299,7 @@ fn null_ref(rt: &RefType) -> Ref {
 
 fn null_val(rt: &RefType) -> Val {
     match rt.heap_type() {
-        HeapType::Func | HeapType::NoFunc => Val::FuncRef(None),
+        HeapType::Func | HeapType::NoFunc | HeapType::ConcreteFunc(_) => Val::FuncRef(None),
         HeapType::Extern | HeapType::NoExtern => Val::ExternRef(None),
         HeapType::Exn | HeapType::NoExn => Val::ExnRef(None),
         _ => Val::AnyRef(None),

@@ -12,6 +12,7 @@ use crate::value::Val;
 use crate::{Error, Result};
 
 impl Execution {
+    /// Executes a numeric/comparison/conversion op. `step` routes only these ops here.
     #[allow(clippy::too_many_lines)] // flat opcode dispatch; arms are one-liners
     pub(super) fn exec_numeric(
         &mut self,
@@ -186,41 +187,6 @@ impl Execution {
             O::I64Extend8S => self.i64_unop(|a| i64::from(a as i8)),
             O::I64Extend16S => self.i64_unop(|a| i64::from(a as i16)),
             O::I64Extend32S => self.i64_unop(|a| i64::from(a as i32)),
-
-            // --- memory ---
-            O::I32Load(_)
-            | O::I64Load(_)
-            | O::F32Load(_)
-            | O::F64Load(_)
-            | O::I32Load8S(_)
-            | O::I32Load8U(_)
-            | O::I32Load16S(_)
-            | O::I32Load16U(_)
-            | O::I64Load8S(_)
-            | O::I64Load8U(_)
-            | O::I64Load16S(_)
-            | O::I64Load16U(_)
-            | O::I64Load32S(_)
-            | O::I64Load32U(_)
-            | O::I32Store(_)
-            | O::I64Store(_)
-            | O::F32Store(_)
-            | O::F64Store(_)
-            | O::I32Store8(_)
-            | O::I32Store16(_)
-            | O::I64Store8(_)
-            | O::I64Store16(_)
-            | O::I64Store32(_)
-            | O::MemorySize
-            | O::MemoryGrow
-            | O::MemoryCopy
-            | O::MemoryFill
-            | O::MemoryInit(_)
-            | O::DataDrop(_) => return self.exec_memory(inner, op, instance),
-
-            O::TableInit { .. } | O::TableCopy { .. } | O::ElemDrop(_) => {
-                return self.exec_table(inner, op, instance)
-            }
 
             other => {
                 return Err(Error::msg(format!(

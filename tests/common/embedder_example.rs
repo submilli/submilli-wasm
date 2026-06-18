@@ -6,11 +6,11 @@
 // No inner attributes here: the including files set crate-level allows.
 
 use wasmtime::{
-    ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, Extern, FieldType, Finality, Func,
-    FuncType, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType, Module,
-    Mutability, Ref, RefType, ResourceLimiter, Result, StorageType, Store, StoreLimits,
-    StoreLimitsBuilder, StructRef, StructRefPre, StructType, Table, TableType, TypedFunc,
-    UpdateDeadline, Val, ValType,
+    ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, Extern, ExternRef, FieldType,
+    Finality, Func, FuncType, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType,
+    Module, Mutability, Ref, RefType, ResourceLimiter, Result, RootScope, StorageType, Store,
+    StoreLimits, StoreLimitsBuilder, StructRef, StructRefPre, StructType, Table, TableType,
+    TypedFunc, UpdateDeadline, Val, ValType,
 };
 
 struct HostState {
@@ -133,6 +133,16 @@ fn resource_control(store: &mut Store<HostState>, engine: &Engine) -> Result<()>
     engine.increment_epoch();
     let weak = engine.weak();
     let _upgraded = weak.upgrade();
+    Ok(())
+}
+
+// externref host-payload API (#26c): wrap host state in an externref and read it back,
+// including under a `RootScope`.
+fn externref_host_state(store: &mut Store<HostState>) -> Result<()> {
+    let r = ExternRef::new(&mut *store, 42u32)?;
+    let _data = r.data(&*store)?;
+    let mut scope = RootScope::new(&mut *store);
+    let _scoped = ExternRef::new(&mut scope, "hi".to_string())?;
     Ok(())
 }
 

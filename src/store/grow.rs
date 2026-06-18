@@ -198,13 +198,14 @@ impl<T: 'static> Store<T> {
             .await
     }
 
-    /// Async sibling of [`limiter_allows_table`](Self::limiter_allows_table) (`Table::new_async`).
-    pub(crate) async fn limiter_allows_table_async(
+    /// Consults the limiter for a table grow `current → desired` elements, awaiting an
+    /// async limiter. No limiter ⇒ allowed.
+    async fn table_growing_async(
         &mut self,
-        initial: u64,
-        max: Option<u64>,
+        current: usize,
+        desired: usize,
+        max: Option<usize>,
     ) -> Result<bool> {
-        let (current, desired, max) = (0, initial as usize, max.map(|m| m as usize));
         match &mut self.limiter {
             None => Ok(true),
             Some(ResourceLimiterInner::Sync(l)) => {
@@ -214,5 +215,42 @@ impl<T: 'static> Store<T> {
                 l(&mut self.data).table_growing(current, desired, max).await
             }
         }
+    }
+
+    /// Async sibling of [`limiter_allows_table`](Self::limiter_allows_table) (`Table::new_async`).
+    pub(crate) async fn limiter_allows_table_async(
+        &mut self,
+        initial: u64,
+        max: Option<u64>,
+    ) -> Result<bool> {
+        self.table_growing_async(0, initial as usize, max.map(|m| m as usize))
+            .await
+    }
+
+    /// Async sibling of [`grow_table`](Self::grow_table): awaits the limiter.
+    pub(crate) async fn grow_table_async(
+        &mut self,
+        handle: Table,
+        delta: u64,
+        init: Ref,
+    ) -> Result<Option<u64>> {
+        let (current, max) = {
+            let e = self.inner.table(handle);
+            (e.size() as usize, e.ty.maximum().map(|m| m as usize))
+        };
+        let desired = current.saturating_add(delta as usize);
+        let allowed = self.table_growing_async(current, desired, max).await?;
+        if allowed {
+            if let Some(old) = self.inner.table_mut(handle).grow(delta, init) {
+                return Ok(Some(old));
+            }
+        }
+        let err = Error::msg("failed to grow table");
+        match self.limiter.as_mut() {
+            None => {}
+            Some(ResourceLimiterInner::Sync(l)) => l(&mut self.data).table_grow_failed(err)?,
+            Some(ResourceLimiterInner::Async(l)) => l(&mut self.data).table_grow_failed(err)?,
+        }
+        Ok(None)
     }
 }

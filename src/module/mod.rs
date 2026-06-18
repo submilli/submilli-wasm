@@ -26,6 +26,14 @@ pub(crate) fn phase1_features() -> WasmFeatures {
         | WasmFeatures::BULK_MEMORY
         | WasmFeatures::SATURATING_FLOAT_TO_INT
         | WasmFeatures::FLOATS
+        | WasmFeatures::REFERENCE_TYPES
+        // `externref` (the `extern` heap type) is gated behind GC_TYPES in wasmparser
+        // even though it's a reference-types value; the full GC proposal (`GC`) — struct/
+        // array/anyref — stays off until Phase 5.
+        | WasmFeatures::GC_TYPES
+        // Typed/non-nullable refs, `call_ref`, `ref.as_non_null`, `br_on_null`/`br_on_non_null`
+        // (#26d). `return_call_ref` additionally needs tail-calls (#39), still off.
+        | WasmFeatures::FUNCTION_REFERENCES
 }
 
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same

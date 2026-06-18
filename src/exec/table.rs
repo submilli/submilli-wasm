@@ -1,5 +1,6 @@
-//! Bulk-memory table ops: `table.init`, `table.copy`, `elem.drop`. Mirrors the
-//! `memory.init`/`data.drop` handling in [`super::memory`].
+//! Table ops: `table.init/copy/get/set/size/fill` and `elem.drop`. Bulk-memory table
+//! parts mirror the `memory.init`/`data.drop` handling in [`super::memory`]; the reference
+//! *value* ops (`ref.null` etc.) live in [`super::ref_`].
 
 use super::Execution;
 use crate::instance::Instance;
@@ -7,7 +8,7 @@ use crate::module::inner::ElemItems;
 use crate::module::op::Op;
 use crate::store::StoreInner;
 use crate::trap::Trap;
-use crate::value::Ref;
+use crate::value::{Ref, Val};
 use crate::{Error, Result};
 
 fn oob() -> Error {
@@ -31,7 +32,47 @@ impl Execution {
                 inner.instance_mut(instance).dropped_elems[*elem as usize] = true;
                 Ok(())
             }
+            Op::TableGet(t) => self.table_get(inner, instance, *t),
+            Op::TableSet(t) => self.table_set(inner, instance, *t),
+            Op::TableSize(t) => {
+                let handle = inner.instance(instance).tables[*t as usize];
+                let size = inner.table(handle).size();
+                self.push(Val::I32(size as i32));
+                Ok(())
+            }
+            Op::TableFill(t) => self.table_fill(inner, instance, *t),
             _ => Err(Error::msg(format!("not a table op: {op:?}"))),
+        }
+    }
+
+    fn table_get(&mut self, inner: &StoreInner, instance: Instance, table: u32) -> Result<()> {
+        let idx = u64::from(self.pop_i32() as u32);
+        let handle = inner.instance(instance).tables[table as usize];
+        let r = inner.table(handle).get(idx).ok_or_else(oob)?;
+        self.push(Val::from_ref(r));
+        Ok(())
+    }
+
+    fn table_set(&mut self, inner: &mut StoreInner, instance: Instance, table: u32) -> Result<()> {
+        let val = self.pop().to_ref();
+        let idx = u64::from(self.pop_i32() as u32);
+        let handle = inner.instance(instance).tables[table as usize];
+        if inner.table_mut(handle).set(idx, val) {
+            Ok(())
+        } else {
+            Err(oob())
+        }
+    }
+
+    fn table_fill(&mut self, inner: &mut StoreInner, instance: Instance, table: u32) -> Result<()> {
+        let len = u64::from(self.pop_i32() as u32);
+        let val = self.pop().to_ref();
+        let dst = u64::from(self.pop_i32() as u32);
+        let handle = inner.instance(instance).tables[table as usize];
+        if inner.table_mut(handle).fill(dst, val, len) {
+            Ok(())
+        } else {
+            Err(oob())
         }
     }
 
@@ -53,7 +94,7 @@ impl Execution {
         let refs = if dropped {
             Vec::new()
         } else {
-            elem_refs(&entity.funcs, &module.inner().elems[elem as usize].items)?
+            elem_refs(inner, instance, &module.inner().elems[elem as usize].items)?
         };
 
         let src_end = checked_range(src, len, refs.len())?;
@@ -91,16 +132,21 @@ impl Execution {
     }
 }
 
-/// Builds the reference list of a (live) element segment for `table.init`.
-fn elem_refs(funcs: &[crate::func::Func], items: &ElemItems) -> Result<Vec<Ref>> {
+/// Builds the reference list of a (live) element segment for `table.init`, resolving
+/// `ref.func`/`ref.null`/`global.get` element expressions against the instance.
+fn elem_refs(inner: &StoreInner, instance: Instance, items: &ElemItems) -> Result<Vec<Ref>> {
+    let entity = inner.instance(instance);
     match items {
         ElemItems::Funcs(idxs) => Ok(idxs
             .iter()
-            .map(|&i| Ref::Func(Some(funcs[i as usize])))
+            .map(|&i| Ref::Func(Some(entity.funcs[i as usize])))
             .collect()),
-        ElemItems::Exprs(_) => Err(Error::msg(
-            "element expressions require reference-types (Phase 4)",
-        )),
+        ElemItems::Exprs(exprs) => exprs
+            .iter()
+            .map(|e| {
+                crate::instance::init::eval_const_ref(inner, &entity.globals, &entity.funcs, e)
+            })
+            .collect(),
     }
 }
 

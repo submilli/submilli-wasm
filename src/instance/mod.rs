@@ -1,7 +1,7 @@
 //! `Instance` — an instantiated module: its resolved index spaces plus the
 //! export-lookup API. Instantiation itself lives in [`init`].
 
-mod init;
+pub(crate) mod init;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

@@ -1,11 +1,31 @@
 //! `call_indirect`: table-element lookup, signature check, then a (wasm or host) call.
 
-use super::{resolve, CallReq, Execution, ResolvedCall, StepOutcome};
+use super::{CallReq, Execution, ResolvedCall, StepOutcome};
+use crate::func::Func;
 use crate::instance::Instance;
 use crate::store::{FuncEntity, StoreInner};
 use crate::trap::Trap;
 use crate::value::{FuncType, Ref};
 use crate::Result;
+
+/// Resolves a function handle to a wasm body (defining instance + compiled code) or a
+/// host func. Imported functions resolve transparently — the handle already points at
+/// the defining instance's `FuncEntity`.
+pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
+    match inner.func(f) {
+        FuncEntity::Wasm {
+            instance,
+            func_index,
+        } => {
+            let def_inst = *instance;
+            let module = inner.instance(def_inst).module.clone();
+            ResolvedCall::Wasm(def_inst, module.inner().compiled(*func_index))
+        }
+        FuncEntity::Host { .. } => ResolvedCall::Host(f),
+        #[cfg(feature = "async")]
+        FuncEntity::HostAsync { .. } => ResolvedCall::HostAsync(f),
+    }
+}
 
 impl Execution {
     pub(super) fn do_call_indirect(
@@ -60,6 +80,39 @@ impl Execution {
                 })
             }
         }
+    }
+
+    /// `call_ref`: pop a funcref operand and dispatch to it. Null traps; the signature
+    /// is statically guaranteed (validation), so there is no runtime type check.
+    pub(super) fn do_call_ref(
+        &mut self,
+        inner: &StoreInner,
+        instance: Instance,
+        return_ip: u32,
+    ) -> Result<StepOutcome> {
+        let f = match self.pop().to_ref() {
+            Ref::Func(Some(f)) => f,
+            Ref::Func(None) => return Err(Trap::NullReference.into()),
+            _ => return Err(Trap::BadSignature.into()),
+        };
+        Ok(match resolve(inner, f) {
+            ResolvedCall::Wasm(def_inst, code) => StepOutcome::DoCall(CallReq {
+                return_ip,
+                instance: def_inst,
+                code,
+            }),
+            ResolvedCall::Host(func) => StepOutcome::DoHostCall {
+                func,
+                instance,
+                return_ip,
+            },
+            #[cfg(feature = "async")]
+            ResolvedCall::HostAsync(func) => StepOutcome::DoHostAsyncCall {
+                func,
+                instance,
+                return_ip,
+            },
+        })
     }
 }
 

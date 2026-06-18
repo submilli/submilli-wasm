@@ -215,6 +215,29 @@ fn concurrent_stores_across_threads() {
     assert_eq!(results, vec![2_500, 5_000, 7_500, 10_000]);
 }
 
+// --- in-wasm table.grow under the async driver (#26a / grow_table_async) ---
+
+#[test]
+fn table_grow_under_async_driver() {
+    let engine = engine_with(false, false);
+    let m = module(
+        &engine,
+        "(module (table 1 funcref)
+            (func (export \"grow\") (param i32) (result i32)
+                (table.grow 0 (ref.null func) (local.get 0)))
+            (func (export \"size\") (result i32) (table.size 0)))",
+    );
+    let mut store = Store::new(&engine, ());
+    let inst = block_on(Instance::new_async(&mut store, &m, &[])).unwrap();
+    let grow = inst.get_func(&mut store, "grow").unwrap();
+    let mut out = [Val::I32(0)];
+    block_on(grow.call_async(&mut store, &[Val::I32(2)], &mut out)).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 1); // old size
+    let size = inst.get_func(&mut store, "size").unwrap();
+    block_on(size.call_async(&mut store, &[], &mut out)).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 3);
+}
+
 // --- sync entry rejects async host fns ------------------------------------
 
 #[test]

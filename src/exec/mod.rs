@@ -12,19 +12,22 @@ mod frame;
 pub(crate) mod host;
 mod memory;
 mod numeric;
+mod outcome;
+mod ref_;
 mod table;
 
 use std::sync::Arc;
 
-use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::op::{BranchTarget, CompiledFunc, Op};
-use crate::store::{FuelStep, FuncEntity, StoreInner};
+use crate::store::{FuelStep, StoreInner};
 use crate::trap::Trap;
 use crate::value::Val;
 use crate::Result;
 
 use self::frame::Frame;
+pub(crate) use outcome::Outcome;
+use outcome::{CallReq, ResolvedCall, StepOutcome};
 
 /// Transient interpreter state for one top-level call. Self-contained: it owns its
 /// operand/frame stacks and holds no borrow into the `Store` across an [`Outcome`]
@@ -42,66 +45,6 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Execution>();
 };
-
-/// Why [`Execution::run`] returned: either the call finished or it suspended on a
-/// host function the (generic) driver in [`host`] must invoke.
-pub(crate) enum Outcome {
-    Finished,
-    HostCall {
-        func: Func,
-        instance: Instance,
-    },
-    /// Suspended on an async host function; only the async driver can service it.
-    #[cfg(feature = "async")]
-    HostAsync {
-        func: Func,
-        instance: Instance,
-    },
-    /// The active fuel slice was exhausted with reserve remaining: yield to the
-    /// executor, refuel, and resume. Only produced under an async fuel-yield interval.
-    #[cfg(feature = "async")]
-    FuelYield,
-    EpochDeadline,
-    Grow {
-        memory: crate::extern_::Memory,
-        delta: u64,
-    },
-}
-
-enum StepOutcome {
-    Advance(u32),
-    DoCall(CallReq),
-    DoHostCall {
-        func: Func,
-        instance: Instance,
-        return_ip: u32,
-    },
-    #[cfg(feature = "async")]
-    DoHostAsyncCall {
-        func: Func,
-        instance: Instance,
-        return_ip: u32,
-    },
-    DoGrow {
-        memory: crate::extern_::Memory,
-        delta: u64,
-        return_ip: u32,
-    },
-}
-
-/// A resolved callee: a wasm body to push a frame for, or a host func to suspend on.
-enum ResolvedCall {
-    Wasm(Instance, Arc<CompiledFunc>),
-    Host(Func),
-    #[cfg(feature = "async")]
-    HostAsync(Func),
-}
-
-struct CallReq {
-    return_ip: u32,
-    instance: Instance,
-    code: Arc<CompiledFunc>,
-}
 
 impl Execution {
     fn push(&mut self, v: Val) {
@@ -239,6 +182,15 @@ impl Execution {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::Grow { memory, delta });
                 }
+                StepOutcome::DoTableGrow {
+                    table,
+                    delta,
+                    init,
+                    return_ip,
+                } => {
+                    self.frames.last_mut().expect("caller frame").ip = return_ip;
+                    return Ok(Outcome::TableGrow { table, delta, init });
+                }
             }
         }
     }
@@ -315,7 +267,7 @@ impl Execution {
             }
             Op::Call(f) => {
                 let callee = inner.instance(instance).funcs[*f as usize];
-                return Ok(match resolve(inner, callee) {
+                return Ok(match call::resolve(inner, callee) {
                     ResolvedCall::Wasm(callee_instance, code) => StepOutcome::DoCall(CallReq {
                         return_ip: next,
                         instance: callee_instance,
@@ -337,6 +289,24 @@ impl Execution {
             Op::CallIndirect { type_idx, table } => {
                 return self.do_call_indirect(inner, instance, *type_idx, *table, next)
             }
+            Op::CallRef(_) => return self.do_call_ref(inner, instance, next),
+            Op::BrOnNull(t) => {
+                let r = self.pop();
+                if r.is_null_ref() {
+                    self.take_branch(t);
+                    return Ok(StepOutcome::Advance(t.ip));
+                }
+                self.push(r); // non-null: keep it, fall through
+            }
+            Op::BrOnNonNull(t) => {
+                let r = self.pop();
+                if !r.is_null_ref() {
+                    self.push(r); // non-null: keep it on the branch target
+                    self.take_branch(t);
+                    return Ok(StepOutcome::Advance(t.ip));
+                }
+                // null: reference dropped, fall through
+            }
             Op::MemoryGrow => {
                 // Routed through the driver so the (T-generic) limiter is consulted.
                 let memory = inner.instance(instance).memories[0];
@@ -347,28 +317,62 @@ impl Execution {
                     return_ip: next,
                 });
             }
+            Op::TableGrow(t) => {
+                // Routed through the driver (limiter-consulted), like `memory.grow`.
+                let table = inner.instance(instance).tables[*t as usize];
+                let delta = u64::from(self.pop_i32() as u32);
+                let init = self.pop().to_ref();
+                return Ok(StepOutcome::DoTableGrow {
+                    table,
+                    delta,
+                    init,
+                    return_ip: next,
+                });
+            }
+            // Straight-line ops route by category to their dedicated handler.
+            op @ (Op::I32Load(_)
+            | Op::I64Load(_)
+            | Op::F32Load(_)
+            | Op::F64Load(_)
+            | Op::I32Load8S(_)
+            | Op::I32Load8U(_)
+            | Op::I32Load16S(_)
+            | Op::I32Load16U(_)
+            | Op::I64Load8S(_)
+            | Op::I64Load8U(_)
+            | Op::I64Load16S(_)
+            | Op::I64Load16U(_)
+            | Op::I64Load32S(_)
+            | Op::I64Load32U(_)
+            | Op::I32Store(_)
+            | Op::I64Store(_)
+            | Op::F32Store(_)
+            | Op::F64Store(_)
+            | Op::I32Store8(_)
+            | Op::I32Store16(_)
+            | Op::I64Store8(_)
+            | Op::I64Store16(_)
+            | Op::I64Store32(_)
+            | Op::MemorySize
+            | Op::MemoryCopy
+            | Op::MemoryFill
+            | Op::MemoryInit(_)
+            | Op::DataDrop(_)) => {
+                self.exec_memory(inner, op, instance)?;
+            }
+            op @ (Op::RefNull(_) | Op::RefFunc(_) | Op::RefIsNull | Op::RefAsNonNull) => {
+                self.exec_ref(inner, op, instance)?;
+            }
+            op @ (Op::TableInit { .. }
+            | Op::TableCopy { .. }
+            | Op::ElemDrop(_)
+            | Op::TableGet(_)
+            | Op::TableSet(_)
+            | Op::TableSize(_)
+            | Op::TableFill(_)) => self.exec_table(inner, op, instance)?,
             other => self.exec_numeric(inner, other, instance)?,
         }
         Ok(StepOutcome::Advance(next))
-    }
-}
-
-/// Resolves a function handle to a wasm body (defining instance + compiled code)
-/// or a host func. Imported functions resolve transparently — the handle already
-/// points at the defining instance's `FuncEntity`.
-fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
-    match inner.func(f) {
-        FuncEntity::Wasm {
-            instance,
-            func_index,
-        } => {
-            let def_inst = *instance;
-            let module = inner.instance(def_inst).module.clone();
-            ResolvedCall::Wasm(def_inst, module.inner().compiled(*func_index))
-        }
-        FuncEntity::Host { .. } => ResolvedCall::Host(f),
-        #[cfg(feature = "async")]
-        FuncEntity::HostAsync { .. } => ResolvedCall::HostAsync(f),
     }
 }
 

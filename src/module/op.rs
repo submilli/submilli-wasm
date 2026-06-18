@@ -6,7 +6,7 @@
 //! resolved target plus the operand-stack fixup inline (the folded sidetable,
 //! see ARCHITECTURE §5). Core wasm only; ref/table/GC/EH ops arrive in their phases.
 
-use crate::value::ValType;
+use crate::value::{RefType, ValType};
 
 pub(crate) type TypeIdx = u32;
 pub(crate) type FuncIdx = u32;
@@ -52,6 +52,15 @@ pub(crate) enum Op {
         type_idx: TypeIdx,
         table: TableIdx,
     },
+    /// `call_ref`: pop a funcref operand and call it (null traps). The type index is
+    /// validation-only — static typing guarantees the signature, so no runtime check.
+    CallRef(TypeIdx),
+    /// Branch when the popped reference is null, dropping it (the branch target does
+    /// not receive it); on fall-through the (now non-null) reference stays.
+    BrOnNull(BranchTarget),
+    /// Branch when the popped reference is non-null, keeping it on the branch target;
+    /// on fall-through (null) the reference is dropped.
+    BrOnNonNull(BranchTarget),
 
     // --- parametric ---
     Drop,
@@ -109,6 +118,18 @@ pub(crate) enum Op {
         src_table: TableIdx,
     },
     ElemDrop(ElemIdx),
+
+    // --- references + table ref-ops (reference-types) ---
+    RefNull(RefType),
+    RefFunc(FuncIdx),
+    RefIsNull,
+    /// `ref.as_non_null`: trap if the top reference is null, else leave it in place.
+    RefAsNonNull,
+    TableGet(TableIdx),
+    TableSet(TableIdx),
+    TableSize(TableIdx),
+    TableGrow(TableIdx),
+    TableFill(TableIdx),
 
     // --- constants (floats as raw bits) ---
     I32Const(i32),

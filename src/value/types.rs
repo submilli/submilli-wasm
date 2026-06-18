@@ -66,6 +66,46 @@ pub enum HeapType {
     Exn,
     NoExn,
     None,
+    /// A concrete function type (function-references). Carries the structural signature
+    /// for identity/subtyping; recursive concrete types collapse to abstract `Func`
+    /// (full rec-group identity is #27c).
+    ConcreteFunc(FuncType),
+}
+
+impl HeapType {
+    /// Is `self` a subtype of `other`? Covers the func/extern abstract hierarchies plus
+    /// concrete-func identity. Declared `sub` chains and the GC lattice are #27c.
+    pub(crate) fn matches(&self, other: &HeapType) -> bool {
+        use HeapType as H;
+        if self == other {
+            return true;
+        }
+        matches!(
+            (self, other),
+            (H::NoFunc, H::Func | H::ConcreteFunc(_))
+                | (H::ConcreteFunc(_), H::Func)
+                | (H::NoExtern, H::Extern)
+                | (H::None, H::Any | H::Eq | H::I31 | H::Struct | H::Array)
+        )
+    }
+}
+
+impl RefType {
+    /// Reference subtyping: heap-type subtyping, and a non-nullable ref is a subtype of a
+    /// nullable one (but not vice-versa).
+    pub(crate) fn matches(&self, other: &RefType) -> bool {
+        (!self.nullable || other.nullable) && self.heap.matches(&other.heap)
+    }
+}
+
+impl ValType {
+    /// Value subtyping: references by [`RefType::matches`], everything else by equality.
+    pub(crate) fn matches(&self, other: &ValType) -> bool {
+        match (self, other) {
+            (ValType::Ref(a), ValType::Ref(b)) => a.matches(b),
+            _ => self == other,
+        }
+    }
 }
 
 /// A function signature.

@@ -109,10 +109,40 @@ impl Val {
         self.v128().expect("expected v128")
     }
 
+    /// Whether this is a *null* reference (any ref kind). Non-refs return false.
+    pub(crate) fn is_null_ref(&self) -> bool {
+        matches!(
+            self,
+            Val::FuncRef(None) | Val::ExternRef(None) | Val::AnyRef(None) | Val::ExnRef(None)
+        )
+    }
+
+    /// Lifts a table/element [`Ref`] to the corresponding `Val`.
+    pub(crate) fn from_ref(r: Ref) -> Val {
+        match r {
+            Ref::Func(f) => Val::FuncRef(f),
+            Ref::Extern(e) => Val::ExternRef(e),
+            Ref::Any(a) => Val::AnyRef(a),
+            Ref::Exn(x) => Val::ExnRef(x),
+        }
+    }
+
+    /// Lowers a reference `Val` to a [`Ref`]. The operand is a reference by validation.
+    pub(crate) fn to_ref(self) -> Ref {
+        match self {
+            Val::FuncRef(f) => Ref::Func(f),
+            Val::ExternRef(e) => Ref::Extern(e),
+            Val::AnyRef(a) => Ref::Any(a),
+            Val::ExnRef(x) => Ref::Exn(x),
+            _ => unreachable!("operand validated as a reference"),
+        }
+    }
+
     /// The correctly-typed zero value for `ty`, used to default-initialize locals.
     ///
-    /// Reference types default to null; non-nullable references (function-references,
-    /// Phase 4) are not defaultable and won't reach here.
+    /// Reference types default to null. A non-nullable reference local (function-references)
+    /// is not defaultable in wasm, but the validator's local-init tracking guarantees it is
+    /// set before any read — so the null placeholder returned here is never observed.
     pub(crate) fn default_for(ty: &ValType) -> Val {
         match ty {
             ValType::I32 => Val::I32(0),
@@ -121,7 +151,7 @@ impl Val {
             ValType::F64 => Val::F64(0),
             ValType::V128 => Val::V128(V128::from(0)),
             ValType::Ref(rt) => match rt.heap_type() {
-                HeapType::Func | HeapType::NoFunc => Val::FuncRef(None),
+                HeapType::Func | HeapType::NoFunc | HeapType::ConcreteFunc(_) => Val::FuncRef(None),
                 HeapType::Extern | HeapType::NoExtern => Val::ExternRef(None),
                 HeapType::Exn | HeapType::NoExn => Val::ExnRef(None),
                 _ => Val::AnyRef(None),

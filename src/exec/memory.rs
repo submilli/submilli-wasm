@@ -17,6 +17,8 @@ fn oob() -> Error {
 }
 
 impl Execution {
+    /// Executes a memory op (loads/stores/size/copy/fill/init/data.drop). `step` routes
+    /// only these ops here.
     #[allow(clippy::too_many_lines)] // flat per-width load/store dispatch
     pub(super) fn exec_memory(
         &mut self,

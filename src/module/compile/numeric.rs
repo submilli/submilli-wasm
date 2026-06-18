@@ -1,137 +1,19 @@
-//! Straight-line operator translation: constants, parametric, variable, memory,
-//! and the full numeric/comparison/conversion set. Called only while reachable.
+//! Numeric / comparison / conversion / sign-extension / saturating-float op
+//! translation. `super::straight_line` routes only these ops (plus `Nop`) here;
+//! constants/parametric/variable are handled inline by the dispatcher, and
+//! memory/table ops by [`super::memory`]/[`super::table`].
 
 use wasmparser::Operator;
 
-use super::{memarg, Translator};
+use super::Translator;
 use crate::module::op::Op;
 use crate::{Error, Result};
 
 impl Translator<'_> {
-    /// pop 2, push 1 (binary numeric / comparison).
-    fn binop(&mut self, op: Op) {
-        self.pop(2);
-        self.push(1);
-        self.emit(op);
-    }
-
-    /// pop 1, push 1 (unary numeric / conversion / test / load).
-    fn unop(&mut self, op: Op) {
-        self.pop(1);
-        self.push(1);
-        self.emit(op);
-    }
-
-    /// pop 2, push 0 (store).
-    fn store(&mut self, op: Op) {
-        self.pop(2);
-        self.emit(op);
-    }
-
-    /// push 1 (constant / size / get).
-    fn constop(&mut self, op: Op) {
-        self.push(1);
-        self.emit(op);
-    }
-
     #[allow(clippy::too_many_lines)] // flat opcode dispatch; arms are one-liners
-    pub(super) fn straight_line(&mut self, op: &Operator<'_>) -> Result<()> {
+    pub(super) fn translate_numeric(&mut self, op: &Operator<'_>) -> Result<()> {
         use Operator as W;
         match *op {
-            // --- constants ---
-            W::I32Const { value } => self.constop(Op::I32Const(value)),
-            W::I64Const { value } => self.constop(Op::I64Const(value)),
-            W::F32Const { value } => self.constop(Op::F32Const(value.bits())),
-            W::F64Const { value } => self.constop(Op::F64Const(value.bits())),
-
-            // --- parametric ---
-            W::Drop => {
-                self.pop(1);
-                self.emit(Op::Drop);
-            }
-            W::Select | W::TypedSelect { .. } => {
-                self.pop(3);
-                self.push(1);
-                self.emit(Op::Select);
-            }
-
-            // --- variable ---
-            W::LocalGet { local_index } => self.constop(Op::LocalGet(local_index)),
-            W::LocalSet { local_index } => {
-                self.pop(1);
-                self.emit(Op::LocalSet(local_index));
-            }
-            W::LocalTee { local_index } => self.emit(Op::LocalTee(local_index)), // height-neutral
-            W::GlobalGet { global_index } => self.constop(Op::GlobalGet(global_index)),
-            W::GlobalSet { global_index } => {
-                self.pop(1);
-                self.emit(Op::GlobalSet(global_index));
-            }
-
-            // --- memory loads (pop addr, push value) ---
-            W::I32Load { memarg: m } => self.unop(Op::I32Load(memarg(m))),
-            W::I64Load { memarg: m } => self.unop(Op::I64Load(memarg(m))),
-            W::F32Load { memarg: m } => self.unop(Op::F32Load(memarg(m))),
-            W::F64Load { memarg: m } => self.unop(Op::F64Load(memarg(m))),
-            W::I32Load8S { memarg: m } => self.unop(Op::I32Load8S(memarg(m))),
-            W::I32Load8U { memarg: m } => self.unop(Op::I32Load8U(memarg(m))),
-            W::I32Load16S { memarg: m } => self.unop(Op::I32Load16S(memarg(m))),
-            W::I32Load16U { memarg: m } => self.unop(Op::I32Load16U(memarg(m))),
-            W::I64Load8S { memarg: m } => self.unop(Op::I64Load8S(memarg(m))),
-            W::I64Load8U { memarg: m } => self.unop(Op::I64Load8U(memarg(m))),
-            W::I64Load16S { memarg: m } => self.unop(Op::I64Load16S(memarg(m))),
-            W::I64Load16U { memarg: m } => self.unop(Op::I64Load16U(memarg(m))),
-            W::I64Load32S { memarg: m } => self.unop(Op::I64Load32S(memarg(m))),
-            W::I64Load32U { memarg: m } => self.unop(Op::I64Load32U(memarg(m))),
-
-            // --- memory stores (pop addr + value) ---
-            W::I32Store { memarg: m } => self.store(Op::I32Store(memarg(m))),
-            W::I64Store { memarg: m } => self.store(Op::I64Store(memarg(m))),
-            W::F32Store { memarg: m } => self.store(Op::F32Store(memarg(m))),
-            W::F64Store { memarg: m } => self.store(Op::F64Store(memarg(m))),
-            W::I32Store8 { memarg: m } => self.store(Op::I32Store8(memarg(m))),
-            W::I32Store16 { memarg: m } => self.store(Op::I32Store16(memarg(m))),
-            W::I64Store8 { memarg: m } => self.store(Op::I64Store8(memarg(m))),
-            W::I64Store16 { memarg: m } => self.store(Op::I64Store16(memarg(m))),
-            W::I64Store32 { memarg: m } => self.store(Op::I64Store32(memarg(m))),
-
-            // --- memory management ---
-            W::MemorySize { .. } => self.constop(Op::MemorySize),
-            W::MemoryGrow { .. } => self.unop(Op::MemoryGrow),
-            W::MemoryInit { data_index, .. } => {
-                self.pop(3);
-                self.emit(Op::MemoryInit(data_index));
-            }
-            W::DataDrop { data_index } => self.emit(Op::DataDrop(data_index)),
-            W::MemoryCopy { .. } => {
-                self.pop(3);
-                self.emit(Op::MemoryCopy);
-            }
-            W::MemoryFill { .. } => {
-                self.pop(3);
-                self.emit(Op::MemoryFill);
-            }
-
-            // --- table management (bulk-memory subset) ---
-            W::TableInit { elem_index, table } => {
-                self.pop(3);
-                self.emit(Op::TableInit {
-                    elem: elem_index,
-                    table,
-                });
-            }
-            W::TableCopy {
-                dst_table,
-                src_table,
-            } => {
-                self.pop(3);
-                self.emit(Op::TableCopy {
-                    dst_table,
-                    src_table,
-                });
-            }
-            W::ElemDrop { elem_index } => self.emit(Op::ElemDrop(elem_index)),
-
             // --- i32 comparisons / numeric ---
             W::I32Eqz => self.unop(Op::I32Eqz),
             W::I32Eq => self.binop(Op::I32Eq),

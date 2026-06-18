@@ -6,13 +6,13 @@
 use std::sync::Arc;
 
 use super::{Execution, Outcome};
-use crate::extern_::Memory;
+use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
 use crate::instance::Instance;
 use crate::module::op::CompiledFunc;
 use crate::store::{FuncEntity, Store, UpdateDeadline};
 use crate::trap::Trap;
-use crate::value::Val;
+use crate::value::{Ref, Val};
 use crate::Result;
 
 /// Runs `code` (of `instance`) with `args`, servicing host calls, and returns the
@@ -44,6 +44,9 @@ pub(crate) fn execute<T>(
             }
             Outcome::EpochDeadline => apply_epoch_deadline(store)?,
             Outcome::Grow { memory, delta } => exec.do_grow(store, memory, delta)?,
+            Outcome::TableGrow { table, delta, init } => {
+                exec.do_grow_table(store, table, delta, init)?;
+            }
         }
     }
 }
@@ -76,6 +79,9 @@ pub(crate) async fn execute_async<T>(
             }
             Outcome::EpochDeadline => apply_epoch_deadline_async(store).await?,
             Outcome::Grow { memory, delta } => exec.do_grow_async(store, memory, delta).await?,
+            Outcome::TableGrow { table, delta, init } => {
+                exec.do_grow_table_async(store, table, delta, init).await?;
+            }
         }
     }
 }
@@ -240,6 +246,40 @@ impl Execution {
         delta: u64,
     ) -> Result<()> {
         let result = match store.grow_memory_async(memory, delta).await? {
+            Some(old) => old as i32,
+            None => -1,
+        };
+        self.push(Val::I32(result));
+        Ok(())
+    }
+
+    /// Services a suspended `table.grow`: consults the limiter and pushes the old size,
+    /// or `-1` on a soft failure (a trap propagates from `grow_table`).
+    fn do_grow_table<T>(
+        &mut self,
+        store: &mut Store<T>,
+        table: Table,
+        delta: u64,
+        init: Ref,
+    ) -> Result<()> {
+        let result = match store.grow_table(table, delta, init)? {
+            Some(old) => old as i32,
+            None => -1,
+        };
+        self.push(Val::I32(result));
+        Ok(())
+    }
+
+    /// Async sibling of [`do_grow_table`](Self::do_grow_table).
+    #[cfg(feature = "async")]
+    async fn do_grow_table_async<T>(
+        &mut self,
+        store: &mut Store<T>,
+        table: Table,
+        delta: u64,
+        init: Ref,
+    ) -> Result<()> {
+        let result = match store.grow_table_async(table, delta, init).await? {
             Some(old) => old as i32,
             None => -1,
         };

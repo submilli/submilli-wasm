@@ -1,6 +1,7 @@
 //! `StoreInner` — the non-generic entity storage the runtime operates on, plus a
 //! simple index arena. Public handles (`Memory`/`Global`/… ) are indices into these.
 
+use core::any::Any;
 use std::num::NonZeroU64;
 
 use crate::engine::Engine;
@@ -51,6 +52,20 @@ impl<E> Arena<E> {
     }
 }
 
+/// Store-side arena of host `externref` payloads. Grow-only for now: entries live for
+/// the store's lifetime (no reclamation until the GC phase; the collector's host-root
+/// enumeration hook is #27g). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
+#[derive(Default)]
+struct ExternRefs(Vec<Box<dyn Any + Send + Sync>>);
+
+impl core::fmt::Debug for ExternRefs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExternRefs")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Non-generic storage for all of a store's runtime entities.
 #[derive(Debug)]
 pub(crate) struct StoreInner {
@@ -60,6 +75,8 @@ pub(crate) struct StoreInner {
     tables: Arena<TableEntity>,
     globals: Arena<GlobalEntity>,
     instances: Arena<InstanceEntity>,
+    /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here.
+    externrefs: ExternRefs,
     /// Active fuel — charged per op (meaningful only when `engine.consume_fuel()`).
     /// With an async yield interval this is the current slice; total = `fuel + fuel_reserve`.
     fuel: u64,
@@ -80,6 +97,7 @@ impl StoreInner {
             tables: Arena::default(),
             globals: Arena::default(),
             instances: Arena::default(),
+            externrefs: ExternRefs::default(),
             fuel: 0,
             fuel_reserve: 0,
             fuel_yield_interval: None,
@@ -89,6 +107,18 @@ impl StoreInner {
 
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Stores a host `externref` payload, returning its index (held by `Rooted<ExternRef>`).
+    pub(crate) fn alloc_externref(&mut self, value: Box<dyn Any + Send + Sync>) -> u32 {
+        let index = self.externrefs.0.len() as u32;
+        self.externrefs.0.push(value);
+        index
+    }
+
+    /// The payload behind an `externref` index, if present.
+    pub(crate) fn externref(&self, index: u32) -> Option<&(dyn Any + Send + Sync)> {
+        self.externrefs.0.get(index as usize).map(AsRef::as_ref)
     }
 
     /// Total remaining fuel (active slice + reserve).

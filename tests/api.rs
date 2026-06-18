@@ -5,9 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::float_cmp)]
 
 use submilli_wasm::{
-    Caller, Config, Engine, Extern, Func, FuncType, Global, GlobalType, Instance, Linker, Memory,
-    MemoryType, Module, Mutability, Store, StoreLimits, StoreLimitsBuilder, Trap, TypedFunc,
-    UpdateDeadline, Val, ValType,
+    Caller, Config, Engine, Extern, ExternRef, Func, FuncType, Global, GlobalType, Instance,
+    Linker, Memory, MemoryType, Module, Mutability, Store, StoreLimits, StoreLimitsBuilder, Trap,
+    TypedFunc, UpdateDeadline, Val, ValType,
 };
 
 fn module(engine: &Engine, wat: &str) -> Module {
@@ -341,4 +341,109 @@ fn limiter_caps_instance_count() {
     let m = module(&engine, "(module)");
     assert!(Instance::new(&mut store, &m, &[]).is_ok());
     assert!(Instance::new(&mut store, &m, &[]).is_err());
+}
+
+// --- reference-types: ref ops + table ref-ops (#26a) -----------------------
+
+#[test]
+fn ref_func_and_is_null() {
+    let engine = Engine::default();
+    // returns (is_null(ref.func 0), is_null(ref.null func))
+    let m = module(
+        &engine,
+        "(module
+            (func $f)
+            (elem declare func $f)
+            (func (export \"check\") (result i32 i32)
+                (ref.is_null (ref.func $f))
+                (ref.is_null (ref.null func))))",
+    );
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let f = inst.get_func(&mut store, "check").unwrap();
+    let mut out = [Val::I32(0), Val::I32(0)];
+    f.call(&mut store, &[], &mut out).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 0); // ref.func is not null
+    assert_eq!(out[1].unwrap_i32(), 1); // ref.null is null
+}
+
+#[test]
+fn table_get_set_grow_size() {
+    let engine = Engine::default();
+    let m = module(
+        &engine,
+        "(module
+            (table (export \"t\") 1 funcref)
+            (func $f)
+            (elem declare func $f)
+            (func (export \"set0\") (table.set 0 (i32.const 0) (ref.func $f)))
+            (func (export \"is_null\") (param i32) (result i32)
+                (ref.is_null (table.get 0 (local.get 0))))
+            (func (export \"size\") (result i32) (table.size 0))
+            (func (export \"grow\") (param i32) (result i32)
+                (table.grow 0 (ref.null func) (local.get 0))))",
+    );
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let call = |store: &mut Store<()>, name: &str, arg: Option<i32>| -> i32 {
+        let f = inst.get_func(&mut *store, name).unwrap();
+        let args: Vec<Val> = arg.map(Val::I32).into_iter().collect();
+        let mut out = [Val::I32(0)];
+        f.call(store, &args, &mut out).unwrap();
+        out[0].unwrap_i32()
+    };
+    assert_eq!(call(&mut store, "is_null", Some(0)), 1); // slot 0 starts null
+    inst.get_func(&mut store, "set0")
+        .unwrap()
+        .call(&mut store, &[], &mut [])
+        .unwrap();
+    assert_eq!(call(&mut store, "is_null", Some(0)), 0); // now a funcref
+    assert_eq!(call(&mut store, "size", None), 1);
+    assert_eq!(call(&mut store, "grow", Some(3)), 1); // old size 1
+    assert_eq!(call(&mut store, "size", None), 4);
+}
+
+#[test]
+fn externref_host_payload_round_trips_through_wasm() {
+    let engine = Engine::default();
+    // Stores the given externref in a table and hands it back.
+    let m = module(
+        &engine,
+        "(module
+            (table 1 externref)
+            (func (export \"roundtrip\") (param externref) (result externref)
+                (table.set 0 (i32.const 0) (local.get 0))
+                (table.get 0 (i32.const 0))))",
+    );
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let r = ExternRef::new(&mut store, "host-state".to_string()).unwrap();
+
+    let func = inst.get_func(&mut store, "roundtrip").unwrap();
+    let mut out = [Val::FuncRef(None)];
+    func.call(&mut store, &[Val::ExternRef(Some(r))], &mut out)
+        .unwrap();
+
+    let Val::ExternRef(Some(back)) = out[0] else {
+        panic!("expected a non-null externref");
+    };
+    let data = back.data(&store).unwrap().unwrap();
+    assert_eq!(data.downcast_ref::<String>().unwrap(), "host-state");
+}
+
+#[test]
+fn table_get_out_of_bounds_traps() {
+    let engine = Engine::default();
+    let m = module(
+        &engine,
+        "(module (table 1 funcref)
+            (func (export \"get\") (param i32) (result funcref) (table.get 0 (local.get 0))))",
+    );
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let f = inst.get_func(&mut store, "get").unwrap();
+    let err = f
+        .call(&mut store, &[Val::I32(5)], &mut [Val::FuncRef(None)])
+        .unwrap_err();
+    assert_eq!(*err.downcast_ref::<Trap>().unwrap(), Trap::TableOutOfBounds);
 }
