@@ -18,7 +18,7 @@ pub(crate) type ElemIdx = u32;
 
 /// A static memory-access immediate. Single memory; `align` is validation-only
 /// (handled by `wasmparser`) and not retained.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MemArg {
     pub offset: u32,
 }
@@ -26,7 +26,7 @@ pub(crate) struct MemArg {
 /// A resolved branch edge: the target instruction plus the operand-stack fixup.
 /// On a taken branch the top `keep` operands are moved down over `pop` discarded
 /// operands, then execution jumps to `ip`.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BranchTarget {
     pub ip: u32,
     pub keep: u32,
@@ -34,7 +34,7 @@ pub(crate) struct BranchTarget {
 }
 
 /// One internal instruction.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Op {
     // --- control ---
     Unreachable,
@@ -268,7 +268,7 @@ pub(crate) enum Op {
 }
 
 /// A function compiled to internal bytecode.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompiledFunc {
     /// The lowered instruction stream.
     pub ops: Box<[Op]>,

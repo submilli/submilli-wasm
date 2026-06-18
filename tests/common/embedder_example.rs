@@ -6,9 +6,11 @@
 // No inner attributes here: the including files set crate-level allows.
 
 use wasmtime::{
-    Caller, Config, Engine, Extern, Func, FuncType, Global, GlobalType, HeapType, Instance, Linker,
-    Memory, MemoryType, Module, Mutability, Ref, RefType, ResourceLimiter, Result, Store,
-    StoreLimits, StoreLimitsBuilder, Table, TableType, TypedFunc, UpdateDeadline, Val, ValType,
+    ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, Extern, FieldType, Finality, Func,
+    FuncType, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType, Module,
+    Mutability, Ref, RefType, ResourceLimiter, Result, StorageType, Store, StoreLimits,
+    StoreLimitsBuilder, StructRef, StructRefPre, StructType, Table, TableType, TypedFunc,
+    UpdateDeadline, Val, ValType,
 };
 
 struct HostState {
@@ -131,6 +133,32 @@ fn resource_control(store: &mut Store<HostState>, engine: &Engine) -> Result<()>
     engine.increment_epoch();
     let weak = engine.weak();
     let _upgraded = weak.upgrade();
+    Ok(())
+}
+
+// GC host-API surface (#24d): a host constructs GC type descriptors and objects.
+// (Accessor/`Rooted` methods like `.field`/`.to_anyref` need real rooting — exercised
+// once that lands; here we prove the descriptor + allocation surface matches wasmtime.)
+fn gc_host_api(engine: &Engine, store: &mut Store<HostState>) -> Result<()> {
+    let field = FieldType::new(Mutability::Var, StorageType::ValType(ValType::I32));
+    let _st0 = StructType::new(engine, [field.clone()])?;
+    let st = StructType::with_finality_and_supertype(engine, Finality::Final, None, [field.clone()])?;
+    let _ = st.fields().count();
+    let _ = st.field(0);
+    let at = ArrayType::new(engine, field);
+    let _ = at.field_type();
+    let _ = at.element_type();
+
+    // Concrete GC heap types flow through `RefType`/`ValType`.
+    let _struct_ty = ValType::Ref(RefType::new(true, HeapType::ConcreteStruct(st.clone())));
+    let _array_ty = ValType::Ref(RefType::new(true, HeapType::ConcreteArray(at.clone())));
+
+    // Allocate structs/arrays from host code.
+    let spre = StructRefPre::new(&mut *store, st);
+    let _s: wasmtime::Rooted<StructRef> = StructRef::new(&mut *store, &spre, &[Val::I32(1)])?;
+    let apre = ArrayRefPre::new(&mut *store, at);
+    let _a: wasmtime::Rooted<ArrayRef> = ArrayRef::new(&mut *store, &apre, &Val::I32(0), 4)?;
+    let _a2 = ArrayRef::new_fixed(&mut *store, &apre, &[Val::I32(1), Val::I32(2)])?;
     Ok(())
 }
 

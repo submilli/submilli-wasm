@@ -82,11 +82,47 @@ impl Config {
         self
     }
 
+    pub fn memory_reservation_for_growth(&mut self, bytes: u64) -> &mut Self {
+        self
+    }
+
+    pub fn memory_may_move(&mut self, enable: bool) -> &mut Self {
+        self
+    }
+
+    pub fn memory_init_cow(&mut self, enable: bool) -> &mut Self {
+        self
+    }
+
     pub fn memory_guard_size(&mut self, bytes: u64) -> &mut Self {
         self
     }
 
     pub fn gc_heap_reservation(&mut self, bytes: u64) -> &mut Self {
+        self
+    }
+
+    pub fn gc_heap_guard_size(&mut self, bytes: u64) -> &mut Self {
+        self
+    }
+
+    pub fn gc_heap_reservation_for_growth(&mut self, bytes: u64) -> &mut Self {
+        self
+    }
+
+    pub fn gc_heap_may_move(&mut self, enable: bool) -> &mut Self {
+        self
+    }
+
+    /// Accepted for wasmtime parity; this interpreter has no Cranelift backend so the
+    /// optimization level has no effect (compilation is a single linear pre-decode pass).
+    pub fn cranelift_opt_level(&mut self, level: OptLevel) -> &mut Self {
+        self
+    }
+
+    /// Accepted for wasmtime parity; backtrace-detail behavior arrives with DWARF
+    /// support (Phase 7), so this is currently a no-op.
+    pub fn wasm_backtrace_details(&mut self, enable: WasmBacktraceDetails) -> &mut Self {
         self
     }
 
@@ -142,4 +178,26 @@ pub enum Collector {
     DeferredReferenceCounting,
     Null,
     Copying,
+}
+
+/// Cranelift optimization level, mirroring `wasmtime::OptLevel`. Accepted for API
+/// parity only — this interpreter has no optimizing backend, so all variants behave
+/// identically (see [`Config::cranelift_opt_level`]).
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+pub enum OptLevel {
+    #[default]
+    None,
+    Speed,
+    SpeedAndSize,
+}
+
+/// Whether to retain detailed backtrace info, mirroring `wasmtime::WasmBacktraceDetails`.
+/// Currently accepted for parity; real effect arrives with DWARF support (Phase 7).
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+pub enum WasmBacktraceDetails {
+    #[default]
+    Enable,
+    Disable,
 }

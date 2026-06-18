@@ -4,6 +4,7 @@ pub(crate) mod compile;
 pub(crate) mod inner;
 pub(crate) mod op;
 pub(crate) mod parse;
+mod serialize;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -52,6 +53,39 @@ impl Module {
     pub fn from_file(engine: &Engine, file: impl AsRef<Path>) -> Result<Module> {
         let bytes = std::fs::read(file).map_err(|e| Error::msg(e.to_string()))?;
         Module::from_binary(engine, &bytes)
+    }
+
+    /// Serializes this compiled module to the binary artifact format consumed by
+    /// [`Module::deserialize`]. The artifact is the *compiled* form, not the original
+    /// wasm — restoring it skips validation + compilation.
+    pub fn serialize(&self) -> Result<Vec<u8>> {
+        serialize::encode(&self.0)
+    }
+
+    /// Restores a [`Module`] from an artifact produced by [`Module::serialize`] /
+    /// [`Engine::precompile_module`], **without** re-validating or recompiling.
+    ///
+    /// # Safety
+    /// Matches `wasmtime::Module::deserialize`: the artifact must be a trusted blob
+    /// produced by a matching version of this crate (it is not guest-reachable input).
+    /// A corrupted artifact cannot cause undefined behavior here — the interpreter runs
+    /// in safe Rust with bounds-checked dispatch, so the worst case is a trap rather than
+    /// memory unsafety — but cross-version/garbage blobs are rejected up front.
+    #[allow(unsafe_code)] // No unsafe operations; `unsafe` is wasmtime API parity only.
+    pub unsafe fn deserialize(engine: &Engine, bytes: impl AsRef<[u8]>) -> Result<Module> {
+        let _ = engine;
+        Ok(Module(Arc::new(serialize::decode(bytes.as_ref())?)))
+    }
+
+    /// Like [`Module::deserialize`] but reads the artifact from a file.
+    ///
+    /// # Safety
+    /// See [`Module::deserialize`].
+    #[allow(unsafe_code)] // No unsafe operations; `unsafe` is wasmtime API parity only.
+    pub unsafe fn deserialize_file(engine: &Engine, path: impl AsRef<Path>) -> Result<Module> {
+        let _ = engine;
+        let bytes = std::fs::read(path).map_err(|e| Error::msg(e.to_string()))?;
+        Ok(Module(Arc::new(serialize::decode(&bytes)?)))
     }
 
     /// Validates a module without compiling it.

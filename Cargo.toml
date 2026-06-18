@@ -17,6 +17,8 @@ async = ["dep:async-trait"]
 wasmparser = "0.252"
 anyhow = "1.0"
 async-trait = { version = "0.1", optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+postcard = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
 wast = "252"

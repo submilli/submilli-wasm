@@ -63,6 +63,13 @@ impl Engine {
         self.inner.is_async
     }
 
+    /// Compiles `bytes` and returns the serialized compiled artifact (as
+    /// [`Module::serialize`]), suitable for `unsafe Module::deserialize`. Validates +
+    /// compiles once here so deserialize can skip both.
+    pub fn precompile_module(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        crate::module::Module::from_binary(self, bytes)?.serialize()
+    }
+
     /// Bumps the epoch counter; pairs with `Store::set_epoch_deadline`.
     pub fn increment_epoch(&self) {
         self.inner.epoch.fetch_add(1, Ordering::Relaxed);

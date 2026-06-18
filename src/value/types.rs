@@ -1,9 +1,10 @@
 //! Type descriptors: `ValType`, `FuncType`, `MemoryType`, etc. (wasmtime-compatible).
 
 use crate::engine::Engine;
+use crate::value::gc_type::{ArrayType, StructType};
 
 /// A wasm value type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ValType {
     I32,
     I64,
@@ -14,14 +15,14 @@ pub enum ValType {
 }
 
 /// Mutability of a global.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Mutability {
     Const,
     Var,
 }
 
 /// A reference type: nullability plus a heap type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct RefType {
     nullable: bool,
     heap: HeapType,
@@ -46,7 +47,7 @@ impl RefType {
 
 /// The heap type of a reference. Abstract types only for now; concrete
 /// (`ConcreteFunc`/struct/array) types arrive with the func-references and GC phases.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum HeapType {
     Func,
@@ -57,14 +58,18 @@ pub enum HeapType {
     Eq,
     I31,
     Struct,
+    /// A concrete struct type (host-declared; produced by the GC phase).
+    ConcreteStruct(StructType),
     Array,
+    /// A concrete array type (host-declared; produced by the GC phase).
+    ConcreteArray(ArrayType),
     Exn,
     NoExn,
     None,
 }
 
 /// A function signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FuncType {
     params: Vec<ValType>,
     results: Vec<ValType>,
@@ -93,7 +98,7 @@ impl FuncType {
 }
 
 /// A linear memory type (limits in 64 KiB pages).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MemoryType {
     minimum: u64,
     maximum: Option<u64>,
@@ -131,7 +136,7 @@ impl MemoryType {
 }
 
 /// A global type: content type plus mutability.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GlobalType {
     content: ValType,
     mutability: Mutability,
@@ -155,7 +160,7 @@ impl GlobalType {
 }
 
 /// A table type: element reference type plus limits.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TableType {
     element: RefType,
     minimum: u64,

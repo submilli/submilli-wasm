@@ -56,7 +56,7 @@ mod value;
 // `bail!`/`ensure!`/`format_err!` are exported at the crate root via `#[macro_export]`.
 pub use crate::error::{Error, Result};
 
-pub use crate::config::{Collector, Config};
+pub use crate::config::{Collector, Config, OptLevel, WasmBacktraceDetails};
 pub use crate::engine::{Engine, EngineWeak};
 pub use crate::extern_::{Extern, Global, Memory, MemoryAccessError, Table};
 pub use crate::func::{
@@ -73,6 +73,8 @@ pub use crate::store::{
 };
 pub use crate::trap::{FrameInfo, Trap, WasmBacktrace};
 pub use crate::value::{
-    AnyRef, ExnRef, ExportType, ExternRef, ExternType, FuncType, GlobalType, HeapType, ImportType,
-    MemoryType, Mutability, Ref, RefType, RootScope, Rooted, TableType, Val, ValType, V128,
+    AnyRef, ArrayRef, ArrayRefPre, ArrayType, ExnRef, ExportType, ExternRef, ExternType, FieldType,
+    Finality, FuncType, GlobalType, HeapType, ImportType, MemoryType, Mutability, RecGroupType,
+    Ref, RefType, RootScope, Rooted, StorageType, StructRef, StructRefPre, StructType, TableType,
+    Val, ValType, V128,
 };

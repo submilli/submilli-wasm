@@ -9,7 +9,7 @@ use crate::module::op::CompiledFunc;
 use crate::value::{ExternType, FuncType, GlobalType, MemoryType, RefType, TableType};
 
 /// A module decoded and compiled to internal bytecode. Immutable and shareable.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ModuleInner {
     pub types: Vec<FuncType>,
     /// Type index for every function — imported functions first, then defined.
@@ -30,14 +30,14 @@ pub(crate) struct ModuleInner {
 }
 
 /// One module import, in declaration order.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Import {
     pub module: String,
     pub name: String,
     pub kind: ImportKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ImportKind {
     Func(u32),
     Table(TableType),
@@ -46,13 +46,13 @@ pub(crate) enum ImportKind {
 }
 
 /// One module export, in declaration order. Indices are module-space.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Export {
     pub name: String,
     pub kind: ExportKind,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ExportKind {
     Func(u32),
     Table(u32),
@@ -61,7 +61,7 @@ pub(crate) enum ExportKind {
 }
 
 /// A defined global: its type plus the constant initializer expression.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GlobalDef {
     pub ty: GlobalType,
     pub init: ConstExpr,
@@ -69,13 +69,13 @@ pub(crate) struct GlobalDef {
 
 /// A data segment. Active segments copy into a memory at instantiation; passive
 /// ones are consumed by `memory.init`.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DataSegment {
     pub mode: DataMode,
     pub bytes: Box<[u8]>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DataMode {
     Passive,
     Active { memory: u32, offset: ConstExpr },
@@ -83,20 +83,20 @@ pub(crate) enum DataMode {
 
 /// An element segment. Active segments write into a table at instantiation;
 /// passive/declared ones are stored inert (table.init/elem.drop are deferred).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ElemSegment {
     pub mode: ElemMode,
     pub items: ElemItems,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ElemMode {
     Passive,
     Declared,
     Active { table: u32, offset: ConstExpr },
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ElemItems {
     Funcs(Box<[u32]>),
     Exprs(Box<[ConstExpr]>),
@@ -104,7 +104,7 @@ pub(crate) enum ElemItems {
 
 /// An owned constant expression, decoupled from the input bytes so it can be
 /// evaluated at instantiation. Only the constant forms the validator admits.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ConstExpr {
     I32(i32),
     I64(i64),
