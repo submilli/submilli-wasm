@@ -5,7 +5,6 @@ use wasmparser::Operator;
 
 use super::{conv_heaptype, Translator};
 use crate::module::op::Op;
-use crate::value::RefType;
 use crate::{Error, Result};
 
 impl Translator<'_> {
@@ -13,10 +12,7 @@ impl Translator<'_> {
         use Operator as W;
         match *op {
             W::RefNull { hty } => {
-                self.constop(Op::RefNull(RefType::new(
-                    true,
-                    conv_heaptype(self.ctx.types, hty)?,
-                )));
+                self.constop(Op::RefNull(conv_heaptype(self.ctx.kinds, hty)?));
             }
             W::RefFunc { function_index } => self.constop(Op::RefFunc(function_index)),
             W::RefIsNull => self.unop(Op::RefIsNull),

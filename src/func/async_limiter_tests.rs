@@ -1,4 +1,4 @@
-//! Async resource-limiter tests (`--features async`, #25f): growth/allocation decisions
+//! Async resource-limiter tests (`--features async`): growth/allocation decisions
 //! that `.await`. Uses a test limiter that yields once (proving the await path) then
 //! enforces a page cap, installed via `Store::limiter_async`.
 #![allow(clippy::unwrap_used)]

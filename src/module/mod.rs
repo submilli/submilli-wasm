@@ -5,6 +5,7 @@ pub(crate) mod inner;
 pub(crate) mod op;
 pub(crate) mod parse;
 mod serialize;
+mod typesec;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,10 +17,9 @@ use crate::module::inner::ModuleInner;
 use crate::value::{ExportType, ExternType, ImportType};
 use crate::{Error, Result};
 
-/// The set of WebAssembly proposals enabled during Phase 1 (core + the small
-/// proposals our interpreter supports). Reference-types/GC/exceptions/SIMD/threads
-/// are intentionally off until their phases (and will be `Config`-driven later).
-pub(crate) fn phase1_features() -> WasmFeatures {
+/// The set of WebAssembly proposals our interpreter currently enables. GC/exceptions/
+/// SIMD/threads are intentionally off until implemented (and will be `Config`-driven later).
+pub(crate) fn enabled_features() -> WasmFeatures {
     WasmFeatures::MUTABLE_GLOBAL
         | WasmFeatures::SIGN_EXTENSION
         | WasmFeatures::MULTI_VALUE
@@ -28,12 +28,14 @@ pub(crate) fn phase1_features() -> WasmFeatures {
         | WasmFeatures::FLOATS
         | WasmFeatures::REFERENCE_TYPES
         // `externref` (the `extern` heap type) is gated behind GC_TYPES in wasmparser
-        // even though it's a reference-types value; the full GC proposal (`GC`) — struct/
-        // array/anyref — stays off until Phase 5.
+        // even though it's a reference-types value.
         | WasmFeatures::GC_TYPES
-        // Typed/non-nullable refs, `call_ref`, `ref.as_non_null`, `br_on_null`/`br_on_non_null`
-        // (#26d). `return_call_ref` additionally needs tail-calls (#39), still off.
+        // Typed/non-nullable refs, `call_ref`, `ref.as_non_null`, `br_on_null`/`br_on_non_null`.
+        // `return_call_ref` additionally needs tail-calls, still off.
         | WasmFeatures::FUNCTION_REFERENCES
+        // Full GC: struct/array type definitions, rec groups, sub/final. The aggregate
+        // instructions + casts are deferred — validated modules using them skip in the harness.
+        | WasmFeatures::GC
 }
 
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same
@@ -81,8 +83,11 @@ impl Module {
     /// memory unsafety — but cross-version/garbage blobs are rejected up front.
     #[allow(unsafe_code)] // No unsafe operations; `unsafe` is wasmtime API parity only.
     pub unsafe fn deserialize(engine: &Engine, bytes: impl AsRef<[u8]>) -> Result<Module> {
-        let _ = engine;
-        Ok(Module(Arc::new(serialize::decode(bytes.as_ref())?)))
+        let mut inner = serialize::decode(bytes.as_ref())?;
+        // Canonical type ids are engine-specific — re-intern the (module-relative) artifact
+        // against the target engine.
+        inner.intern(engine);
+        Ok(Module(Arc::new(inner)))
     }
 
     /// Like [`Module::deserialize`] but reads the artifact from a file.
@@ -91,15 +96,16 @@ impl Module {
     /// See [`Module::deserialize`].
     #[allow(unsafe_code)] // No unsafe operations; `unsafe` is wasmtime API parity only.
     pub unsafe fn deserialize_file(engine: &Engine, path: impl AsRef<Path>) -> Result<Module> {
-        let _ = engine;
         let bytes = std::fs::read(path).map_err(|e| Error::msg(e.to_string()))?;
-        Ok(Module(Arc::new(serialize::decode(&bytes)?)))
+        let mut inner = serialize::decode(&bytes)?;
+        inner.intern(engine);
+        Ok(Module(Arc::new(inner)))
     }
 
     /// Validates a module without compiling it.
     pub fn validate(engine: &Engine, binary: &[u8]) -> Result<()> {
         let _ = engine;
-        Validator::new_with_features(phase1_features())
+        Validator::new_with_features(enabled_features())
             .validate_all(binary)
             .map(|_| ())
             .map_err(|e| Error::msg(e.to_string()))

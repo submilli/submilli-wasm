@@ -1,4 +1,4 @@
-//! Fuel & epoch async-yield tests (`--features async`, #25d): long-running guests
+//! Fuel & epoch async-yield tests (`--features async`): long-running guests
 //! yield to the executor instead of trapping, then resume. Uses a no-op-waker `drive`
 //! helper that counts `Pending`s to prove a yield actually happened.
 #![allow(clippy::unwrap_used)]

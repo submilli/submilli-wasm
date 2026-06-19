@@ -3,6 +3,7 @@
 //! `Val` is both the public, `wasmtime`-compatible value type and the value the
 //! interpreter operates on (there is no separate internal value type).
 
+use crate::canon::{AggKind, IrHeap, IrVal};
 use crate::func::Func;
 use crate::value::gc_ref::{AnyRef, ExnRef, ExternRef, Rooted};
 use crate::value::types::{HeapType, ValType};
@@ -138,12 +139,37 @@ impl Val {
         }
     }
 
-    /// The correctly-typed zero value for `ty`, used to default-initialize locals.
+    /// The correctly-typed zero value for an IR local type, used to default-initialize locals.
     ///
     /// Reference types default to null. A non-nullable reference local (function-references)
     /// is not defaultable in wasm, but the validator's local-init tracking guarantees it is
     /// set before any read — so the null placeholder returned here is never observed.
-    pub(crate) fn default_for(ty: &ValType) -> Val {
+    pub(crate) fn default_for(ty: &IrVal) -> Val {
+        match ty {
+            IrVal::I32 => Val::I32(0),
+            IrVal::I64 => Val::I64(0),
+            IrVal::F32 => Val::F32(0),
+            IrVal::F64 => Val::F64(0),
+            IrVal::V128 => Val::V128(V128::from(0)),
+            IrVal::Ref { heap, .. } => Val::null_for_heap(heap),
+        }
+    }
+
+    /// The null reference value for an IR heap type (by hierarchy).
+    pub(crate) fn null_for_heap(heap: &IrHeap) -> Val {
+        match heap {
+            IrHeap::Func | IrHeap::NoFunc | IrHeap::Concrete(_, AggKind::Func) => {
+                Val::FuncRef(None)
+            }
+            IrHeap::Extern | IrHeap::NoExtern => Val::ExternRef(None),
+            IrHeap::Exn | IrHeap::NoExn => Val::ExnRef(None),
+            _ => Val::AnyRef(None),
+        }
+    }
+
+    /// The default zero value for a public (boundary) value type — used to pre-initialize host
+    /// call result slots before the host writes them.
+    pub(crate) fn default_for_valtype(ty: &ValType) -> Val {
         match ty {
             ValType::I32 => Val::I32(0),
             ValType::I64 => Val::I64(0),
@@ -198,9 +224,10 @@ mod tests {
 
     #[test]
     fn default_for_numeric_types() {
-        assert_eq!(Val::default_for(&ValType::I32).unwrap_i32(), 0);
-        assert_eq!(Val::default_for(&ValType::I64).unwrap_i64(), 0);
-        assert_eq!(Val::default_for(&ValType::F32).unwrap_f32().to_bits(), 0);
-        assert_eq!(Val::default_for(&ValType::F64).unwrap_f64().to_bits(), 0);
+        use crate::canon::IrVal;
+        assert_eq!(Val::default_for(&IrVal::I32).unwrap_i32(), 0);
+        assert_eq!(Val::default_for(&IrVal::I64).unwrap_i64(), 0);
+        assert_eq!(Val::default_for(&IrVal::F32).unwrap_f32().to_bits(), 0);
+        assert_eq!(Val::default_for(&IrVal::F64).unwrap_f64().to_bits(), 0);
     }
 }

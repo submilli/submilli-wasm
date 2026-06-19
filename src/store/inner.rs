@@ -9,6 +9,7 @@ use crate::extern_::{Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
 
+use super::gc::{GcHeap, GcObject};
 use super::{FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity};
 
 /// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
@@ -53,8 +54,8 @@ impl<E> Arena<E> {
 }
 
 /// Store-side arena of host `externref` payloads. Grow-only for now: entries live for
-/// the store's lifetime (no reclamation until the GC phase; the collector's host-root
-/// enumeration hook is #27g). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
+/// the store's lifetime (no reclamation until a tracing collector, whose host-root
+/// enumeration hook lands then). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
 #[derive(Default)]
 struct ExternRefs(Vec<Box<dyn Any + Send + Sync>>);
 
@@ -77,6 +78,9 @@ pub(crate) struct StoreInner {
     instances: Arena<InstanceEntity>,
     /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here.
     externrefs: ExternRefs,
+    /// Managed `struct`/`array` objects; `Rooted<AnyRef>` slot handles index here.
+    /// Allocate-only (null collector); reclamation comes with a tracing collector.
+    gc: GcHeap,
     /// Active fuel — charged per op (meaningful only when `engine.consume_fuel()`).
     /// With an async yield interval this is the current slice; total = `fuel + fuel_reserve`.
     fuel: u64,
@@ -90,6 +94,7 @@ pub(crate) struct StoreInner {
 
 impl StoreInner {
     pub(crate) fn new(engine: Engine) -> Self {
+        let gc = GcHeap::new(engine.gc_memory_threshold());
         StoreInner {
             engine,
             funcs: Arena::default(),
@@ -98,6 +103,7 @@ impl StoreInner {
             globals: Arena::default(),
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
+            gc,
             fuel: 0,
             fuel_reserve: 0,
             fuel_yield_interval: None,
@@ -119,6 +125,26 @@ impl StoreInner {
     /// The payload behind an `externref` index, if present.
     pub(crate) fn externref(&self, index: u32) -> Option<&(dyn Any + Send + Sync)> {
         self.externrefs.0.get(index as usize).map(AsRef::as_ref)
+    }
+
+    /// Allocates a managed `struct`/`array` object, returning its heap slot index (held by a
+    /// `Rooted<AnyRef>`). Traps on heap exhaustion. Wired by the host GC API and the
+    /// aggregate instructions.
+    #[allow(dead_code)]
+    pub(crate) fn alloc_gc(&mut self, object: GcObject) -> crate::Result<u32> {
+        self.gc.alloc(object)
+    }
+
+    /// The managed object at a heap slot index, if present.
+    #[allow(dead_code)]
+    pub(crate) fn gc_object(&self, index: u32) -> Option<&GcObject> {
+        self.gc.get(index)
+    }
+
+    /// Mutable access to the managed object at a heap slot index, if present.
+    #[allow(dead_code)]
+    pub(crate) fn gc_object_mut(&mut self, index: u32) -> Option<&mut GcObject> {
+        self.gc.get_mut(index)
     }
 
     /// Total remaining fuel (active slice + reserve).

@@ -171,7 +171,7 @@ fn host_import_called_from_async_wasm() {
     assert_eq!(out[0].unwrap_i32(), 42);
 }
 
-// --- async host functions (#25c) ---
+// --- async host functions ---
 
 const CALLS_HOST: &str = "(module
     (import \"h\" \"f\" (func (param i32) (result i32)))

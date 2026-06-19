@@ -3,10 +3,9 @@
 //! Fast-compilation-first, stack-based interpreter. See `docs/ARCHITECTURE.md`.
 //!
 //! The public surface mirrors `wasmtime` 45.x so embedder code is drop-in
-//! (`use submilli_wasm as wasmtime;`). Method bodies are placeholders during
-//! Phase 1; the interpreter is filled in by subsequent tasks.
+//! (`use submilli_wasm as wasmtime;`). The interpreter is filled in incrementally.
 
-// TODO(phase1): remove these as `todo!()` stubs are replaced by real bodies.
+// TODO: remove these as `todo!()` stubs are replaced by real bodies.
 // They fire only because placeholder bodies don't yet read their fields/params.
 #![allow(dead_code)]
 #![allow(unused_variables)]
@@ -39,6 +38,7 @@ macro_rules! for_each_arity {
 }
 pub(crate) use for_each_arity;
 
+mod canon;
 mod config;
 mod engine;
 mod error;

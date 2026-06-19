@@ -1,4 +1,4 @@
-//! Tests for entity behavior (Task #10), exercising the store→inner→entity path.
+//! Tests for entity behavior, exercising the store→inner→entity path.
 #![allow(clippy::unwrap_used)]
 
 use super::{Global, Memory, Table};

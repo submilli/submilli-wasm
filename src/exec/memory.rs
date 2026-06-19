@@ -1,5 +1,5 @@
 //! Memory instructions: bounds-checked loads/stores plus size/grow/copy/fill.
-//! `memory.init`/`data.drop` (passive data segments) arrive in Task #13.
+//! `memory.init`/`data.drop` operate on passive data segments.
 
 // `&MemArg` arrives naturally from matching `&Op`; passing it by ref is fine.
 #![allow(clippy::trivially_copy_pass_by_ref)]

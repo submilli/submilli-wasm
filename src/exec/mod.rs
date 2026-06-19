@@ -31,8 +31,8 @@ use outcome::{CallReq, ResolvedCall, StepOutcome};
 
 /// Transient interpreter state for one top-level call. Self-contained: it owns its
 /// operand/frame stacks and holds no borrow into the `Store` across an [`Outcome`]
-/// suspend, so it can be *parked* between resumptions — the basis for async
-/// (Phase 3) where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
+/// suspend, so it can be *parked* between resumptions — the basis for async,
+/// where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
 struct Execution {
     values: Vec<Val>,
     frames: Vec<Frame>,

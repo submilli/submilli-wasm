@@ -211,7 +211,22 @@ fn is_unsupported_module(ctx: &SpecContext, bytes: &[u8]) -> bool {
 /// instructions (`return_call`/`return_call_indirect`/`return_call_ref`) — #39. The
 /// function-references flag makes `return_call_ref` *validate*, so it reaches compilation.
 fn is_deferred_op(err: &Error) -> bool {
-    err.to_string().contains("ReturnCall")
+    let msg = err.to_string();
+    // Tail calls (#39) and the GC aggregate/cast instructions (their own subtasks) validate
+    // under our feature set but aren't compiled yet; their modules skip rather than fail.
+    const DEFERRED: &[&str] = &[
+        "ReturnCall",
+        "Struct",
+        "Array",
+        "I31",
+        "RefCast",
+        "RefTest",
+        "BrOnCast",
+        "RefEq",
+        "ConvertExtern",
+        "ConvertAny",
+    ];
+    DEFERRED.iter().any(|op| msg.contains(op))
 }
 
 /// True if every import of `module` is satisfiable by the linker (else a provider

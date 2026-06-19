@@ -2,6 +2,7 @@
 
 mod context;
 mod entity;
+mod gc;
 mod grow;
 mod inner;
 mod limits;

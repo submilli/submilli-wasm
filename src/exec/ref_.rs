@@ -6,7 +6,7 @@ use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::StoreInner;
 use crate::trap::Trap;
-use crate::value::{Val, ValType};
+use crate::value::Val;
 use crate::{Error, Result};
 
 impl Execution {
@@ -17,8 +17,8 @@ impl Execution {
         instance: Instance,
     ) -> Result<()> {
         match op {
-            Op::RefNull(rt) => {
-                self.push(Val::default_for(&ValType::Ref(rt.clone())));
+            Op::RefNull(heap) => {
+                self.push(Val::null_for_heap(heap));
                 Ok(())
             }
             Op::RefFunc(f) => {

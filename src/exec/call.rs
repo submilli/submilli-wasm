@@ -1,6 +1,7 @@
 //! `call_indirect`: table-element lookup, signature check, then a (wasm or host) call.
 
 use super::{CallReq, Execution, ResolvedCall, StepOutcome};
+use crate::canon::CanonicalTypeId;
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::store::{FuncEntity, StoreInner};
@@ -45,11 +46,18 @@ impl Execution {
             None => return Err(Trap::TableOutOfBounds.into()),
         };
 
-        let expected = &inner.instance(instance).module.inner().types[type_idx as usize];
+        let expected_module = inner.instance(instance).module.clone();
+        // Engine-canonical id of the expected type (cross-module, recursion-safe identity).
+        let expected_id = expected_module.inner().canonical_type_id(type_idx);
         match resolve(inner, f) {
             ResolvedCall::Wasm(def_inst, code) => {
-                let actual = &inner.instance(def_inst).module.inner().types[code.type_idx as usize];
-                if expected != actual {
+                let actual_id = inner
+                    .instance(def_inst)
+                    .module
+                    .inner()
+                    .canonical_type_id(code.type_idx);
+                // The callee's type must be a subtype of the expected one (funcref subtyping).
+                if !inner.engine().is_subtype(actual_id, expected_id) {
                     return Err(Trap::BadSignature.into());
                 }
                 Ok(StepOutcome::DoCall(CallReq {
@@ -58,10 +66,9 @@ impl Execution {
                     code,
                 }))
             }
+            // Host func types are interned too — compare canonical ids uniformly.
             ResolvedCall::Host(func) => {
-                if expected != host_ty(inner, func) {
-                    return Err(Trap::BadSignature.into());
-                }
+                host_sig_ok(inner, func, expected_id)?;
                 Ok(StepOutcome::DoHostCall {
                     func,
                     instance,
@@ -70,9 +77,7 @@ impl Execution {
             }
             #[cfg(feature = "async")]
             ResolvedCall::HostAsync(func) => {
-                if expected != host_ty(inner, func) {
-                    return Err(Trap::BadSignature.into());
-                }
+                host_sig_ok(inner, func, expected_id)?;
                 Ok(StepOutcome::DoHostAsyncCall {
                     func,
                     instance,
@@ -113,6 +118,19 @@ impl Execution {
                 return_ip,
             },
         })
+    }
+}
+
+/// Traps unless the host callee's (interned) type is a subtype of the `call_indirect` site's
+/// expected canonical type id.
+fn host_sig_ok(inner: &StoreInner, func: Func, expected_id: CanonicalTypeId) -> Result<()> {
+    if inner
+        .engine()
+        .is_subtype(host_ty(inner, func).canonical_id(), expected_id)
+    {
+        Ok(())
+    } else {
+        Err(Trap::BadSignature.into())
     }
 }
 

@@ -121,7 +121,7 @@ impl Config {
     }
 
     /// Accepted for wasmtime parity; backtrace-detail behavior arrives with DWARF
-    /// support (Phase 7), so this is currently a no-op.
+    /// debug-info support, so this is currently a no-op.
     pub fn wasm_backtrace_details(&mut self, enable: WasmBacktraceDetails) -> &mut Self {
         self
     }
@@ -141,6 +141,16 @@ impl Config {
     pub fn collector(&mut self, collector: Collector) -> &mut Self {
         self.collector = collector;
         self
+    }
+
+    /// The selected garbage collector (read by the `Engine`; uniform until a tracing collector lands).
+    pub(crate) fn collector_kind(&self) -> Collector {
+        self.collector
+    }
+
+    /// The configured engine-wide GC-pressure threshold in bytes, if set.
+    pub(crate) fn gc_memory_threshold_bytes(&self) -> Option<usize> {
+        self.gc_memory_threshold
     }
 
     /// Enables async execution (`Func::call_async`, async host fns, yields).
@@ -193,7 +203,7 @@ pub enum OptLevel {
 }
 
 /// Whether to retain detailed backtrace info, mirroring `wasmtime::WasmBacktraceDetails`.
-/// Currently accepted for parity; real effect arrives with DWARF support (Phase 7).
+/// Currently accepted for parity; real effect arrives with DWARF debug-info support.
 #[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub enum WasmBacktraceDetails {

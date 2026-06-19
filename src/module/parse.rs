@@ -12,6 +12,7 @@ use wasmparser::{
     GlobalSectionReader, ImportSectionReader, Operator, Parser, Payload, TypeRef,
 };
 
+use crate::canon::{AggKind, IrGlobalType, IrHeap, IrRef, IrTableType, IrVal, ModuleType};
 use crate::engine::Engine;
 use crate::module::compile::{conv_valtype, translate_function, CompileCtx};
 use crate::module::inner::{
@@ -19,7 +20,7 @@ use crate::module::inner::{
     GlobalDef, Import, ImportKind, ModuleInner, TableDef,
 };
 use crate::module::op::CompiledFunc;
-use crate::value::{FuncType, GlobalType, MemoryType, Mutability, RefType, TableType, ValType};
+use crate::value::MemoryType;
 use crate::{Error, Result};
 
 fn wp_err(e: BinaryReaderError) -> Error {
@@ -33,7 +34,7 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
 
     for payload in Parser::new(0).parse_all(bytes) {
         match payload.map_err(wp_err)? {
-            Payload::TypeSection(r) => parse_types(engine, &mut m.types, r)?,
+            Payload::TypeSection(r) => super::typesec::parse_types(&mut m.types, r)?,
             Payload::ImportSection(r) => parse_imports(&mut m, r)?,
             Payload::FunctionSection(r) => {
                 for ty in r {
@@ -41,12 +42,13 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
                 }
             }
             Payload::TableSection(r) => {
+                let kinds = m.type_kinds();
                 for t in r {
                     let t = t.map_err(wp_err)?;
-                    let ty = conv_tabletype(&m.types, t.ty)?;
+                    let ty = conv_tabletype(&kinds, t.ty)?;
                     let init = match t.init {
                         wasmparser::TableInit::RefNull => None,
-                        wasmparser::TableInit::Expr(e) => Some(parse_const_expr(&m.types, &e)?),
+                        wasmparser::TableInit::Expr(e) => Some(parse_const_expr(&kinds, &e)?),
                     };
                     m.tables.push(TableDef { ty, init });
                 }
@@ -56,17 +58,28 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
                     m.memories.push(conv_memtype(mt.map_err(wp_err)?));
                 }
             }
-            Payload::GlobalSection(r) => parse_globals(&m.types, &mut m.globals, r)?,
+            Payload::GlobalSection(r) => {
+                let kinds = m.type_kinds();
+                parse_globals(&kinds, &mut m.globals, r)?;
+            }
             Payload::ExportSection(r) => parse_exports(&mut m.exports, r)?,
             Payload::StartSection { func, .. } => m.start = Some(func),
-            Payload::ElementSection(r) => parse_elems(&m.types, &mut m.elems, r)?,
-            Payload::DataSection(r) => parse_datas(&m.types, &mut m.datas, r)?,
+            Payload::ElementSection(r) => {
+                let kinds = m.type_kinds();
+                parse_elems(&kinds, &mut m.elems, r)?;
+            }
+            Payload::DataSection(r) => {
+                let kinds = m.type_kinds();
+                parse_datas(&kinds, &mut m.datas, r)?;
+            }
             Payload::CodeSectionEntry(body) => bodies.push(body),
             _ => {}
         }
     }
 
     m.functions = compile_bodies(&m.types, &m.func_types, m.num_imported_funcs, &bodies)?;
+    // Register the module's rec groups in the engine, baking canonical type ids.
+    m.intern(engine);
     Ok(m)
 }
 
@@ -84,32 +97,10 @@ fn empty_inner() -> ModuleInner {
         datas: Vec::new(),
         elems: Vec::new(),
         start: None,
+        type_ids: Vec::new(),
+        group_handles: Vec::new(),
+        engine: None,
     }
-}
-
-fn parse_types(
-    engine: &Engine,
-    out: &mut Vec<FuncType>,
-    reader: wasmparser::TypeSectionReader<'_>,
-) -> Result<()> {
-    for rec in reader {
-        for sub in rec.map_err(wp_err)?.into_types() {
-            let wasmparser::CompositeInnerType::Func(ft) = sub.composite_type.inner else {
-                return Err(Error::msg("non-function composite types not supported"));
-            };
-            let params = conv_valtypes(out, ft.params())?;
-            let results = conv_valtypes(out, ft.results())?;
-            out.push(FuncType::new(engine, params, results));
-        }
-    }
-    Ok(())
-}
-
-fn conv_valtypes(types: &[FuncType], tys: &[wasmparser::ValType]) -> Result<Vec<ValType>> {
-    tys.iter()
-        .copied()
-        .map(|t| conv_valtype(types, t))
-        .collect()
 }
 
 fn parse_imports(m: &mut ModuleInner, reader: ImportSectionReader<'_>) -> Result<()> {
@@ -123,15 +114,16 @@ fn parse_imports(m: &mut ModuleInner, reader: ImportSectionReader<'_>) -> Result
 }
 
 fn push_import(m: &mut ModuleInner, imp: &wasmparser::Import<'_>) -> Result<()> {
+    let kinds = m.type_kinds();
     let kind = match imp.ty {
         TypeRef::Func(t) => {
             m.func_types.push(t);
             m.num_imported_funcs += 1;
             ImportKind::Func(t)
         }
-        TypeRef::Table(tt) => ImportKind::Table(conv_tabletype(&m.types, tt)?),
+        TypeRef::Table(tt) => ImportKind::Table(conv_tabletype(&kinds, tt)?),
         TypeRef::Memory(mt) => ImportKind::Memory(conv_memtype(mt)),
-        TypeRef::Global(gt) => ImportKind::Global(conv_globaltype(&m.types, gt)?),
+        TypeRef::Global(gt) => ImportKind::Global(conv_globaltype(&kinds, gt)?),
         TypeRef::Tag(_) | TypeRef::FuncExact(_) => {
             return Err(Error::msg("unsupported import kind"))
         }
@@ -145,15 +137,15 @@ fn push_import(m: &mut ModuleInner, imp: &wasmparser::Import<'_>) -> Result<()> 
 }
 
 fn parse_globals(
-    types: &[FuncType],
+    kinds: &[AggKind],
     out: &mut Vec<GlobalDef>,
     reader: GlobalSectionReader<'_>,
 ) -> Result<()> {
     for g in reader {
         let g = g.map_err(wp_err)?;
         out.push(GlobalDef {
-            ty: conv_globaltype(types, g.ty)?,
-            init: parse_const_expr(types, &g.init_expr)?,
+            ty: conv_globaltype(kinds, g.ty)?,
+            init: parse_const_expr(kinds, &g.init_expr)?,
         });
     }
     Ok(())
@@ -180,7 +172,7 @@ fn parse_exports(out: &mut Vec<Export>, reader: wasmparser::ExportSectionReader<
 }
 
 fn parse_elems(
-    types: &[FuncType],
+    kinds: &[AggKind],
     out: &mut Vec<ElemSegment>,
     reader: wasmparser::ElementSectionReader<'_>,
 ) -> Result<()> {
@@ -194,18 +186,18 @@ fn parse_elems(
                 offset_expr,
             } => ElemMode::Active {
                 table: table_index.unwrap_or(0),
-                offset: parse_const_expr(types, &offset_expr)?,
+                offset: parse_const_expr(kinds, &offset_expr)?,
             },
         };
         out.push(ElemSegment {
             mode,
-            items: conv_elem_items(types, e.items)?,
+            items: conv_elem_items(kinds, e.items)?,
         });
     }
     Ok(())
 }
 
-fn conv_elem_items(types: &[FuncType], items: ElementItems<'_>) -> Result<ElemItems> {
+fn conv_elem_items(kinds: &[AggKind], items: ElementItems<'_>) -> Result<ElemItems> {
     match items {
         ElementItems::Functions(r) => {
             let funcs = r
@@ -217,7 +209,7 @@ fn conv_elem_items(types: &[FuncType], items: ElementItems<'_>) -> Result<ElemIt
         ElementItems::Expressions(_, r) => {
             let exprs = r
                 .into_iter()
-                .map(|e| parse_const_expr(types, &e.map_err(wp_err)?))
+                .map(|e| parse_const_expr(kinds, &e.map_err(wp_err)?))
                 .collect::<Result<Vec<_>>>()?;
             Ok(ElemItems::Exprs(exprs.into_boxed_slice()))
         }
@@ -225,7 +217,7 @@ fn conv_elem_items(types: &[FuncType], items: ElementItems<'_>) -> Result<ElemIt
 }
 
 fn parse_datas(
-    types: &[FuncType],
+    kinds: &[AggKind],
     out: &mut Vec<DataSegment>,
     reader: wasmparser::DataSectionReader<'_>,
 ) -> Result<()> {
@@ -238,7 +230,7 @@ fn parse_datas(
                 offset_expr,
             } => DataMode::Active {
                 memory: memory_index,
-                offset: parse_const_expr(types, &offset_expr)?,
+                offset: parse_const_expr(kinds, &offset_expr)?,
             },
         };
         out.push(DataSegment {
@@ -249,7 +241,7 @@ fn parse_datas(
     Ok(())
 }
 
-fn parse_const_expr(types: &[FuncType], expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
+fn parse_const_expr(kinds: &[AggKind], expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
     let mut ops = expr.get_operators_reader();
     let op = ops.read().map_err(wp_err)?;
     Ok(match op {
@@ -257,20 +249,31 @@ fn parse_const_expr(types: &[FuncType], expr: &wasmparser::ConstExpr<'_>) -> Res
         Operator::I64Const { value } => ConstExpr::I64(value),
         Operator::F32Const { value } => ConstExpr::F32(value.bits()),
         Operator::F64Const { value } => ConstExpr::F64(value.bits()),
-        Operator::RefNull { hty } => ConstExpr::RefNull(conv_reftype_heap(types, hty)?),
+        Operator::RefNull { hty } => ConstExpr::RefNull(conv_reftype_heap(kinds, hty)?),
         Operator::RefFunc { function_index } => ConstExpr::RefFunc(function_index),
         Operator::GlobalGet { global_index } => ConstExpr::GlobalGet(global_index),
-        _ => return Err(Error::msg("unsupported constant expression")),
+        // Name the operator so GC aggregate const exprs (struct.new/array.new/ref.i31, deferred
+        // to the aggregate-instruction subtask) are recognized as a deferred-op skip, not a bug.
+        other => {
+            return Err(Error::msg(format!(
+                "unsupported constant expression: {other:?}"
+            )))
+        }
     })
 }
 
 fn compile_bodies(
-    types: &[FuncType],
+    types: &[ModuleType],
     func_types: &[u32],
     num_imported_funcs: u32,
     bodies: &[FunctionBody<'_>],
 ) -> Result<Vec<Arc<CompiledFunc>>> {
-    let ctx = CompileCtx { types, func_types };
+    let kinds: Vec<AggKind> = types.iter().map(ModuleType::kind).collect();
+    let ctx = CompileCtx {
+        types,
+        kinds: &kinds,
+        func_types,
+    };
     let mut out = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
         let type_idx = func_types[num_imported_funcs as usize + i];
@@ -289,36 +292,29 @@ fn conv_memtype(mt: wasmparser::MemoryType) -> MemoryType {
     }
 }
 
-fn conv_globaltype(types: &[FuncType], gt: wasmparser::GlobalType) -> Result<GlobalType> {
-    let mutability = if gt.mutable {
-        Mutability::Var
-    } else {
-        Mutability::Const
-    };
-    Ok(GlobalType::new(
-        conv_valtype(types, gt.content_type)?,
-        mutability,
-    ))
+fn conv_globaltype(kinds: &[AggKind], gt: wasmparser::GlobalType) -> Result<IrGlobalType> {
+    Ok(IrGlobalType {
+        content: conv_valtype(kinds, gt.content_type)?,
+        mutable: gt.mutable,
+    })
 }
 
-fn conv_tabletype(types: &[FuncType], tt: wasmparser::TableType) -> Result<TableType> {
-    Ok(TableType::new(
-        conv_reftype(types, tt.element_type)?,
-        tt.initial as u32,
-        tt.maximum.map(|m| m as u32),
-    ))
+fn conv_tabletype(kinds: &[AggKind], tt: wasmparser::TableType) -> Result<IrTableType> {
+    Ok(IrTableType {
+        element: conv_reftype(kinds, tt.element_type)?,
+        min: tt.initial as u32,
+        max: tt.maximum.map(|m| m as u32),
+    })
 }
 
-fn conv_reftype(types: &[FuncType], rt: wasmparser::RefType) -> Result<RefType> {
-    match conv_valtype(types, wasmparser::ValType::Ref(rt))? {
-        ValType::Ref(r) => Ok(r),
+fn conv_reftype(kinds: &[AggKind], rt: wasmparser::RefType) -> Result<IrRef> {
+    match conv_valtype(kinds, wasmparser::ValType::Ref(rt))? {
+        IrVal::Ref { nullable, heap } => Ok(IrRef { nullable, heap }),
         _ => unreachable!("Ref maps to Ref"),
     }
 }
 
-fn conv_reftype_heap(types: &[FuncType], hty: wasmparser::HeapType) -> Result<RefType> {
-    conv_reftype(
-        types,
-        wasmparser::RefType::new(true, hty).ok_or_else(|| Error::msg("bad ref type"))?,
-    )
+fn conv_reftype_heap(kinds: &[AggKind], hty: wasmparser::HeapType) -> Result<IrHeap> {
+    let rt = wasmparser::RefType::new(true, hty).ok_or_else(|| Error::msg("bad ref type"))?;
+    Ok(conv_reftype(kinds, rt)?.heap)
 }

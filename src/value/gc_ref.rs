@@ -1,5 +1,5 @@
-//! GC reference handles. `externref` is real (a store-side host-payload arena, #26c);
-//! the managed-GC refs (`anyref`/struct/array/exn) stay stubs until Phase 5.
+//! GC reference handles. `externref` is real (a store-side host-payload arena);
+//! the managed-GC refs (`anyref`/struct/array/exn) stay stubs until garbage collection lands.
 
 use core::any::Any;
 use core::marker::PhantomData;
@@ -32,7 +32,7 @@ impl<T> core::fmt::Debug for Rooted<T> {
 
 /// A scope bounding the lifetime of [`Rooted`] references. It delegates store access to
 /// the wrapped store, so it's usable anywhere an `AsContext[Mut]` is. Reclamation on
-/// drop is a no-op until the GC phase (the arena is grow-only; #27g adds collection).
+/// drop is a no-op for now (the arena is grow-only; a tracing collector adds reclamation).
 pub struct RootScope<S> {
     store: S,
 }

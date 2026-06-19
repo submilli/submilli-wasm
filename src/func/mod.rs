@@ -174,7 +174,7 @@ impl Func {
 
 /// A zero/default-initialized results buffer sized to `ty`'s results.
 fn default_results(ty: &FuncType) -> Vec<Val> {
-    ty.results().map(|t| Val::default_for(&t)).collect()
+    ty.results().map(|t| Val::default_for_valtype(&t)).collect()
 }
 
 /// Checks the argument count and per-value types against `ty`'s parameters.

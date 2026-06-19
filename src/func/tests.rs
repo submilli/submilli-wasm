@@ -89,7 +89,7 @@ fn wrong_arg_count_is_error_not_panic() {
     assert!(f.call(&mut store, &[], &mut results).is_err());
 }
 
-// --- host functions (#16) ---
+// --- host functions ---
 
 use crate::extern_::Extern;
 use crate::func::{Caller, Func};
@@ -178,7 +178,7 @@ fn wasm_imports_and_calls_host_func() {
     assert_eq!(out[0].unwrap_i32(), 41); // 20*2 + 1
 }
 
-// --- Caller::get_export + guest memory (#17) ---
+// --- Caller::get_export + guest memory ---
 
 #[test]
 fn host_fn_writes_guest_memory_via_get_export() {
@@ -262,7 +262,7 @@ fn get_export_is_none_at_top_level() {
     assert_eq!(out[0].unwrap_i32(), 0);
 }
 
-// --- typed API (#18/#19) ---
+// --- typed API ---
 
 use crate::func::TypedFunc;
 

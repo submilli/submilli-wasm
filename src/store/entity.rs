@@ -2,7 +2,7 @@
 //!
 //! Kept separate from the public handle types (`Memory`/`Global`/`Table`/`Func`/
 //! `Instance`), which live in their own modules — those are the embedder-facing
-//! API; these are interpreter internals. Behavior on the handles (Task #10/#13)
+//! API; these are interpreter internals. Behavior on the handles
 //! reads/writes these through `StoreInner`.
 
 use crate::extern_::{Global, Memory, Table};
@@ -16,7 +16,7 @@ pub(crate) const PAGE_SIZE: usize = 64 * 1024;
 /// Maximum addressable pages for a 32-bit memory (4 GiB).
 const MAX_PAGES: u64 = 1 << 16;
 
-/// Runtime data backing a [`Memory`](crate::Memory) (behavior lands in Task #10).
+/// Runtime data backing a [`Memory`](crate::Memory).
 #[derive(Debug)]
 pub(crate) struct MemoryEntity {
     pub bytes: Vec<u8>,
@@ -60,7 +60,7 @@ pub(crate) enum FuncEntity {
 }
 
 /// Runtime data backing an [`Instance`](crate::Instance): its resolved index
-/// spaces (populated in Task #13).
+/// spaces.
 #[derive(Debug)]
 pub(crate) struct InstanceEntity {
     pub module: Module,

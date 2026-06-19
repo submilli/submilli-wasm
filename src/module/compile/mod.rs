@@ -18,16 +18,18 @@ mod tests;
 
 use wasmparser::{BinaryReaderError, FunctionBody, Operator};
 
+use crate::canon::{AggKind, IrHeap, IrVal, ModuleType};
 use crate::module::op::{CompiledFunc, MemArg, Op};
-use crate::value::{FuncType, HeapType, RefType, ValType};
 use crate::{Error, Result};
 
 use self::control::{BlockKind, CtrlFrame};
 
-/// Per-module context the translator needs: the type section and the
-/// function-index → type-index map (imports + defined functions).
+/// Per-module context the translator needs: the type table (for func signatures), the
+/// per-type kind table (for resolving concrete references), and the function-index →
+/// type-index map (imports + defined functions).
 pub(crate) struct CompileCtx<'a> {
-    pub types: &'a [FuncType],
+    pub types: &'a [ModuleType],
+    pub kinds: &'a [AggKind],
     pub func_types: &'a [u32],
 }
 
@@ -35,46 +37,55 @@ fn wp_err(e: BinaryReaderError) -> Error {
     Error::msg(e.to_string())
 }
 
-/// Maps a `wasmparser` value type to ours (core numeric/vector + funcref/externref,
-/// including typed/non-nullable references from function-references, #26d). `types` is the
-/// module's (so-far-converted) type section, used to resolve concrete func-type references.
-pub(crate) fn conv_valtype(types: &[FuncType], ty: wasmparser::ValType) -> Result<ValType> {
+/// Maps a `wasmparser` value type to the module IR. `kinds` is the per-type-index kind table,
+/// used to tag concrete references with their hierarchy.
+pub(crate) fn conv_valtype(kinds: &[AggKind], ty: wasmparser::ValType) -> Result<IrVal> {
     Ok(match ty {
-        wasmparser::ValType::I32 => ValType::I32,
-        wasmparser::ValType::I64 => ValType::I64,
-        wasmparser::ValType::F32 => ValType::F32,
-        wasmparser::ValType::F64 => ValType::F64,
-        wasmparser::ValType::V128 => ValType::V128,
-        wasmparser::ValType::Ref(rt) => ValType::Ref(RefType::new(
-            rt.is_nullable(),
-            conv_heaptype(types, rt.heap_type())?,
-        )),
+        wasmparser::ValType::I32 => IrVal::I32,
+        wasmparser::ValType::I64 => IrVal::I64,
+        wasmparser::ValType::F32 => IrVal::F32,
+        wasmparser::ValType::F64 => IrVal::F64,
+        wasmparser::ValType::V128 => IrVal::V128,
+        wasmparser::ValType::Ref(rt) => IrVal::Ref {
+            nullable: rt.is_nullable(),
+            heap: conv_heaptype(kinds, rt.heap_type())?,
+        },
     })
 }
 
-/// Converts a wasmparser heap type to ours: the reference-types abstract set (`func`/`extern`
-/// and their `nofunc`/`noextern` bottoms) plus, for function-references, concrete func types.
-/// GC is off, so a concrete type is always a function type — resolved to its structural
-/// signature for identity. A concrete reference we can't yet resolve (a forward/recursive
-/// type index) collapses to abstract `func`; full rec-group canonicalization is #27c.
-pub(crate) fn conv_heaptype(types: &[FuncType], hty: wasmparser::HeapType) -> Result<HeapType> {
+/// Converts a wasmparser heap type to the module IR: the abstract hierarchies (func/extern/any
+/// and the bottoms, preserved distinctly for canonical identity) plus concrete (defined) types,
+/// carrying a module-relative type index and kind (rewritten to a canonical id by `intern`).
+pub(crate) fn conv_heaptype(kinds: &[AggKind], hty: wasmparser::HeapType) -> Result<IrHeap> {
     use wasmparser::{AbstractHeapType as A, HeapType as H};
     Ok(match hty {
-        H::Abstract {
-            shared: false,
-            ty: A::Func | A::NoFunc,
-        } => HeapType::Func,
-        H::Abstract {
-            shared: false,
-            ty: A::Extern | A::NoExtern,
-        } => HeapType::Extern,
-        H::Concrete(idx) | H::Exact(idx) => match idx.as_module_index() {
-            Some(i) if (i as usize) < types.len() => {
-                HeapType::ConcreteFunc(types[i as usize].clone())
-            }
-            _ => HeapType::Func,
+        H::Abstract { shared: false, ty } => match ty {
+            A::Func => IrHeap::Func,
+            A::NoFunc => IrHeap::NoFunc,
+            A::Extern => IrHeap::Extern,
+            A::NoExtern => IrHeap::NoExtern,
+            A::Any => IrHeap::Any,
+            A::Eq => IrHeap::Eq,
+            A::I31 => IrHeap::I31,
+            A::Struct => IrHeap::Struct,
+            A::Array => IrHeap::Array,
+            A::None => IrHeap::None,
+            A::Exn => IrHeap::Exn,
+            A::NoExn => IrHeap::NoExn,
+            A::Cont | A::NoCont => return Err(Error::msg("continuation heap types unsupported")),
         },
-        H::Abstract { .. } => return Err(Error::msg("unsupported heap type (GC)")),
+        H::Concrete(idx) | H::Exact(idx) => {
+            let i = idx
+                .as_module_index()
+                .ok_or_else(|| Error::msg("non-module-relative type index"))?;
+            let kind = *kinds
+                .get(i as usize)
+                .ok_or_else(|| Error::msg("type index out of range"))?;
+            IrHeap::Concrete(i, kind)
+        }
+        H::Abstract { shared: true, .. } => {
+            return Err(Error::msg("shared heap types unsupported"))
+        }
     })
 }
 
@@ -91,14 +102,14 @@ pub(crate) fn translate_function(
     type_idx: u32,
     body: &FunctionBody<'_>,
 ) -> Result<CompiledFunc> {
-    let func_ty = &ctx.types[type_idx as usize];
-    let n_params = func_ty.params().len() as u32;
-    let n_results = func_ty.results().len() as u32;
+    let (params, results) = ctx.types[type_idx as usize].func_sig();
+    let n_params = params.len() as u32;
+    let n_results = results.len() as u32;
 
-    let mut local_types: Vec<ValType> = Vec::new();
+    let mut local_types: Vec<IrVal> = Vec::new();
     for entry in body.get_locals_reader().map_err(wp_err)? {
         let (count, ty) = entry.map_err(wp_err)?;
-        let vt = conv_valtype(ctx.types, ty)?;
+        let vt = conv_valtype(ctx.kinds, ty)?;
         for _ in 0..count {
             local_types.push(vt.clone());
         }

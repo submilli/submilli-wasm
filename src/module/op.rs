@@ -6,7 +6,7 @@
 //! resolved target plus the operand-stack fixup inline (the folded sidetable,
 //! see ARCHITECTURE §5). Core wasm only; ref/table/GC/EH ops arrive in their phases.
 
-use crate::value::{RefType, ValType};
+use crate::canon::{IrHeap, IrVal};
 
 pub(crate) type TypeIdx = u32;
 pub(crate) type FuncIdx = u32;
@@ -120,7 +120,7 @@ pub(crate) enum Op {
     ElemDrop(ElemIdx),
 
     // --- references + table ref-ops (reference-types) ---
-    RefNull(RefType),
+    RefNull(IrHeap),
     RefFunc(FuncIdx),
     RefIsNull,
     /// `ref.as_non_null`: trap if the top reference is null, else leave it in place.
@@ -301,7 +301,7 @@ pub(crate) struct CompiledFunc {
     pub n_results: u32,
     /// Declared local types (params excluded); used to default-initialize the
     /// frame's locals to the correctly-typed zero `Val` at call time.
-    pub local_types: Box<[ValType]>,
+    pub local_types: Box<[IrVal]>,
     /// Peak operand-stack depth above the locals (for stack pre-reservation).
     pub max_operands: u32,
 }

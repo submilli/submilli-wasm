@@ -1,15 +1,30 @@
-//! Unit tests for the translator (#7 straight-line + #8 control flow).
+//! Unit tests for the translator (straight-line + control flow).
 #![allow(clippy::unwrap_used)]
 
 use super::{translate_function, wp_err, CompileCtx};
+use crate::canon::{AggKind, CompositeBody, IrVal, ModuleType};
 use crate::engine::Engine;
 use crate::module::op::{BranchTarget, Op};
 use crate::module::Module;
-use crate::value::{FuncType, ValType};
+use crate::value::{Finality, ValType};
 use crate::Result;
 use wasmparser::{Parser, Payload};
 
 type Sig<'a> = (&'a [ValType], &'a [ValType]);
+
+/// Maps a (numeric) public `ValType` to module IR — these tests only use numeric signatures.
+fn ir(tys: &[ValType]) -> Vec<IrVal> {
+    tys.iter()
+        .map(|t| match t {
+            ValType::I32 => IrVal::I32,
+            ValType::I64 => IrVal::I64,
+            ValType::F32 => IrVal::F32,
+            ValType::F64 => IrVal::F64,
+            ValType::V128 => IrVal::V128,
+            ValType::Ref(_) => unreachable!("translator tests use only numeric signatures"),
+        })
+        .collect()
+}
 
 /// Validates `wat`, then translates its first function body using the given
 /// type section (`sigs`), function-index→type map (`func_types`), and the
@@ -23,12 +38,23 @@ fn compile_one(
     let engine = Engine::default();
     let bytes = wat::parse_str(wat).expect("valid wat");
     Module::validate(&engine, &bytes)?;
-    let types: Vec<FuncType> = sigs
+    let types: Vec<ModuleType> = sigs
         .iter()
-        .map(|(p, r)| FuncType::new(&engine, p.iter().cloned(), r.iter().cloned()))
+        .enumerate()
+        .map(|(i, (p, r))| ModuleType {
+            group: i as u32,
+            finality: Finality::Final,
+            supertype: None,
+            body: CompositeBody::Func {
+                params: ir(p),
+                results: ir(r),
+            },
+        })
         .collect();
+    let kinds = vec![AggKind::Func; types.len()];
     let ctx = CompileCtx {
         types: &types,
+        kinds: &kinds,
         func_types,
     };
     for payload in Parser::new(0).parse_all(&bytes) {

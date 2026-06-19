@@ -298,7 +298,7 @@ impl Table {
 }
 
 /// Coarse value/type compatibility check (numeric exact; any reference matches a
-/// reference type). Precise reference-type checking arrives with Phase 4.
+/// reference type). Precise reference-type checking is left to validation.
 pub(crate) fn val_matches(val: &Val, ty: &ValType) -> bool {
     matches!(
         (val, ty),

@@ -68,8 +68,8 @@ impl Translator<'_> {
             BlockType::Empty => (0, 0),
             BlockType::Type(_) => (0, 1),
             BlockType::FuncType(i) => {
-                let ty = &self.ctx.types[i as usize];
-                (ty.params().len() as u32, ty.results().len() as u32)
+                let (params, results) = self.ctx.types[i as usize].func_sig();
+                (params.len() as u32, results.len() as u32)
             }
         }
     }
@@ -274,8 +274,8 @@ impl Translator<'_> {
     }
 
     fn signature(&self, type_index: u32) -> (u32, u32) {
-        let ty = &self.ctx.types[type_index as usize];
-        (ty.params().len() as u32, ty.results().len() as u32)
+        let (params, results) = self.ctx.types[type_index as usize].func_sig();
+        (params.len() as u32, results.len() as u32)
     }
 
     /// Computes a branch's `BranchTarget`; returns the control-frame index to

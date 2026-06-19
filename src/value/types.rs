@@ -1,10 +1,11 @@
 //! Type descriptors: `ValType`, `FuncType`, `MemoryType`, etc. (wasmtime-compatible).
 
+use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
 use crate::value::gc_type::{ArrayType, StructType};
 
-/// A wasm value type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// A wasm value type. (Public/boundary type — the serializable internal form is `canon::IrVal`.)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ValType {
     I32,
     I64,
@@ -22,7 +23,7 @@ pub enum Mutability {
 }
 
 /// A reference type: nullability plus a heap type.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RefType {
     nullable: bool,
     heap: HeapType,
@@ -45,9 +46,11 @@ impl RefType {
     }
 }
 
-/// The heap type of a reference. Abstract types only for now; concrete
-/// (`ConcreteFunc`/struct/array) types arrive with the func-references and GC phases.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// The heap type of a reference: the abstract hierarchies (func/extern/any + bottoms) plus
+/// concrete (defined) types, each carrying an engine-interned descriptor handle (`FuncType`/
+/// `StructType`/`ArrayType`). Matches `wasmtime::HeapType`. (Boundary type — the serializable
+/// internal form is `canon::IrHeap`.)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum HeapType {
     Func,
@@ -58,23 +61,23 @@ pub enum HeapType {
     Eq,
     I31,
     Struct,
-    /// A concrete struct type (host-declared; produced by the GC phase).
+    /// A concrete struct type.
     ConcreteStruct(StructType),
     Array,
-    /// A concrete array type (host-declared; produced by the GC phase).
+    /// A concrete array type.
     ConcreteArray(ArrayType),
     Exn,
     NoExn,
     None,
-    /// A concrete function type (function-references). Carries the structural signature
-    /// for identity/subtyping; recursive concrete types collapse to abstract `Func`
-    /// (full rec-group identity is #27c).
+    /// A concrete function type.
     ConcreteFunc(FuncType),
 }
 
 impl HeapType {
-    /// Is `self` a subtype of `other`? Covers the func/extern abstract hierarchies plus
-    /// concrete-func identity. Declared `sub` chains and the GC lattice are #27c.
+    /// Is `self` a subtype of `other` in the **abstract** lattice (the three disjoint
+    /// hierarchies + bottoms), plus concrete-type placement by hierarchy and id equality
+    /// (`self == other`). Concrete-to-concrete *declared* subtyping (the supertype chain) is
+    /// resolved separately against the type registry (`Engine::is_subtype`).
     pub(crate) fn matches(&self, other: &HeapType) -> bool {
         use HeapType as H;
         if self == other {
@@ -85,7 +88,20 @@ impl HeapType {
             (H::NoFunc, H::Func | H::ConcreteFunc(_))
                 | (H::ConcreteFunc(_), H::Func)
                 | (H::NoExtern, H::Extern)
-                | (H::None, H::Any | H::Eq | H::I31 | H::Struct | H::Array)
+                | (H::I31 | H::Struct | H::Array | H::Eq, H::Any)
+                | (H::I31 | H::Struct | H::Array, H::Eq)
+                | (H::ConcreteStruct(_), H::Struct | H::Eq | H::Any)
+                | (H::ConcreteArray(_), H::Array | H::Eq | H::Any)
+                | (
+                    H::None,
+                    H::Any
+                        | H::Eq
+                        | H::I31
+                        | H::Struct
+                        | H::Array
+                        | H::ConcreteStruct(_)
+                        | H::ConcreteArray(_)
+                )
         )
     }
 }
@@ -108,11 +124,12 @@ impl ValType {
     }
 }
 
-/// A function signature.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// A function signature — an engine-interned handle (identity by canonical type id; the
+/// structure is materialized from the engine registry). Matches `wasmtime::FuncType`.
+#[derive(Clone)]
 pub struct FuncType {
-    params: Vec<ValType>,
-    results: Vec<ValType>,
+    engine: Engine,
+    id: CanonicalTypeId,
 }
 
 impl FuncType {
@@ -121,19 +138,56 @@ impl FuncType {
         params: impl IntoIterator<Item = ValType>,
         results: impl IntoIterator<Item = ValType>,
     ) -> FuncType {
-        let _ = engine;
+        let params: Vec<ValType> = params.into_iter().collect();
+        let results: Vec<ValType> = results.into_iter().collect();
+        let id = engine.intern_func_type(&params, &results);
         FuncType {
-            params: params.into_iter().collect(),
-            results: results.into_iter().collect(),
+            engine: engine.clone(),
+            id,
         }
     }
 
-    pub fn params(&self) -> impl ExactSizeIterator<Item = ValType> + '_ {
-        self.params.iter().cloned()
+    /// Wraps an already-interned canonical id (internal — used by the registry/module boundary).
+    pub(crate) fn from_id(engine: &Engine, id: CanonicalTypeId) -> FuncType {
+        FuncType {
+            engine: engine.clone(),
+            id,
+        }
     }
 
-    pub fn results(&self) -> impl ExactSizeIterator<Item = ValType> + '_ {
-        self.results.iter().cloned()
+    /// The engine-canonical type id (internal identity).
+    pub(crate) fn canonical_id(&self) -> CanonicalTypeId {
+        self.id
+    }
+
+    pub fn params(&self) -> impl ExactSizeIterator<Item = ValType> {
+        self.engine.func_sig(self.id).0.into_iter()
+    }
+
+    pub fn results(&self) -> impl ExactSizeIterator<Item = ValType> {
+        self.engine.func_sig(self.id).1.into_iter()
+    }
+}
+
+impl PartialEq for FuncType {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for FuncType {}
+
+impl core::hash::Hash for FuncType {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl core::fmt::Debug for FuncType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FuncType")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -175,8 +229,8 @@ impl MemoryType {
     }
 }
 
-/// A global type: content type plus mutability.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// A global type: content type plus mutability. (Boundary type; internal storage is IR.)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GlobalType {
     content: ValType,
     mutability: Mutability,
@@ -199,8 +253,8 @@ impl GlobalType {
     }
 }
 
-/// A table type: element reference type plus limits.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// A table type: element reference type plus limits. (Boundary type; internal storage is IR.)
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TableType {
     element: RefType,
     minimum: u64,

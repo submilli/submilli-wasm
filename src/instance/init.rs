@@ -1,6 +1,7 @@
 //! Instantiation: link imports, allocate the defined entities, and initialize the
 //! active element/data segments. (The start function is run by `Instance::new`.)
 
+use crate::canon::{self, AggKind, IrGlobalType, IrHeap, IrTableType};
 use crate::extern_::{Extern, Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
@@ -10,7 +11,7 @@ use crate::store::{
     FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, StoreInner, TableEntity,
 };
 use crate::trap::Trap;
-use crate::value::{GlobalType, HeapType, MemoryType, Mutability, Ref, RefType, TableType, Val};
+use crate::value::{MemoryType, Mutability, Ref, Val};
 use crate::{Error, Result};
 
 /// Index spaces built from a module's imports.
@@ -44,21 +45,13 @@ pub(crate) fn instantiate(
     for td in &m.tables {
         let init = match &td.init {
             Some(e) => eval_const_ref(inner, &globals, &funcs, e)?,
-            None => null_ref(td.ty.element()),
+            None => null_ref(&td.ty.element.heap),
         };
-        tables.push(inner.alloc_table(TableEntity::new(td.ty.clone(), init)));
+        let ty = canon::materialize_table(m.engine(), &m.type_ids, &td.ty);
+        tables.push(inner.alloc_table(TableEntity::new(ty, init)));
     }
 
-    for g in &m.globals {
-        let value = match &g.init {
-            ConstExpr::RefFunc(i) => Val::FuncRef(Some(funcs[*i as usize])),
-            other => eval_const(inner, &globals, other)?,
-        };
-        globals.push(inner.alloc_global(GlobalEntity {
-            value,
-            ty: g.ty.clone(),
-        }));
-    }
+    init_defined_globals(inner, module, &funcs, &mut globals)?;
 
     // Active/declared element segments are unusable by `table.init` (dropped);
     // only passive segments remain live.
@@ -85,6 +78,28 @@ pub(crate) fn instantiate(
     Ok(instance)
 }
 
+/// Allocates the module's defined globals, baking their types to canonical ids. (`ref.func`
+/// initializers resolve against the already-allocated function handles.)
+fn init_defined_globals(
+    inner: &mut StoreInner,
+    module: &Module,
+    funcs: &[Func],
+    globals: &mut Vec<Global>,
+) -> Result<()> {
+    let m = module.inner();
+    for g in &m.globals {
+        let value = match &g.init {
+            ConstExpr::RefFunc(i) => Val::FuncRef(Some(funcs[*i as usize])),
+            other => eval_const(inner, globals, other)?,
+        };
+        globals.push(inner.alloc_global(GlobalEntity {
+            value,
+            ty: canon::materialize_global(m.engine(), &m.type_ids, &g.ty),
+        }));
+    }
+    Ok(())
+}
+
 fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Result<Imported> {
     let mut spaces: Imported = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (imp, ext) in module.inner().imports.iter().zip(imports) {
@@ -98,11 +113,11 @@ fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Resu
                 spaces.1.push(*mem);
             }
             (ImportKind::Global(gt), Extern::Global(g)) => {
-                check_global(inner, gt, *g)?;
+                check_global(inner, module, gt, *g)?;
                 spaces.2.push(*g);
             }
             (ImportKind::Table(tt), Extern::Table(t)) => {
-                check_table(inner, tt, *t)?;
+                check_table(inner, module, tt, *t)?;
                 spaces.3.push(*t);
             }
             _ => return Err(Error::msg("import kind mismatch")),
@@ -112,21 +127,24 @@ fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Resu
 }
 
 fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Result<()> {
-    let actual = match inner.func(f) {
+    let expected_id = module.inner().canonical_type_id(type_idx);
+    let ok = match inner.func(f) {
         FuncEntity::Wasm {
             instance,
             func_index,
-        } => inner
-            .instance(*instance)
-            .module
-            .inner()
-            .func_type(*func_index)
-            .clone(),
-        FuncEntity::Host { ty, .. } => ty.clone(),
+        } => {
+            let pmod = inner.instance(*instance).module.inner();
+            let actual_id = pmod.canonical_type_id(pmod.func_types[*func_index as usize]);
+            inner.engine().is_subtype(actual_id, expected_id)
+        }
+        // Host func types are interned too — compare canonical ids uniformly.
+        FuncEntity::Host { ty, .. } => inner.engine().is_subtype(ty.canonical_id(), expected_id),
         #[cfg(feature = "async")]
-        FuncEntity::HostAsync { ty, .. } => ty.clone(),
+        FuncEntity::HostAsync { ty, .. } => {
+            inner.engine().is_subtype(ty.canonical_id(), expected_id)
+        }
     };
-    if module.inner().types[type_idx as usize] == actual {
+    if ok {
         Ok(())
     } else {
         Err(Error::msg("imported function signature mismatch"))
@@ -148,8 +166,17 @@ fn check_memory(inner: &StoreInner, declared: &MemoryType, m: Memory) -> Result<
     }
 }
 
-fn check_table(inner: &StoreInner, declared: &TableType, t: Table) -> Result<()> {
+fn check_table(
+    inner: &StoreInner,
+    module: &Module,
+    declared: &IrTableType,
+    t: Table,
+) -> Result<()> {
     let entity = inner.table(t);
+    // Materialize the importer's declared element type to canonical handles (the provider
+    // entity's type is already canonical), so concrete GC/func element types compare cross-module.
+    let m = module.inner();
+    let declared = canon::materialize_table(m.engine(), &m.type_ids, declared);
     // Import matching uses the table's *current size* as its effective minimum (a table
     // grown past its declared minimum still satisfies imports declaring that larger min).
     let ok = entity.ty.element() == declared.element()
@@ -166,8 +193,16 @@ fn check_table(inner: &StoreInner, declared: &TableType, t: Table) -> Result<()>
     }
 }
 
-fn check_global(inner: &StoreInner, declared: &GlobalType, g: Global) -> Result<()> {
+fn check_global(
+    inner: &StoreInner,
+    module: &Module,
+    declared: &IrGlobalType,
+    g: Global,
+) -> Result<()> {
     let actual = &inner.global(g).ty;
+    // Materialize the importer's declared type to canonical handles (the entity's is canonical).
+    let m = module.inner();
+    let declared = canon::materialize_global(m.engine(), &m.type_ids, declared);
     let ok = actual.mutability() == declared.mutability()
         && match declared.mutability() {
             // Immutable globals are read-only, so the export type need only be a subtype of
@@ -260,7 +295,7 @@ fn eval_const(inner: &StoreInner, globals: &[Global], e: &ConstExpr) -> Result<V
         ConstExpr::I64(v) => Val::I64(*v),
         ConstExpr::F32(v) => Val::F32(*v),
         ConstExpr::F64(v) => Val::F64(*v),
-        ConstExpr::RefNull(rt) => null_val(rt),
+        ConstExpr::RefNull(heap) => Val::null_for_heap(heap),
         ConstExpr::GlobalGet(g) => inner.global(globals[*g as usize]).value,
         ConstExpr::RefFunc(_) => return Err(Error::msg("ref.func outside element segment")),
     })
@@ -274,7 +309,7 @@ pub(crate) fn eval_const_ref(
 ) -> Result<Ref> {
     Ok(match e {
         ConstExpr::RefFunc(i) => Ref::Func(Some(funcs[*i as usize])),
-        ConstExpr::RefNull(rt) => null_ref(rt),
+        ConstExpr::RefNull(heap) => null_ref(heap),
         ConstExpr::GlobalGet(g) => val_to_ref(inner.global(globals[*g as usize]).value)?,
         _ => return Err(Error::msg("non-reference element expression")),
     })
@@ -288,21 +323,13 @@ fn const_to_usize(v: Val) -> Result<usize> {
     }
 }
 
-fn null_ref(rt: &RefType) -> Ref {
-    match rt.heap_type() {
-        HeapType::Func | HeapType::NoFunc | HeapType::ConcreteFunc(_) => Ref::Func(None),
-        HeapType::Extern | HeapType::NoExtern => Ref::Extern(None),
-        HeapType::Exn | HeapType::NoExn => Ref::Exn(None),
+/// The null reference for an IR heap type (by hierarchy).
+fn null_ref(heap: &IrHeap) -> Ref {
+    match heap {
+        IrHeap::Func | IrHeap::NoFunc | IrHeap::Concrete(_, AggKind::Func) => Ref::Func(None),
+        IrHeap::Extern | IrHeap::NoExtern => Ref::Extern(None),
+        IrHeap::Exn | IrHeap::NoExn => Ref::Exn(None),
         _ => Ref::Any(None),
-    }
-}
-
-fn null_val(rt: &RefType) -> Val {
-    match rt.heap_type() {
-        HeapType::Func | HeapType::NoFunc | HeapType::ConcreteFunc(_) => Val::FuncRef(None),
-        HeapType::Extern | HeapType::NoExtern => Val::ExternRef(None),
-        HeapType::Exn | HeapType::NoExn => Val::ExnRef(None),
-        _ => Val::AnyRef(None),
     }
 }
 

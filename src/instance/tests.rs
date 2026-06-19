@@ -1,5 +1,5 @@
 //! Instantiation + cross-function/indirect-call + segment tests. We drive the
-//! interpreter through the internal `exec` path since `Func::call` lands in #14.
+//! interpreter through the internal `exec` path (the public `Func::call` is covered elsewhere).
 #![allow(clippy::unwrap_used)]
 
 use super::Instance;
@@ -258,7 +258,7 @@ fn unbounded_recursion_traps_stack_overflow() {
     assert_eq!(trap_of(r), Trap::StackOverflow);
 }
 
-// --- fuel metering (#21) ---
+// --- fuel metering ---
 
 use crate::Config;
 
@@ -315,7 +315,7 @@ fn fuel_exhaustion_traps() {
     assert_eq!(trap_of(r), Trap::OutOfFuel);
 }
 
-// --- epoch interruption (#22) ---
+// --- epoch interruption ---
 
 use crate::UpdateDeadline;
 use std::sync::atomic::{AtomicUsize, Ordering};

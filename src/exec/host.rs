@@ -174,7 +174,7 @@ impl Execution {
             FuncEntity::Host { ty, host_index } => (
                 ty.params().len(),
                 ty.results()
-                    .map(|t| Val::default_for(&t))
+                    .map(|t| Val::default_for_valtype(&t))
                     .collect::<Vec<_>>(),
                 *host_index,
             ),
@@ -209,7 +209,7 @@ impl Execution {
             FuncEntity::HostAsync { ty, host_index } => (
                 ty.params().len(),
                 ty.results()
-                    .map(|t| Val::default_for(&t))
+                    .map(|t| Val::default_for_valtype(&t))
                     .collect::<Vec<_>>(),
                 *host_index,
             ),
