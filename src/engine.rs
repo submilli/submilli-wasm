@@ -80,6 +80,47 @@ impl Engine {
             .release(group_ids);
     }
 
+    /// Adds a registration to the group owning `id` (a type handle was cloned / materialized).
+    pub(crate) fn incref_type(&self, id: CanonicalTypeId) {
+        self.inner
+            .types
+            .write()
+            .expect("type registry poisoned")
+            .incref_type(id);
+    }
+
+    /// Removes a registration from the group owning `id` (a type handle was dropped).
+    pub(crate) fn decref_type(&self, id: CanonicalTypeId) {
+        self.inner
+            .types
+            .write()
+            .expect("type registry poisoned")
+            .decref_type(id);
+    }
+
+    /// Removes one registration from group `g` (a `RecGroup` / `Module` handle was dropped).
+    pub(crate) fn release_group(&self, g: GroupId) {
+        self.release_types(&[g]);
+    }
+
+    /// Adds one registration to group `g` (a `RecGroup` was cloned).
+    pub(crate) fn incref_group(&self, g: GroupId) {
+        self.inner
+            .types
+            .write()
+            .expect("type registry poisoned")
+            .incref_group(g);
+    }
+
+    /// The number of live (registered) rec groups — for leak/reclamation tests.
+    pub(crate) fn live_group_count(&self) -> usize {
+        self.inner
+            .types
+            .read()
+            .expect("type registry poisoned")
+            .live_group_count()
+    }
+
     /// Whether canonical type `sub` is a declared subtype of `sup`.
     pub(crate) fn is_subtype(&self, sub: CanonicalTypeId, sup: CanonicalTypeId) -> bool {
         self.inner
@@ -141,47 +182,39 @@ impl Engine {
             .0
     }
 
-    /// Interns a host-built rec group (`RecGroupBuilder`), returning the members' canonical ids.
-    /// The group id is discarded (leaked, like the singleton host-type interners); reclamation is
-    /// a later collector concern (#27i).
+    /// Interns a host-built rec group (`RecGroupBuilder`), returning the members' canonical ids
+    /// and the group id (with one registration, adopted by the resulting `RecGroup`).
     pub(crate) fn intern_host_group(
         &self,
         members: &[ModuleType],
         externals: &[CanonicalTypeId],
-    ) -> Vec<CanonicalTypeId> {
+    ) -> (Vec<CanonicalTypeId>, GroupId) {
         self.inner
             .types
             .write()
             .expect("type registry poisoned")
             .intern_host_group(members, externals)
-            .0
+    }
+
+    /// The engine's canonical type registry lock (used by the two-phase materializers in `canon`,
+    /// which acquire it briefly to clone canonical data, then build handles after releasing it).
+    pub(crate) fn types(&self) -> &RwLock<TypeRegistry> {
+        &self.inner.types
     }
 
     /// The materialized (params, results) of a canonical func type.
     pub(crate) fn func_sig(&self, id: CanonicalTypeId) -> (Vec<ValType>, Vec<ValType>) {
-        self.inner
-            .types
-            .read()
-            .expect("type registry poisoned")
-            .func_sig(self, id)
+        crate::canon::func_sig(self, id)
     }
 
     /// The materialized fields of a canonical struct type.
     pub(crate) fn struct_fields(&self, id: CanonicalTypeId) -> Vec<FieldType> {
-        self.inner
-            .types
-            .read()
-            .expect("type registry poisoned")
-            .struct_fields(self, id)
+        crate::canon::struct_fields(self, id)
     }
 
     /// The materialized element of a canonical array type.
     pub(crate) fn array_field(&self, id: CanonicalTypeId) -> FieldType {
-        self.inner
-            .types
-            .read()
-            .expect("type registry poisoned")
-            .array_field(self, id)
+        crate::canon::array_field(self, id)
     }
 
     /// Whether epoch-based interruption is enabled (`Config::epoch_interruption`).

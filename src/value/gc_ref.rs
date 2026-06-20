@@ -4,7 +4,7 @@
 use core::any::Any;
 use core::marker::PhantomData;
 
-use crate::canon::{CanonicalTypeId, Layout};
+use crate::canon::Layout;
 use crate::store::{
     anyref_handle_slot, decode_anyref_handle, read_slot, slot_accepts, write_slot, AnyRefHandle,
     AsContext, AsContextMut, GcObject, ObjKind, StoreContext, StoreContextMut,
@@ -177,11 +177,12 @@ pub struct StructRef {
     _private: (),
 }
 
-/// Pre-allocation handle for [`StructRef::new`]: caches the type's canonical id + packed byte
-/// layout so repeated allocations skip the lookup (wasmtime's `*Pre` purpose).
+/// Pre-allocation handle for [`StructRef::new`]: holds the `StructType` (a registration, so the
+/// type stays alive until allocation) plus its cached packed layout (amortizing the lookup —
+/// wasmtime's `*Pre` purpose).
 #[derive(Debug)]
 pub struct StructRefPre {
-    type_id: CanonicalTypeId,
+    ty: StructType,
     layout: Layout,
 }
 
@@ -190,7 +191,7 @@ impl StructRefPre {
         let _ = store; // no rooting/registration needed under the null collector
         let fields: Vec<_> = ty.fields().collect();
         StructRefPre {
-            type_id: ty.canonical_id(),
+            ty,
             layout: Layout::for_struct(&fields),
         }
     }
@@ -223,13 +224,12 @@ impl StructRef {
         for (slot, v) in slots.iter().zip(fields) {
             write_slot(*slot, &mut data, *v);
         }
+        let type_id = allocator.ty.canonical_id();
         let mut ctx = store.as_context_mut();
         let inner = ctx.inner_mut();
         inner.gc_check_capacity(*size)?;
-        let idx = inner.alloc_gc(GcObject::new_struct(
-            allocator.type_id,
-            data.into_boxed_slice(),
-        ))?;
+        inner.pin_gc_type(type_id); // keep the type alive for the object's (store) lifetime
+        let idx = inner.alloc_gc(GcObject::new_struct(type_id, data.into_boxed_slice()))?;
         Ok(Rooted::from_raw(anyref_handle_slot(idx)))
     }
 }
@@ -266,20 +266,19 @@ pub struct ArrayRef {
     _private: (),
 }
 
-/// Pre-allocation handle for [`ArrayRef::new`] (caches the type's canonical id + element layout).
+/// Pre-allocation handle for [`ArrayRef::new`]: holds the `ArrayType` (a registration) + cached
+/// element layout (like [`StructRefPre`]).
 #[derive(Debug)]
 pub struct ArrayRefPre {
-    type_id: CanonicalTypeId,
+    ty: ArrayType,
     layout: Layout,
 }
 
 impl ArrayRefPre {
     pub fn new(store: impl AsContextMut, ty: ArrayType) -> Self {
         let _ = store;
-        ArrayRefPre {
-            type_id: ty.canonical_id(),
-            layout: Layout::for_array(&ty.field_type()),
-        }
+        let layout = Layout::for_array(&ty.field_type());
+        ArrayRefPre { ty, layout }
     }
 }
 
@@ -324,11 +323,13 @@ impl ArrayRef {
         for i in 0..count {
             write_slot(allocator.layout.elem_at(i), &mut data, *elem_at(i));
         }
+        let type_id = allocator.ty.canonical_id();
         let mut ctx = store.as_context_mut();
         let inner = ctx.inner_mut();
         inner.gc_check_capacity(byte_len)?;
+        inner.pin_gc_type(type_id);
         let idx = inner.alloc_gc(GcObject::new_array(
-            allocator.type_id,
+            type_id,
             count as u32,
             data.into_boxed_slice(),
         ))?;

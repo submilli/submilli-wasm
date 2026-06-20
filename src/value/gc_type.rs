@@ -53,8 +53,8 @@ impl FieldType {
     }
 }
 
-/// A GC struct type — an engine-interned handle (identity by canonical id).
-#[derive(Clone)]
+/// A GC struct type — an engine-interned handle (identity by canonical id). Refcounted (#27i):
+/// holds one registration on its rec group; `Clone`/`Drop` incref/decref (see `handle_id_traits!`).
 pub struct StructType {
     engine: Engine,
     id: CanonicalTypeId,
@@ -81,6 +81,7 @@ impl StructType {
     }
 
     pub(crate) fn from_id(engine: &Engine, id: CanonicalTypeId) -> Self {
+        engine.incref_type(id);
         StructType {
             engine: engine.clone(),
             id,
@@ -100,8 +101,8 @@ impl StructType {
     }
 }
 
-/// A GC array type — an engine-interned handle (identity by canonical id).
-#[derive(Clone)]
+/// A GC array type — an engine-interned handle (identity by canonical id). Refcounted (#27i),
+/// like [`StructType`].
 pub struct ArrayType {
     engine: Engine,
     id: CanonicalTypeId,
@@ -131,6 +132,7 @@ impl ArrayType {
     }
 
     pub(crate) fn from_id(engine: &Engine, id: CanonicalTypeId) -> Self {
+        engine.incref_type(id);
         ArrayType {
             engine: engine.clone(),
             id,
@@ -152,6 +154,20 @@ impl ArrayType {
 
 macro_rules! handle_id_traits {
     ($ty:ident) => {
+        impl Clone for $ty {
+            fn clone(&self) -> Self {
+                self.engine.incref_type(self.id);
+                $ty {
+                    engine: self.engine.clone(),
+                    id: self.id,
+                }
+            }
+        }
+        impl Drop for $ty {
+            fn drop(&mut self) {
+                self.engine.decref_type(self.id);
+            }
+        }
         impl PartialEq for $ty {
             fn eq(&self, other: &Self) -> bool {
                 self.id == other.id

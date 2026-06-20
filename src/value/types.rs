@@ -126,7 +126,10 @@ impl ValType {
 
 /// A function signature — an engine-interned handle (identity by canonical type id; the
 /// structure is materialized from the engine registry). Matches `wasmtime::FuncType`.
-#[derive(Clone)]
+///
+/// Refcounted (#27i): the handle holds one registration on its type's rec group; `Clone` increfs
+/// and `Drop` decrefs, so the group is reclaimed once the last handle (and any `Module`/`Store`
+/// holding it) is gone.
 pub struct FuncType {
     engine: Engine,
     id: CanonicalTypeId,
@@ -140,6 +143,7 @@ impl FuncType {
     ) -> FuncType {
         let params: Vec<ValType> = params.into_iter().collect();
         let results: Vec<ValType> = results.into_iter().collect();
+        // `intern_func_type` returns a type with one registration; this handle adopts it.
         let id = engine.intern_func_type(&params, &results);
         FuncType {
             engine: engine.clone(),
@@ -147,8 +151,10 @@ impl FuncType {
         }
     }
 
-    /// Wraps an already-interned canonical id (internal — used by the registry/module boundary).
+    /// Wraps an already-interned canonical id, taking a fresh registration (internal — used by the
+    /// registry/module materialization boundary).
     pub(crate) fn from_id(engine: &Engine, id: CanonicalTypeId) -> FuncType {
+        engine.incref_type(id);
         FuncType {
             engine: engine.clone(),
             id,
@@ -166,6 +172,22 @@ impl FuncType {
 
     pub fn results(&self) -> impl ExactSizeIterator<Item = ValType> {
         self.engine.func_sig(self.id).1.into_iter()
+    }
+}
+
+impl Clone for FuncType {
+    fn clone(&self) -> Self {
+        self.engine.incref_type(self.id);
+        FuncType {
+            engine: self.engine.clone(),
+            id: self.id,
+        }
+    }
+}
+
+impl Drop for FuncType {
+    fn drop(&mut self) {
+        self.engine.decref_type(self.id);
     }
 }
 

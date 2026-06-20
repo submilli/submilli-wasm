@@ -5,14 +5,11 @@
 use std::collections::HashMap;
 
 use super::keys::{
-    abs_decode, array_body, body_key, body_kind, func_body, num_decode, resolve, resolve_body,
-    struct_body, CBody, CField, CGroup, CHeap, CStore, CType, CVal, CanonRef,
+    array_body, body_key, body_kind, func_body, resolve, resolve_body, struct_body, CBody, CField,
+    CGroup, CHeap, CStore, CType, CVal, CanonRef,
 };
 use super::{AggKind, CanonicalTypeId, Finality, GroupId, ModuleType};
-use crate::engine::Engine;
-use crate::value::{
-    ArrayType, FieldType, FuncType, HeapType, Mutability, RefType, StorageType, StructType, ValType,
-};
+use crate::value::{FieldType, ValType};
 
 /// A registered canonical type (body refs resolved to absolute canonical ids).
 #[derive(Clone)]
@@ -33,6 +30,9 @@ struct GroupRecord {
 #[derive(Default)]
 pub(crate) struct TypeRegistry {
     types: Vec<Option<CanonType>>,
+    /// Parallel to `types`: each live canonical type's owning group (so a handle holding a
+    /// `CanonicalTypeId` can find its group to incref/decref). `None` for free slots.
+    type_to_group: Vec<Option<GroupId>>,
     free_types: Vec<CanonicalTypeId>,
     groups: Vec<Option<GroupRecord>>,
     free_groups: Vec<GroupId>,
@@ -164,23 +164,11 @@ impl TypeRegistry {
         (ids, group_id)
     }
 
-    /// Releases group ids (one decrement each); reclaims a group at refcount 0.
+    /// Releases group ids (one decrement each); reclaims a group at refcount 0 (with the
+    /// edge-decref cascade in [`decref_group`]).
     pub(crate) fn release(&mut self, group_ids: &[GroupId]) {
         for &g in group_ids {
-            let Some(rec) = self.groups[g.index()].as_mut() else {
-                continue;
-            };
-            rec.refcount -= 1;
-            if rec.refcount > 0 {
-                continue;
-            }
-            let rec = self.groups[g.index()].take().expect("present");
-            self.interned.remove(&rec.key);
-            for &m in &rec.members {
-                self.types[m.index()] = None;
-                self.free_types.push(m);
-            }
-            self.free_groups.push(g);
+            self.decref_group(g);
         }
     }
 
@@ -207,34 +195,36 @@ impl TypeRegistry {
         self.types[id.index()].as_ref().expect("live type").finality
     }
 
-    /// The materialized (public) parameter + result types of a func type.
-    pub(crate) fn func_sig(
-        &self,
-        engine: &Engine,
-        id: CanonicalTypeId,
-    ) -> (Vec<ValType>, Vec<ValType>) {
+    /// Number of currently-registered (live) rec groups — for leak/reclamation tests.
+    pub(crate) fn live_group_count(&self) -> usize {
+        self.interned.len()
+    }
+
+    /// Clones a func type's canonical (params, results) under the lock — phase 1 of materialization
+    /// (the handle-building phase 2 runs lock-free, see the free `func_sig`).
+    pub(super) fn func_body_raw(&self, id: CanonicalTypeId) -> (Vec<CVal>, Vec<CVal>) {
         match &self.types[id.index()].as_ref().expect("live type").body {
-            CBody::Func(p, r) => (
-                p.iter().map(|v| self.mat_val(engine, v)).collect(),
-                r.iter().map(|v| self.mat_val(engine, v)).collect(),
-            ),
+            CBody::Func(p, r) => (p.clone(), r.clone()),
             _ => (Vec::new(), Vec::new()),
         }
     }
 
-    /// The materialized fields of a struct type.
-    pub(crate) fn struct_fields(&self, engine: &Engine, id: CanonicalTypeId) -> Vec<FieldType> {
+    /// Clones a struct type's canonical fields under the lock (phase 1).
+    pub(super) fn struct_fields_raw(&self, id: CanonicalTypeId) -> Vec<CField> {
         match &self.types[id.index()].as_ref().expect("live type").body {
-            CBody::Struct(fields) => fields.iter().map(|f| self.mat_field(engine, f)).collect(),
+            CBody::Struct(fields) => fields.clone(),
             _ => Vec::new(),
         }
     }
 
-    /// The materialized element of an array type.
-    pub(crate) fn array_field(&self, engine: &Engine, id: CanonicalTypeId) -> FieldType {
+    /// Clones an array type's canonical element under the lock (phase 1).
+    pub(super) fn array_field_raw(&self, id: CanonicalTypeId) -> CField {
         match &self.types[id.index()].as_ref().expect("live type").body {
-            CBody::Array(f) => self.mat_field(engine, f),
-            _ => FieldType::new(Mutability::Const, StorageType::I8),
+            CBody::Array(f) => f.clone(),
+            _ => CField {
+                mutable: false,
+                storage: CStore::Packed(0),
+            },
         }
     }
 
@@ -242,16 +232,18 @@ impl TypeRegistry {
 
     fn intern_group(&mut self, key: CGroup, len: usize) -> GroupId {
         if let Some(&g) = self.interned.get(&key) {
-            self.groups[g.index()]
-                .as_mut()
-                .expect("interned group")
-                .refcount += 1;
+            self.incref_group(g);
             return g;
         }
+        let g = self.free_groups.pop().unwrap_or_else(|| {
+            self.groups.push(None);
+            GroupId::new((self.groups.len() - 1) as u32)
+        });
         let mut members = Vec::with_capacity(len);
         for _ in 0..len {
             let id = self.free_types.pop().unwrap_or_else(|| {
                 self.types.push(None);
+                self.type_to_group.push(None);
                 CanonicalTypeId::new((self.types.len() - 1) as u32)
             });
             members.push(id);
@@ -263,11 +255,14 @@ impl TypeRegistry {
                 supertype: ct.supertype.as_ref().map(|r| resolve(r, &members)),
                 body: resolve_body(&ct.body, &members),
             });
+            self.type_to_group[members[pos].index()] = Some(g);
         }
-        let g = self.free_groups.pop().unwrap_or_else(|| {
-            self.groups.push(None);
-            GroupId::new((self.groups.len() - 1) as u32)
-        });
+        // Pin the groups this new group references (cross-group edges) — they must outlive it.
+        for id in edge_canon_ids(&key) {
+            if let Some(og) = self.type_to_group[id.index()] {
+                self.incref_group(og);
+            }
+        }
         self.groups[g.index()] = Some(GroupRecord {
             key: key.clone(),
             members,
@@ -275,6 +270,53 @@ impl TypeRegistry {
         });
         self.interned.insert(key, g);
         g
+    }
+
+    pub(crate) fn incref_group(&mut self, g: GroupId) {
+        self.groups[g.index()]
+            .as_mut()
+            .expect("live group")
+            .refcount += 1;
+    }
+
+    /// Decrements a group's refcount; at zero, reclaims it — decref-ing its outgoing edges (which
+    /// may cascade) via an explicit worklist, then freeing its type + group slots for reuse.
+    pub(crate) fn decref_group(&mut self, g: GroupId) {
+        let mut stack = vec![g];
+        while let Some(g) = stack.pop() {
+            let Some(rec) = self.groups[g.index()].as_mut() else {
+                continue;
+            };
+            rec.refcount -= 1;
+            if rec.refcount > 0 {
+                continue;
+            }
+            let rec = self.groups[g.index()].take().expect("present");
+            self.interned.remove(&rec.key);
+            for id in edge_canon_ids(&rec.key) {
+                if let Some(og) = self.type_to_group[id.index()] {
+                    stack.push(og); // cascade: decref the referenced group next
+                }
+            }
+            for &m in &rec.members {
+                self.types[m.index()] = None;
+                self.type_to_group[m.index()] = None;
+                self.free_types.push(m);
+            }
+            self.free_groups.push(g);
+        }
+    }
+
+    /// Adds a registration to the group owning `id` (a handle was cloned / materialized).
+    pub(crate) fn incref_type(&mut self, id: CanonicalTypeId) {
+        let g = self.type_to_group[id.index()].expect("live type");
+        self.incref_group(g);
+    }
+
+    /// Removes a registration from the group owning `id` (a handle was dropped).
+    pub(crate) fn decref_type(&mut self, id: CanonicalTypeId) {
+        let g = self.type_to_group[id.index()].expect("live type");
+        self.decref_group(g);
     }
 
     fn build_key(
@@ -301,42 +343,49 @@ impl TypeRegistry {
             })
             .collect()
     }
+}
 
-    // --- materialization (canonical → public handle types) ---
+// --- cross-group edge tracing (the absolute canonical ids a group's key references) ---
 
-    fn mat_val(&self, engine: &Engine, v: &CVal) -> ValType {
-        match v {
-            CVal::Num(c) => num_decode(*c),
-            CVal::Ref(nullable, h) => {
-                ValType::Ref(RefType::new(*nullable, self.mat_heap(engine, h)))
+/// The canonical ids a group's key references *outside itself* — i.e. `CanonRef::Canon` entries in
+/// supertypes and bodies (siblings are `Rel` and excluded). One entry per occurrence (refcount
+/// incref/decref are symmetric over this, so duplicates balance).
+fn edge_canon_ids(key: &CGroup) -> Vec<CanonicalTypeId> {
+    let mut out = Vec::new();
+    for ct in key {
+        if let Some(CanonRef::Canon(id)) = &ct.supertype {
+            out.push(*id);
+        }
+        body_canon_ids(&ct.body, &mut out);
+    }
+    out
+}
+
+fn body_canon_ids(b: &CBody, out: &mut Vec<CanonicalTypeId>) {
+    match b {
+        CBody::Func(p, r) => {
+            for v in p.iter().chain(r) {
+                val_canon_id(v, out);
             }
         }
-    }
-
-    fn mat_heap(&self, engine: &Engine, h: &CHeap) -> HeapType {
-        match h {
-            CHeap::Abs(c) => abs_decode(*c),
-            CHeap::Concrete(kind, CanonRef::Canon(id)) => match kind {
-                AggKind::Func => HeapType::ConcreteFunc(FuncType::from_id(engine, *id)),
-                AggKind::Struct => HeapType::ConcreteStruct(StructType::from_id(engine, *id)),
-                AggKind::Array => HeapType::ConcreteArray(ArrayType::from_id(engine, *id)),
-            },
-            CHeap::Concrete(_, CanonRef::Rel(_)) => unreachable!("stored bodies use absolute ids"),
+        CBody::Struct(fields) => {
+            for f in fields {
+                field_canon_id(f, out);
+            }
         }
+        CBody::Array(f) => field_canon_id(f, out),
     }
+}
 
-    fn mat_field(&self, engine: &Engine, f: &CField) -> FieldType {
-        let mutability = if f.mutable {
-            Mutability::Var
-        } else {
-            Mutability::Const
-        };
-        let storage = match &f.storage {
-            CStore::Packed(0) => StorageType::I8,
-            CStore::Packed(_) => StorageType::I16,
-            CStore::Val(v) => StorageType::ValType(self.mat_val(engine, v)),
-        };
-        FieldType::new(mutability, storage)
+fn field_canon_id(f: &CField, out: &mut Vec<CanonicalTypeId>) {
+    if let CStore::Val(v) = &f.storage {
+        val_canon_id(v, out);
+    }
+}
+
+fn val_canon_id(v: &CVal, out: &mut Vec<CanonicalTypeId>) {
+    if let CVal::Ref(_, CHeap::Concrete(_, CanonRef::Canon(id))) = v {
+        out.push(*id);
     }
 }
 

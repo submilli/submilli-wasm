@@ -17,7 +17,7 @@ pub use template::{
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::canon::{AggKind, CanonicalTypeId, ModuleType};
+use crate::canon::{AggKind, CanonicalTypeId, GroupId, ModuleType};
 use crate::engine::Engine;
 use crate::value::{ArrayType, Finality, FuncType, StructType};
 use crate::{Error, Result};
@@ -218,10 +218,13 @@ impl RecGroupBuilder {
             });
             kinds.push(kind);
         }
-        let ids = self.engine.intern_host_group(&members, &externals);
+        // The group is interned with one registration, which this `RecGroup` adopts (released on
+        // drop). Extracted `StructType`/etc. handles take their own registrations via `from_id`.
+        let (ids, group) = self.engine.intern_host_group(&members, &externals);
         Ok(RecGroup {
             engine: self.engine,
             builder_id: self.builder_id,
+            group,
             ids,
             kinds,
         })
@@ -237,12 +240,34 @@ pub enum CompositeType {
 }
 
 /// A registered recursion group: the canonical types produced by [`RecGroupBuilder::build`].
-#[derive(Clone, Debug)]
+/// Holds one registration on the group (`Clone` increfs, `Drop` decrefs), keeping all its member
+/// types alive while it lives.
+#[derive(Debug)]
 pub struct RecGroup {
     engine: Engine,
     builder_id: usize,
+    group: GroupId,
     ids: Vec<CanonicalTypeId>,
     kinds: Vec<AggKind>,
+}
+
+impl Clone for RecGroup {
+    fn clone(&self) -> Self {
+        self.engine.incref_group(self.group);
+        RecGroup {
+            engine: self.engine.clone(),
+            builder_id: self.builder_id,
+            group: self.group,
+            ids: self.ids.clone(),
+            kinds: self.kinds.clone(),
+        }
+    }
+}
+
+impl Drop for RecGroup {
+    fn drop(&mut self) {
+        self.engine.release_group(self.group);
+    }
 }
 
 impl RecGroup {

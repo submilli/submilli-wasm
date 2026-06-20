@@ -4,6 +4,7 @@
 use core::any::Any;
 use std::num::NonZeroU64;
 
+use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
 use crate::extern_::{Global, Memory, Table};
 use crate::func::Func;
@@ -91,6 +92,12 @@ pub(crate) struct StoreInner {
     /// Managed `struct`/`array` objects; `Rooted<AnyRef>` slot handles index here.
     /// Allocate-only (null collector); reclamation comes with a tracing collector.
     gc: GcHeap,
+    /// Canonical type ids of **host-allocated** GC objects, each pinned with one type-registration
+    /// (decref'd on store drop). A `GcHeader` holds only a bare `CanonicalTypeId`; guest-object
+    /// types stay alive via the defining instance's module, but a host object could outlive the
+    /// embedder's `StructType` handle — so the store pins host-alloc types for its lifetime (#27i,
+    /// mirrors wasmtime's `gc_host_alloc_types`).
+    gc_host_alloc_types: std::collections::HashSet<CanonicalTypeId>,
     /// Active fuel — charged per op (meaningful only when `engine.consume_fuel()`).
     /// With an async yield interval this is the current slice; total = `fuel + fuel_reserve`.
     fuel: u64,
@@ -114,6 +121,7 @@ impl StoreInner {
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
             gc,
+            gc_host_alloc_types: std::collections::HashSet::new(),
             fuel: 0,
             fuel_reserve: 0,
             fuel_yield_interval: None,
@@ -186,6 +194,15 @@ impl StoreInner {
     /// `Rooted<AnyRef>`). Traps on heap exhaustion.
     pub(crate) fn alloc_gc(&mut self, object: GcObject) -> crate::Result<u32> {
         self.gc.alloc(object)
+    }
+
+    /// Pins a host-allocated GC object's type for the store's lifetime (one registration per
+    /// distinct type), so the object's bare `type_id` stays valid even if the embedder drops its
+    /// `StructType`/`ArrayType`. Idempotent per type.
+    pub(crate) fn pin_gc_type(&mut self, id: CanonicalTypeId) {
+        if self.gc_host_alloc_types.insert(id) {
+            self.engine.incref_type(id);
+        }
     }
 
     /// Traps unless an aggregate of `extra_bytes` would still fit under the GC-heap ceiling
@@ -344,6 +361,15 @@ impl StoreInner {
 
     pub(crate) fn instance_mut(&mut self, handle: Instance) -> &mut InstanceEntity {
         self.instances.get_mut(handle.index)
+    }
+}
+
+impl Drop for StoreInner {
+    fn drop(&mut self) {
+        // Release the type-registrations pinned by host GC allocations.
+        for &id in &self.gc_host_alloc_types {
+            self.engine.decref_type(id);
+        }
     }
 }
 
