@@ -16,7 +16,9 @@ pub(crate) use gc::{
     anyref_handle_i31, anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle,
     GcObject, ObjKind,
 };
-pub(crate) use gc_codec::{default_for_slot, read_slot, read_slot_packed, write_slot};
+pub(crate) use gc_codec::{
+    default_for_slot, read_slot, read_slot_packed, slot_accepts, write_slot,
+};
 pub(crate) use inner::{FuelStep, StoreInner};
 #[cfg(feature = "async")]
 pub use limits::ResourceLimiterAsync;

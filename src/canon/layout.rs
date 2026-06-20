@@ -110,11 +110,46 @@ impl Layout {
         }
     }
 
+    /// Builds a struct layout from public field descriptors (host-built `StructType`).
+    pub(crate) fn for_struct(fields: &[crate::value::FieldType]) -> Layout {
+        let mut offset = 0;
+        let slots: Vec<Slot> = fields
+            .iter()
+            .map(|f| {
+                let slot = pub_field_slot(f, offset);
+                offset += slot.width();
+                slot
+            })
+            .collect();
+        Layout::Struct {
+            fields: slots.into_boxed_slice(),
+            size: offset,
+        }
+    }
+
+    /// Builds an array layout from a public element descriptor (host-built `ArrayType`).
+    pub(crate) fn for_array(field: &crate::value::FieldType) -> Layout {
+        let elem = pub_field_slot(field, 0);
+        Layout::Array {
+            elem,
+            stride: elem.width(),
+        }
+    }
+
     /// The slot of struct field `i` (panics for arrays / out of range — callers gate by kind).
     pub(crate) fn field(&self, i: usize) -> Slot {
         match self {
             Layout::Struct { fields, .. } => fields[i],
             Layout::Array { .. } => unreachable!("field() on an array layout"),
+        }
+    }
+
+    /// The slot of struct field `i`, or `None` if out of range / not a struct (host path:
+    /// returns an error instead of panicking on bad input).
+    pub(crate) fn get_field(&self, i: usize) -> Option<Slot> {
+        match self {
+            Layout::Struct { fields, .. } => fields.get(i).copied(),
+            Layout::Array { .. } => None,
         }
     }
 
@@ -182,6 +217,52 @@ fn ref_kind(heap: &IrHeap) -> RefKind {
         IrHeap::Func | IrHeap::NoFunc | IrHeap::Concrete(_, AggKind::Func) => RefKind::Func,
         IrHeap::Extern | IrHeap::NoExtern => RefKind::Extern,
         IrHeap::Exn | IrHeap::NoExn => RefKind::Exn,
+        _ => RefKind::Any,
+    }
+}
+
+/// Maps a public `FieldType` (host descriptor) to a slot at `offset`.
+fn pub_field_slot(f: &crate::value::FieldType, offset: usize) -> Slot {
+    use crate::value::{StorageType, ValType};
+    match f.element_type() {
+        StorageType::I8 => Slot::Scalar {
+            offset,
+            kind: ScalarKind::I8,
+        },
+        StorageType::I16 => Slot::Scalar {
+            offset,
+            kind: ScalarKind::I16,
+        },
+        StorageType::ValType(ValType::Ref(rt)) => Slot::Ref {
+            offset,
+            kind: pub_ref_kind(rt.heap_type()),
+        },
+        StorageType::ValType(v) => Slot::Scalar {
+            offset,
+            kind: pub_num_kind(v),
+        },
+    }
+}
+
+fn pub_num_kind(v: &crate::value::ValType) -> ScalarKind {
+    use crate::value::ValType;
+    match v {
+        ValType::I32 => ScalarKind::I32,
+        ValType::I64 => ScalarKind::I64,
+        ValType::F32 => ScalarKind::F32,
+        ValType::F64 => ScalarKind::F64,
+        ValType::V128 => ScalarKind::V128,
+        ValType::Ref(_) => unreachable!("ref handled as a Ref slot"),
+    }
+}
+
+/// The reference hierarchy of a public heap type (mirrors `ref_kind` over `IrHeap`).
+fn pub_ref_kind(heap: &crate::value::HeapType) -> RefKind {
+    use crate::value::HeapType as H;
+    match heap {
+        H::Func | H::NoFunc | H::ConcreteFunc(_) => RefKind::Func,
+        H::Extern | H::NoExtern => RefKind::Extern,
+        H::Exn | H::NoExn => RefKind::Exn,
         _ => RefKind::Any,
     }
 }

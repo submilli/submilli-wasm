@@ -129,6 +129,41 @@ impl TypeRegistry {
         self.intern_one(finality, supertype, array_body(field))
     }
 
+    /// Interns a host-built rec group (`RecGroupBuilder`). `members` is the group's IR; a body's
+    /// concrete ref index `mi` resolves to a *sibling* (`mi < members.len()` → `Rel`) or to an
+    /// already-canonical `externals[mi - members.len()]` (`Canon`). Returns the members' canonical
+    /// ids + the group id.
+    pub(crate) fn intern_host_group(
+        &mut self,
+        members: &[ModuleType],
+        externals: &[CanonicalTypeId],
+    ) -> (Vec<CanonicalTypeId>, GroupId) {
+        let n = members.len();
+        let cref = |mi: u32| {
+            let mi = mi as usize;
+            if mi < n {
+                CanonRef::Rel(mi as u32)
+            } else {
+                CanonRef::Canon(externals[mi - n])
+            }
+        };
+        let key: CGroup = members
+            .iter()
+            .map(|t| CType {
+                finality: t.finality,
+                supertype: t.supertype.map(&cref),
+                body: body_key(&t.body, &cref),
+            })
+            .collect();
+        let group_id = self.intern_group(key, n);
+        let ids = self.groups[group_id.index()]
+            .as_ref()
+            .expect("just interned")
+            .members
+            .clone();
+        (ids, group_id)
+    }
+
     /// Releases group ids (one decrement each); reclaims a group at refcount 0.
     pub(crate) fn release(&mut self, group_ids: &[GroupId]) {
         for &g in group_ids {

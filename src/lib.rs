@@ -73,8 +73,10 @@ pub use crate::store::{
 };
 pub use crate::trap::{FrameInfo, Trap, WasmBacktrace};
 pub use crate::value::{
-    AnyRef, ArrayRef, ArrayRefPre, ArrayType, ExnRef, ExportType, ExternRef, ExternType, FieldType,
-    Finality, FuncType, GlobalType, HeapType, ImportType, MemoryType, Mutability, RecGroupType,
-    Ref, RefType, RootScope, Rooted, StorageType, StructRef, StructRefPre, StructType, TableType,
-    Val, ValType, V128,
+    AnyRef, ArrayRef, ArrayRefPre, ArraySuperType, ArrayType, CompositeType, ExnRef, ExportType,
+    ExternRef, ExternType, FieldTemplate, FieldType, Finality, FuncSuperType, FuncType, GlobalType,
+    HeapType, HeapTypeTemplate, ImportType, MemoryType, Mutability, PendingArrayId, PendingFuncId,
+    PendingStructId, RecGroup, RecGroupBuilder, RecGroupType, Ref, RefType, RootScope, Rooted,
+    StorageType, StorageTypeTemplate, StructRef, StructRefPre, StructSuperType, StructType,
+    TableType, Val, ValType, ValTypeTemplate, V128,
 };

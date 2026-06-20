@@ -22,6 +22,13 @@ pub enum StorageType {
     ValType(ValType),
 }
 
+impl StorageType {
+    /// Whether this storage type is a (non-packed) value type.
+    pub fn is_val_type(&self) -> bool {
+        matches!(self, StorageType::ValType(_))
+    }
+}
+
 /// A struct field / array element type: mutability plus storage type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FieldType {

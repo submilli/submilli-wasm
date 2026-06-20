@@ -141,6 +141,22 @@ impl Engine {
             .0
     }
 
+    /// Interns a host-built rec group (`RecGroupBuilder`), returning the members' canonical ids.
+    /// The group id is discarded (leaked, like the singleton host-type interners); reclamation is
+    /// a later collector concern (#27i).
+    pub(crate) fn intern_host_group(
+        &self,
+        members: &[ModuleType],
+        externals: &[CanonicalTypeId],
+    ) -> Vec<CanonicalTypeId> {
+        self.inner
+            .types
+            .write()
+            .expect("type registry poisoned")
+            .intern_host_group(members, externals)
+            .0
+    }
+
     /// The materialized (params, results) of a canonical func type.
     pub(crate) fn func_sig(&self, id: CanonicalTypeId) -> (Vec<ValType>, Vec<ValType>) {
         self.inner

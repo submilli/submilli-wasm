@@ -6,7 +6,7 @@
 // No inner attributes here: the including files set crate-level allows.
 
 use wasmtime::{
-    ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, Extern, ExternRef, FieldType,
+    AnyRef, ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, Extern, ExternRef, FieldType,
     Finality, Func, FuncType, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType,
     Module, Mutability, Ref, RefType, ResourceLimiter, Result, RootScope, StorageType, Store,
     StoreLimits, StoreLimitsBuilder, StructRef, StructRefPre, StructType, Table, TableType,
@@ -146,11 +146,11 @@ fn externref_host_state(store: &mut Store<HostState>) -> Result<()> {
     Ok(())
 }
 
-// GC host-API surface (#24d): a host constructs GC type descriptors and objects.
-// (Accessor/`Rooted` methods like `.field`/`.to_anyref` need real rooting — exercised
-// once that lands; here we prove the descriptor + allocation surface matches wasmtime.)
+// GC host-API surface (#24d/#27b): a host constructs GC type descriptors, allocates objects,
+// reads them back, and upcasts to `anyref` — all proving signature parity with wasmtime.
 fn gc_host_api(engine: &Engine, store: &mut Store<HostState>) -> Result<()> {
     let field = FieldType::new(Mutability::Var, StorageType::ValType(ValType::I32));
+    let _ = field.element_type().is_val_type();
     let _st0 = StructType::new(engine, [field.clone()])?;
     let st = StructType::with_finality_and_supertype(engine, Finality::Final, None, [field.clone()])?;
     let _ = st.fields().count();
@@ -165,10 +165,17 @@ fn gc_host_api(engine: &Engine, store: &mut Store<HostState>) -> Result<()> {
 
     // Allocate structs/arrays from host code.
     let spre = StructRefPre::new(&mut *store, st);
-    let _s: wasmtime::Rooted<StructRef> = StructRef::new(&mut *store, &spre, &[Val::I32(1)])?;
+    let s: wasmtime::Rooted<StructRef> = StructRef::new(&mut *store, &spre, &[Val::I32(1)])?;
     let apre = ArrayRefPre::new(&mut *store, at);
-    let _a: wasmtime::Rooted<ArrayRef> = ArrayRef::new(&mut *store, &apre, &Val::I32(0), 4)?;
+    let a: wasmtime::Rooted<ArrayRef> = ArrayRef::new(&mut *store, &apre, &Val::I32(0), 4)?;
     let _a2 = ArrayRef::new_fixed(&mut *store, &apre, &[Val::I32(1), Val::I32(2)])?;
+
+    // Read fields/elements back; upcast struct/array → anyref and reinterpret.
+    let _f = s.field(&mut *store, 0)?;
+    let _len = a.len(&*store)?;
+    let _e = a.get(&mut *store, 0)?;
+    let any: wasmtime::Rooted<AnyRef> = s.into();
+    let _back = any.unwrap_struct(&*store)?;
     Ok(())
 }
 

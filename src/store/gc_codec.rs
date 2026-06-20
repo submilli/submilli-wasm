@@ -51,6 +51,26 @@ pub(crate) fn read_slot_packed(slot: Slot, data: &[u8], signed: bool) -> i32 {
     }
 }
 
+/// Whether `v`'s kind is storable in `slot` — used by the host API to reject mismatched
+/// values without panicking (the interpreter relies on validation instead).
+pub(crate) fn slot_accepts(slot: Slot, v: &Val) -> bool {
+    match slot {
+        Slot::Scalar { kind, .. } => match kind {
+            ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I32 => matches!(v, Val::I32(_)),
+            ScalarKind::I64 => matches!(v, Val::I64(_)),
+            ScalarKind::F32 => matches!(v, Val::F32(_)),
+            ScalarKind::F64 => matches!(v, Val::F64(_)),
+            ScalarKind::V128 => matches!(v, Val::V128(_)),
+        },
+        Slot::Ref { kind, .. } => match kind {
+            RefKind::Func => matches!(v, Val::FuncRef(_)),
+            RefKind::Extern => matches!(v, Val::ExternRef(_)),
+            RefKind::Any => matches!(v, Val::AnyRef(_)),
+            RefKind::Exn => matches!(v, Val::ExnRef(_)),
+        },
+    }
+}
+
 /// The zero/default value for a slot (numeric zero / null reference).
 pub(crate) fn default_for_slot(slot: Slot) -> Val {
     match slot {
