@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::canon::{
-    self, AggKind, CanonicalTypeId, GroupId, IrGlobalType, IrHeap, IrTableType, ModuleType,
+    self, AggKind, CanonicalTypeId, GroupId, IrGlobalType, IrHeap, IrTableType, Layout, ModuleType,
 };
 use crate::engine::Engine;
 use crate::module::op::CompiledFunc;
@@ -43,6 +43,10 @@ pub(crate) struct ModuleInner {
     /// Registered canonical group ids, released on drop (engine-specific).
     #[serde(skip)]
     pub group_handles: Vec<GroupId>,
+    /// Per-module-type GC byte layout (`None` for function types). Rebuilt by `intern` from the
+    /// IR; the interpreter reads it lock-free for `struct.*`/`array.*` field/element access.
+    #[serde(skip)]
+    pub layouts: Vec<Option<Layout>>,
     /// The owning engine (for releasing `group_handles` on drop). `None` until `intern`.
     #[serde(skip)]
     pub engine: Option<Engine>,
@@ -55,12 +59,24 @@ impl ModuleInner {
         let (type_ids, group_handles) = engine.intern_types(&self.types);
         self.type_ids = type_ids;
         self.group_handles = group_handles;
+        self.layouts = self
+            .types
+            .iter()
+            .map(|t| Layout::from_body(&t.body))
+            .collect();
         self.engine = Some(engine.clone());
     }
 
     /// The engine-canonical id of a module type index.
     pub(crate) fn canonical_type_id(&self, type_index: u32) -> CanonicalTypeId {
         self.type_ids[type_index as usize]
+    }
+
+    /// The GC byte layout of an aggregate (struct/array) module type index.
+    pub(crate) fn layout(&self, type_index: u32) -> &Layout {
+        self.layouts[type_index as usize]
+            .as_ref()
+            .expect("aggregate type has a layout")
     }
 
     /// The owning engine (set by `intern`).
@@ -163,10 +179,16 @@ pub(crate) enum ElemItems {
     Exprs(Box<[ConstExpr]>),
 }
 
-/// An owned constant expression, decoupled from the input bytes so it can be
-/// evaluated at instantiation. Only the constant forms the validator admits.
+/// An owned constant expression: the operator sequence (decoupled from the input bytes),
+/// evaluated by a small stack machine at instantiation. Only the constant forms the validator
+/// admits — including the GC aggregate constructors, which allocate at init time.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) enum ConstExpr {
+pub(crate) struct ConstExpr(pub Box<[ConstOp]>);
+
+/// One operator of a [`ConstExpr`] (postfix; aggregate ops pop their operands from the
+/// const-eval stack).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ConstOp {
     I32(i32),
     I64(i64),
     F32(u32),
@@ -175,6 +197,25 @@ pub(crate) enum ConstExpr {
     RefFunc(u32),
     /// `global.get` of an imported, immutable global (guaranteed by validation).
     GlobalGet(u32),
+    RefI31,
+    StructNew(u32),
+    StructNewDefault(u32),
+    ArrayNew(u32),
+    ArrayNewDefault(u32),
+    ArrayNewFixed {
+        ty: u32,
+        n: u32,
+    },
+    ArrayNewData {
+        ty: u32,
+        data: u32,
+    },
+    ArrayNewElem {
+        ty: u32,
+        elem: u32,
+    },
+    AnyConvertExtern,
+    ExternConvertAny,
 }
 
 impl ModuleInner {

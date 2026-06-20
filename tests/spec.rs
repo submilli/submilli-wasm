@@ -214,18 +214,7 @@ fn is_deferred_op(err: &Error) -> bool {
     let msg = err.to_string();
     // Tail calls (#39) and the GC aggregate/cast instructions (their own subtasks) validate
     // under our feature set but aren't compiled yet; their modules skip rather than fail.
-    const DEFERRED: &[&str] = &[
-        "ReturnCall",
-        "Struct",
-        "Array",
-        "I31",
-        "RefCast",
-        "RefTest",
-        "BrOnCast",
-        "RefEq",
-        "ConvertExtern",
-        "ConvertAny",
-    ];
+    const DEFERRED: &[&str] = &["ReturnCall"];
     DEFERRED.iter().any(|op| msg.contains(op))
 }
 
@@ -669,7 +658,9 @@ fn ret_core_matches(store: &Store<()>, actual: &Val, expected: &WastRetCore<'_>)
         // `(ref.func)` / `(ref.func $f)` assert a non-null funcref (identity isn't
         // portably checkable), so we accept any non-null funcref.
         WastRetCore::RefFunc(_) => matches!(actual, Val::FuncRef(Some(_))),
-        // `(ref.extern N)` / `(ref.host N)`: a non-null externref carrying payload `N`.
+        // `(ref.extern N)` / `(ref.host N)`: a non-null externref carrying payload `N`. An
+        // `any.convert_extern` of a host extern yields an *anyref* wrapping it; we have no public
+        // way to read the wrapped payload, so accept any non-null anyref there (as with `ref.func`).
         WastRetCore::RefExtern(Some(n)) | WastRetCore::RefHost(n) => match actual {
             Val::ExternRef(Some(r)) => {
                 r.data(store)
@@ -678,9 +669,18 @@ fn ret_core_matches(store: &Store<()>, actual: &Val, expected: &WastRetCore<'_>)
                     .and_then(|a| a.downcast_ref::<u32>())
                     == Some(n)
             }
+            Val::AnyRef(Some(_)) => true,
             _ => false,
         },
         WastRetCore::RefExtern(None) => matches!(actual, Val::ExternRef(Some(_))),
+        // GC any-hierarchy assertions `(ref.array|struct|eq|i31|any)` check the result is a
+        // non-null ref of that hierarchy; all map to `Val::AnyRef`, and (like `ref.func`) the
+        // finer kind/identity isn't portably checkable here, so accept any non-null `anyref`.
+        WastRetCore::RefArray
+        | WastRetCore::RefStruct
+        | WastRetCore::RefEq
+        | WastRetCore::RefI31
+        | WastRetCore::RefAny => matches!(actual, Val::AnyRef(Some(_))),
         WastRetCore::Either(opts) => opts.iter().any(|o| ret_core_matches(store, actual, o)),
         _ => false,
     }

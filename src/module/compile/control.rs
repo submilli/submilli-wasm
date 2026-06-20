@@ -4,6 +4,7 @@
 use wasmparser::{BlockType, BrTable};
 
 use super::{wp_err, Translator};
+use crate::canon::IrHeap;
 use crate::module::op::{BranchTarget, Op};
 use crate::Result;
 
@@ -273,6 +274,28 @@ impl Translator<'_> {
         self.pop(1); // fall-through drops the reference
     }
 
+    /// `br_on_cast`/`br_on_cast_fail`: the reference stays on the stack on *both* edges (cast to
+    /// the to-type on the matching edge, kept as the from-type on the other), so this is
+    /// height-neutral — only the runtime predicate decides which way it goes.
+    pub(super) fn br_on_cast(&mut self, depth: u32, ty: IrHeap, nullable: bool, on_fail: bool) {
+        let (target, patch_frame) = self.branch_target(depth);
+        let idx = self.ops.len() as u32;
+        self.emit(if on_fail {
+            Op::BrOnCastFail {
+                ty,
+                nullable,
+                target,
+            }
+        } else {
+            Op::BrOnCast {
+                ty,
+                nullable,
+                target,
+            }
+        });
+        self.register_branch(patch_frame, idx, PatchSlot::Single);
+    }
+
     fn signature(&self, type_index: u32) -> (u32, u32) {
         let (params, results) = self.ctx.types[type_index as usize].func_sig();
         (params.len() as u32, results.len() as u32)
@@ -309,7 +332,13 @@ impl Translator<'_> {
 
     fn patch_ip(&mut self, op: u32, slot: PatchSlot, ip: u32) {
         match &mut self.ops[op as usize] {
-            Op::Br(t) | Op::BrIf(t) | Op::BrIfNot(t) | Op::BrOnNull(t) | Op::BrOnNonNull(t) => {
+            Op::Br(t)
+            | Op::BrIf(t)
+            | Op::BrIfNot(t)
+            | Op::BrOnNull(t)
+            | Op::BrOnNonNull(t)
+            | Op::BrOnCast { target: t, .. }
+            | Op::BrOnCastFail { target: t, .. } => {
                 t.ip = ip;
             }
             Op::BrTable { targets, default } => match slot {

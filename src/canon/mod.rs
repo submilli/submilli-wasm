@@ -8,8 +8,10 @@
 //!   and **materializes** the public handle types (`FuncType`/`StructType`/`ArrayType`).
 
 mod keys;
+mod layout;
 mod registry;
 
+pub(crate) use layout::{Layout, RefKind, ScalarKind, Slot};
 pub(crate) use registry::TypeRegistry;
 
 use crate::engine::Engine;
@@ -31,7 +33,7 @@ pub(crate) struct CanonicalTypeId(u32);
 pub(crate) struct GroupId(u32);
 
 impl CanonicalTypeId {
-    fn new(raw: u32) -> Self {
+    pub(crate) fn new(raw: u32) -> Self {
         CanonicalTypeId(raw)
     }
 

@@ -16,8 +16,8 @@ use crate::canon::{AggKind, IrGlobalType, IrHeap, IrRef, IrTableType, IrVal, Mod
 use crate::engine::Engine;
 use crate::module::compile::{conv_valtype, translate_function, CompileCtx};
 use crate::module::inner::{
-    ConstExpr, DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export, ExportKind,
-    GlobalDef, Import, ImportKind, ModuleInner, TableDef,
+    ConstExpr, ConstOp, DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export,
+    ExportKind, GlobalDef, Import, ImportKind, ModuleInner, TableDef,
 };
 use crate::module::op::CompiledFunc;
 use crate::value::MemoryType;
@@ -99,6 +99,7 @@ fn empty_inner() -> ModuleInner {
         start: None,
         type_ids: Vec::new(),
         group_handles: Vec::new(),
+        layouts: Vec::new(),
         engine: None,
     }
 }
@@ -242,24 +243,65 @@ fn parse_datas(
 }
 
 fn parse_const_expr(kinds: &[AggKind], expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
-    let mut ops = expr.get_operators_reader();
-    let op = ops.read().map_err(wp_err)?;
-    Ok(match op {
-        Operator::I32Const { value } => ConstExpr::I32(value),
-        Operator::I64Const { value } => ConstExpr::I64(value),
-        Operator::F32Const { value } => ConstExpr::F32(value.bits()),
-        Operator::F64Const { value } => ConstExpr::F64(value.bits()),
-        Operator::RefNull { hty } => ConstExpr::RefNull(conv_reftype_heap(kinds, hty)?),
-        Operator::RefFunc { function_index } => ConstExpr::RefFunc(function_index),
-        Operator::GlobalGet { global_index } => ConstExpr::GlobalGet(global_index),
-        // Name the operator so GC aggregate const exprs (struct.new/array.new/ref.i31, deferred
-        // to the aggregate-instruction subtask) are recognized as a deferred-op skip, not a bug.
-        other => {
+    let mut reader = expr.get_operators_reader();
+    let mut ops = Vec::new();
+    while let Some(op) = conv_const_op(kinds, &reader.read().map_err(wp_err)?)? {
+        ops.push(op);
+    }
+    Ok(ConstExpr(ops.into_boxed_slice()))
+}
+
+/// Maps one operator of a constant expression to a [`ConstOp`]; `None` marks the terminating
+/// `end`. Naming the operator on the error path lets still-deferred const forms (extern
+/// conversions, #27f stage 3) register as a deferred-op skip rather than a bug.
+fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>> {
+    Ok(Some(match *op {
+        Operator::I32Const { value } => ConstOp::I32(value),
+        Operator::I64Const { value } => ConstOp::I64(value),
+        Operator::F32Const { value } => ConstOp::F32(value.bits()),
+        Operator::F64Const { value } => ConstOp::F64(value.bits()),
+        Operator::RefNull { hty } => ConstOp::RefNull(conv_reftype_heap(kinds, hty)?),
+        Operator::RefFunc { function_index } => ConstOp::RefFunc(function_index),
+        Operator::GlobalGet { global_index } => ConstOp::GlobalGet(global_index),
+        Operator::RefI31 => ConstOp::RefI31,
+        Operator::StructNew { struct_type_index } => ConstOp::StructNew(struct_type_index),
+        Operator::StructNewDefault { struct_type_index } => {
+            ConstOp::StructNewDefault(struct_type_index)
+        }
+        Operator::ArrayNew { array_type_index } => ConstOp::ArrayNew(array_type_index),
+        Operator::ArrayNewDefault { array_type_index } => {
+            ConstOp::ArrayNewDefault(array_type_index)
+        }
+        Operator::ArrayNewFixed {
+            array_type_index,
+            array_size,
+        } => ConstOp::ArrayNewFixed {
+            ty: array_type_index,
+            n: array_size,
+        },
+        Operator::ArrayNewData {
+            array_type_index,
+            array_data_index,
+        } => ConstOp::ArrayNewData {
+            ty: array_type_index,
+            data: array_data_index,
+        },
+        Operator::ArrayNewElem {
+            array_type_index,
+            array_elem_index,
+        } => ConstOp::ArrayNewElem {
+            ty: array_type_index,
+            elem: array_elem_index,
+        },
+        Operator::AnyConvertExtern => ConstOp::AnyConvertExtern,
+        Operator::ExternConvertAny => ConstOp::ExternConvertAny,
+        Operator::End => return Ok(None),
+        ref other => {
             return Err(Error::msg(format!(
                 "unsupported constant expression: {other:?}"
             )))
         }
-    })
+    }))
 }
 
 fn compile_bodies(

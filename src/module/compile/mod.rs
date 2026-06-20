@@ -8,6 +8,7 @@
 //! `ip >= ops.len()`).
 
 mod control;
+mod gc;
 mod memory;
 mod numeric;
 mod ref_;
@@ -51,6 +52,14 @@ pub(crate) fn conv_valtype(kinds: &[AggKind], ty: wasmparser::ValType) -> Result
             heap: conv_heaptype(kinds, rt.heap_type())?,
         },
     })
+}
+
+/// A `br_on_cast` target reference type as `(heap, nullable)` for the IR.
+fn ref_target(kinds: &[AggKind], rt: wasmparser::RefType) -> Result<(IrHeap, bool)> {
+    match conv_valtype(kinds, wasmparser::ValType::Ref(rt))? {
+        IrVal::Ref { nullable, heap } => Ok((heap, nullable)),
+        _ => unreachable!("ref type maps to a reference"),
+    }
 }
 
 /// Converts a wasmparser heap type to the module IR: the abstract hierarchies (func/extern/any
@@ -279,6 +288,38 @@ impl<'a> Translator<'a> {
                 self.translate_table(op)?;
             }
 
+            // --- GC aggregates (struct/array/i31) → gc module ---
+            W::StructNew { .. }
+            | W::StructNewDefault { .. }
+            | W::StructGet { .. }
+            | W::StructGetS { .. }
+            | W::StructGetU { .. }
+            | W::StructSet { .. }
+            | W::ArrayNew { .. }
+            | W::ArrayNewDefault { .. }
+            | W::ArrayNewFixed { .. }
+            | W::ArrayNewData { .. }
+            | W::ArrayNewElem { .. }
+            | W::ArrayGet { .. }
+            | W::ArrayGetS { .. }
+            | W::ArrayGetU { .. }
+            | W::ArraySet { .. }
+            | W::ArrayLen
+            | W::ArrayFill { .. }
+            | W::ArrayCopy { .. }
+            | W::ArrayInitData { .. }
+            | W::ArrayInitElem { .. }
+            | W::RefI31
+            | W::I31GetS
+            | W::I31GetU
+            | W::RefTestNonNull { .. }
+            | W::RefTestNullable { .. }
+            | W::RefCastNonNull { .. }
+            | W::RefCastNullable { .. }
+            | W::RefEq
+            | W::AnyConvertExtern
+            | W::ExternConvertAny => self.translate_gc(op)?,
+
             // --- numeric / comparison / conversion / sign-ext / saturating / nop ---
             _ => self.translate_numeric(op)?,
         }
@@ -287,6 +328,7 @@ impl<'a> Translator<'a> {
 
     /// Dispatch one operator. Control constructs always run (to balance the frame
     /// stack); everything else is skipped while unreachable (dead-code elision).
+    #[allow(clippy::too_many_lines)] // flat control-flow dispatch
     fn translate(&mut self, op: &Operator<'_>) -> Result<()> {
         use Operator as W;
         match *op {
@@ -309,6 +351,22 @@ impl<'a> Translator<'a> {
             W::BrOnNonNull { relative_depth } if self.reachable => {
                 self.br_on_non_null(relative_depth);
             }
+            W::BrOnCast {
+                relative_depth,
+                to_ref_type,
+                ..
+            } if self.reachable => {
+                let (ty, nullable) = ref_target(self.ctx.kinds, to_ref_type)?;
+                self.br_on_cast(relative_depth, ty, nullable, false);
+            }
+            W::BrOnCastFail {
+                relative_depth,
+                to_ref_type,
+                ..
+            } if self.reachable => {
+                let (ty, nullable) = ref_target(self.ctx.kinds, to_ref_type)?;
+                self.br_on_cast(relative_depth, ty, nullable, true);
+            }
             W::Unreachable if self.reachable => {
                 self.emit(Op::Unreachable);
                 self.reachable = false;
@@ -323,6 +381,8 @@ impl<'a> Translator<'a> {
             | W::CallRef { .. }
             | W::BrOnNull { .. }
             | W::BrOnNonNull { .. }
+            | W::BrOnCast { .. }
+            | W::BrOnCastFail { .. }
             | W::Unreachable => {}
             _ if self.reachable => self.straight_line(op)?,
             _ => {}

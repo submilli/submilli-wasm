@@ -8,8 +8,11 @@ use crate::engine::Engine;
 use crate::extern_::{Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
+use crate::value::{Rooted, Val};
 
-use super::gc::{GcHeap, GcObject};
+use super::gc::{
+    anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle, GcHeap, GcObject,
+};
 use super::{FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity};
 
 /// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
@@ -53,11 +56,18 @@ impl<E> Arena<E> {
     }
 }
 
-/// Store-side arena of host `externref` payloads. Grow-only for now: entries live for
-/// the store's lifetime (no reclamation until a tracing collector, whose host-root
-/// enumeration hook lands then). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
+/// One externref-arena entry: a host payload, or an *internalized* `anyref` produced by
+/// `extern.convert_any` (carrying that ref's handle so `any.convert_extern` recovers it).
+enum ExternEntry {
+    Host(Box<dyn Any + Send + Sync>),
+    Internal(u32),
+}
+
+/// Store-side arena of `externref` entries. Grow-only for now: entries live for the store's
+/// lifetime (no reclamation until a tracing collector, whose host-root enumeration hook lands
+/// then). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
 #[derive(Default)]
-struct ExternRefs(Vec<Box<dyn Any + Send + Sync>>);
+struct ExternRefs(Vec<ExternEntry>);
 
 impl core::fmt::Debug for ExternRefs {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -117,32 +127,79 @@ impl StoreInner {
 
     /// Stores a host `externref` payload, returning its index (held by `Rooted<ExternRef>`).
     pub(crate) fn alloc_externref(&mut self, value: Box<dyn Any + Send + Sync>) -> u32 {
+        self.push_extern(ExternEntry::Host(value))
+    }
+
+    fn push_extern(&mut self, entry: ExternEntry) -> u32 {
         let index = self.externrefs.0.len() as u32;
-        self.externrefs.0.push(value);
+        self.externrefs.0.push(entry);
         index
     }
 
-    /// The payload behind an `externref` index, if present.
+    /// The host payload behind an `externref` index, if it is a host ref (not an internalized
+    /// `anyref`).
     pub(crate) fn externref(&self, index: u32) -> Option<&(dyn Any + Send + Sync)> {
-        self.externrefs.0.get(index as usize).map(AsRef::as_ref)
+        match self.externrefs.0.get(index as usize)? {
+            ExternEntry::Host(v) => Some(v.as_ref()),
+            ExternEntry::Internal(_) => None,
+        }
+    }
+
+    /// `extern.convert_any`: an internal `anyref` becomes an `externref`. A wrapper of a host
+    /// extern unwraps to that extern; any other ref is wrapped in a fresh `Internal` entry. A
+    /// host-provided externref used in an `any` position (e.g. a `ref.host` argument) is already
+    /// external — passed through unchanged.
+    pub(crate) fn extern_convert_any(&mut self, v: Val) -> Val {
+        let handle = match v {
+            Val::AnyRef(None) => return Val::ExternRef(None),
+            Val::AnyRef(Some(r)) => r.raw(),
+            Val::ExternRef(_) => return v,
+            _ => unreachable!("extern.convert_any operand is a reference"),
+        };
+        if let AnyRefHandle::Slot(i) = decode_anyref_handle(handle) {
+            if let Some(e) = self.gc.get(i).expect("live gc slot").extern_index() {
+                return Val::ExternRef(Some(Rooted::from_raw(e)));
+            }
+        }
+        let idx = self.push_extern(ExternEntry::Internal(handle));
+        Val::ExternRef(Some(Rooted::from_raw(idx)))
+    }
+
+    /// `any.convert_extern`: an `externref` becomes an `anyref`. An internalized entry recovers
+    /// its original ref; a host extern is wrapped in a fresh `Extern` GC object. A value already
+    /// in the `any` representation (a host ref handed in as `any`) is passed through.
+    pub(crate) fn any_convert_extern(&mut self, v: Val) -> crate::Result<Val> {
+        let idx = match v {
+            Val::ExternRef(None) => return Ok(Val::AnyRef(None)),
+            Val::ExternRef(Some(r)) => r.raw(),
+            Val::AnyRef(_) => return Ok(v),
+            _ => unreachable!("any.convert_extern operand is a reference"),
+        };
+        if let Some(ExternEntry::Internal(h)) = self.externrefs.0.get(idx as usize) {
+            return Ok(anyref_value(*h));
+        }
+        let slot = self.gc.alloc(GcObject::extern_wrapper(idx))?;
+        Ok(anyref_value(anyref_handle_slot(slot)))
     }
 
     /// Allocates a managed `struct`/`array` object, returning its heap slot index (held by a
-    /// `Rooted<AnyRef>`). Traps on heap exhaustion. Wired by the host GC API and the
-    /// aggregate instructions.
-    #[allow(dead_code)]
+    /// `Rooted<AnyRef>`). Traps on heap exhaustion.
     pub(crate) fn alloc_gc(&mut self, object: GcObject) -> crate::Result<u32> {
         self.gc.alloc(object)
     }
 
+    /// Traps unless an aggregate of `extra_bytes` would still fit under the GC-heap ceiling
+    /// (a pre-check for large `array.new*` before its backing `Vec` is built).
+    pub(crate) fn gc_check_capacity(&self, extra_bytes: usize) -> crate::Result<()> {
+        self.gc.check_capacity(extra_bytes)
+    }
+
     /// The managed object at a heap slot index, if present.
-    #[allow(dead_code)]
     pub(crate) fn gc_object(&self, index: u32) -> Option<&GcObject> {
         self.gc.get(index)
     }
 
     /// Mutable access to the managed object at a heap slot index, if present.
-    #[allow(dead_code)]
     pub(crate) fn gc_object_mut(&mut self, index: u32) -> Option<&mut GcObject> {
         self.gc.get_mut(index)
     }

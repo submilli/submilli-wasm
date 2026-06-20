@@ -32,6 +32,18 @@ pub struct Func {
     pub(crate) index: u32,
 }
 
+impl Func {
+    /// Wraps a raw store-arena index (the funcref handle stored in tables / GC bodies).
+    pub(crate) fn from_raw(index: u32) -> Self {
+        Func { index }
+    }
+
+    /// The raw store-arena index behind this funcref handle.
+    pub(crate) fn raw(self) -> u32 {
+        self.index
+    }
+}
+
 /// The resolved kind of a callee, with the entity's Copy fields extracted.
 enum Callee {
     Wasm(Instance, u32),

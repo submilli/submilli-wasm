@@ -24,6 +24,22 @@ impl<T> Clone for Rooted<T> {
 
 impl<T> Copy for Rooted<T> {}
 
+impl<T> Rooted<T> {
+    /// Wraps a raw handle/index (an `anyref` handle for `AnyRef`, an arena index for
+    /// `ExternRef`). Internal — the run loop builds reference values from raw handles.
+    pub(crate) fn from_raw(index: u32) -> Self {
+        Rooted {
+            index,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The raw handle/index behind this rooted reference.
+    pub(crate) fn raw(self) -> u32 {
+        self.index
+    }
+}
+
 impl<T> core::fmt::Debug for Rooted<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Rooted").finish_non_exhaustive()

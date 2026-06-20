@@ -1,11 +1,12 @@
 //! Instantiation: link imports, allocate the defined entities, and initialize the
 //! active element/data segments. (The start function is run by `Instance::new`.)
 
+use super::const_eval::{elem_refs, eval_const, eval_const_ref, ConstCtx};
 use crate::canon::{self, AggKind, IrGlobalType, IrHeap, IrTableType};
 use crate::extern_::{Extern, Global, Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
-use crate::module::inner::{ConstExpr, DataMode, ElemItems, ElemMode, ImportKind};
+use crate::module::inner::{DataMode, ElemMode, ImportKind};
 use crate::module::Module;
 use crate::store::{
     FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, StoreInner, TableEntity,
@@ -42,24 +43,17 @@ pub(crate) fn instantiate(
             func_index: m.num_imported_funcs + i,
         }));
     }
-    for td in &m.tables {
-        let init = match &td.init {
-            Some(e) => eval_const_ref(inner, &globals, &funcs, e)?,
-            None => null_ref(&td.ty.element.heap),
-        };
-        let ty = canon::materialize_table(m.engine(), &m.type_ids, &td.ty);
-        tables.push(inner.alloc_table(TableEntity::new(ty, init)));
-    }
+    alloc_defined_tables(inner, module, &funcs, &globals, &mut tables)?;
 
     init_defined_globals(inner, module, &funcs, &mut globals)?;
 
-    // Active/declared element segments are unusable by `table.init` (dropped);
-    // only passive segments remain live.
-    let dropped_elems = m
-        .elems
-        .iter()
-        .map(|e| !matches!(e.mode, ElemMode::Passive))
-        .collect();
+    // Evaluate every element segment once (reference identity must be stable across
+    // `table.init`/`array.new_elem`). Passive segments keep their refs as the instance's element
+    // instances; active/declared are dropped (empty). The instance is allocated *before* active
+    // segments are applied so that — if a later active segment traps — funcrefs already written
+    // into a (possibly shared/imported) table still resolve to a live instance.
+    let evaluated = eval_elems(inner, module, &funcs, &globals)?;
+    let elems = passive_elem_instances(m, &evaluated);
     let allocated = inner.alloc_instance(InstanceEntity {
         module: module.clone(),
         funcs: funcs.clone(),
@@ -67,15 +61,59 @@ pub(crate) fn instantiate(
         globals: globals.clone(),
         tables: tables.clone(),
         dropped_data: vec![false; m.datas.len()],
-        dropped_elems,
+        elems,
     });
     debug_assert_eq!(allocated.index, instance.index);
 
-    init_elems(inner, module, &funcs, &tables, &globals)?;
+    apply_active_elems(inner, module, &funcs, &tables, &globals, &evaluated)?;
     init_datas(inner, module, instance, &memories, &globals)?;
     // The start function is run by `Instance::new` (it needs the typed `Store<T>`
     // so a host-imported start can build a `Caller`).
     Ok(instance)
+}
+
+/// Allocates the module's defined tables, evaluating each table's optional initializer
+/// (defaulting to a typed null), and appends their handles to `tables`.
+fn alloc_defined_tables(
+    inner: &mut StoreInner,
+    module: &Module,
+    funcs: &[Func],
+    globals: &[Global],
+    tables: &mut Vec<Table>,
+) -> Result<()> {
+    let m = module.inner();
+    for td in &m.tables {
+        let init = match &td.init {
+            Some(e) => {
+                let ctx = ConstCtx {
+                    module,
+                    funcs,
+                    globals,
+                };
+                eval_const_ref(inner, &ctx, e)?
+            }
+            None => null_ref(&td.ty.element.heap),
+        };
+        let ty = canon::materialize_table(m.engine(), &m.type_ids, &td.ty);
+        tables.push(inner.alloc_table(TableEntity::new(ty, init)));
+    }
+    Ok(())
+}
+
+/// The per-segment element instances stored on a fresh instance: passive segments keep their
+/// evaluated refs; active/declared segments hold an empty (dropped) instance.
+fn passive_elem_instances(
+    m: &crate::module::inner::ModuleInner,
+    evaluated: &[Vec<Ref>],
+) -> Vec<Vec<Ref>> {
+    m.elems
+        .iter()
+        .zip(evaluated)
+        .map(|(seg, refs)| match seg.mode {
+            ElemMode::Passive => refs.clone(),
+            ElemMode::Active { .. } | ElemMode::Declared => Vec::new(),
+        })
+        .collect()
 }
 
 /// Allocates the module's defined globals, baking their types to canonical ids. (`ref.func`
@@ -88,10 +126,12 @@ fn init_defined_globals(
 ) -> Result<()> {
     let m = module.inner();
     for g in &m.globals {
-        let value = match &g.init {
-            ConstExpr::RefFunc(i) => Val::FuncRef(Some(funcs[*i as usize])),
-            other => eval_const(inner, globals, other)?,
+        let ctx = ConstCtx {
+            module,
+            funcs,
+            globals,
         };
+        let value = eval_const(inner, &ctx, &g.init)?;
         globals.push(inner.alloc_global(GlobalEntity {
             value,
             ty: canon::materialize_global(m.engine(), &m.type_ids, &g.ty),
@@ -222,47 +262,63 @@ fn limits_ok(amin: u64, amax: Option<u64>, imin: u64, imax: Option<u64>) -> bool
     amin >= imin && imax.is_none_or(|im| amax.is_some_and(|am| am <= im))
 }
 
-fn init_elems(
+/// Evaluates every element segment's items once (their reference identity must be stable).
+fn eval_elems(
+    inner: &mut StoreInner,
+    module: &Module,
+    funcs: &[Func],
+    globals: &[Global],
+) -> Result<Vec<Vec<Ref>>> {
+    let ctx = ConstCtx {
+        module,
+        funcs,
+        globals,
+    };
+    let mut out = Vec::with_capacity(module.inner().elems.len());
+    for seg in &module.inner().elems {
+        out.push(elem_refs(inner, &ctx, &seg.items)?);
+    }
+    Ok(out)
+}
+
+/// Applies each active element segment's (pre-evaluated) refs to its table.
+fn apply_active_elems(
     inner: &mut StoreInner,
     module: &Module,
     funcs: &[Func],
     tables: &[Table],
     globals: &[Global],
+    evaluated: &[Vec<Ref>],
 ) -> Result<()> {
-    for seg in &module.inner().elems {
-        let ElemMode::Active { table, offset } = &seg.mode else {
-            continue;
-        };
-        let dst = const_to_usize(eval_const(inner, globals, offset)?)?;
-        let refs = elem_refs(inner, globals, funcs, &seg.items)?;
-        let handle = tables[*table as usize];
-        let size = inner.table(handle).size() as usize;
-        if dst.checked_add(refs.len()).is_none_or(|end| end > size) {
-            return Err(Trap::TableOutOfBounds.into());
-        }
-        for (i, r) in refs.into_iter().enumerate() {
-            inner.table_mut(handle).set((dst + i) as u64, r);
+    let ctx = ConstCtx {
+        module,
+        funcs,
+        globals,
+    };
+    for (seg, refs) in module.inner().elems.iter().zip(evaluated) {
+        if let ElemMode::Active { table, offset } = &seg.mode {
+            let dst = const_to_usize(eval_const(inner, &ctx, offset)?)?;
+            apply_active_elem(inner, tables[*table as usize], dst, refs)?;
         }
     }
     Ok(())
 }
 
-fn elem_refs(
-    inner: &StoreInner,
-    globals: &[Global],
-    funcs: &[Func],
-    items: &ElemItems,
-) -> Result<Vec<Ref>> {
-    match items {
-        ElemItems::Funcs(idxs) => Ok(idxs
-            .iter()
-            .map(|&i| Ref::Func(Some(funcs[i as usize])))
-            .collect()),
-        ElemItems::Exprs(exprs) => exprs
-            .iter()
-            .map(|e| eval_const_ref(inner, globals, funcs, e))
-            .collect(),
+/// Writes an active element segment's refs into `table` at `dst`, trapping if out of bounds.
+fn apply_active_elem(
+    inner: &mut StoreInner,
+    handle: Table,
+    dst: usize,
+    refs: &[Ref],
+) -> Result<()> {
+    let size = inner.table(handle).size() as usize;
+    if dst.checked_add(refs.len()).is_none_or(|end| end > size) {
+        return Err(Trap::TableOutOfBounds.into());
     }
+    for (i, r) in refs.iter().enumerate() {
+        inner.table_mut(handle).set((dst + i) as u64, r.clone());
+    }
+    Ok(())
 }
 
 fn init_datas(
@@ -276,7 +332,12 @@ fn init_datas(
         let DataMode::Active { memory, offset } = &seg.mode else {
             continue;
         };
-        let dst = const_to_usize(eval_const(inner, globals, offset)?)?;
+        let ctx = ConstCtx {
+            module,
+            funcs: &[],
+            globals,
+        };
+        let dst = const_to_usize(eval_const(inner, &ctx, offset)?)?;
         let mem = memories[*memory as usize];
         let len = seg.bytes.len();
         let mem_len = inner.memory(mem).bytes.len();
@@ -287,32 +348,6 @@ fn init_datas(
         inner.instance_mut(instance).dropped_data[seg_idx] = true;
     }
     Ok(())
-}
-
-fn eval_const(inner: &StoreInner, globals: &[Global], e: &ConstExpr) -> Result<Val> {
-    Ok(match e {
-        ConstExpr::I32(v) => Val::I32(*v),
-        ConstExpr::I64(v) => Val::I64(*v),
-        ConstExpr::F32(v) => Val::F32(*v),
-        ConstExpr::F64(v) => Val::F64(*v),
-        ConstExpr::RefNull(heap) => Val::null_for_heap(heap),
-        ConstExpr::GlobalGet(g) => inner.global(globals[*g as usize]).value,
-        ConstExpr::RefFunc(_) => return Err(Error::msg("ref.func outside element segment")),
-    })
-}
-
-pub(crate) fn eval_const_ref(
-    inner: &StoreInner,
-    globals: &[Global],
-    funcs: &[Func],
-    e: &ConstExpr,
-) -> Result<Ref> {
-    Ok(match e {
-        ConstExpr::RefFunc(i) => Ref::Func(Some(funcs[*i as usize])),
-        ConstExpr::RefNull(heap) => null_ref(heap),
-        ConstExpr::GlobalGet(g) => val_to_ref(inner.global(globals[*g as usize]).value)?,
-        _ => return Err(Error::msg("non-reference element expression")),
-    })
 }
 
 fn const_to_usize(v: Val) -> Result<usize> {
@@ -330,15 +365,5 @@ fn null_ref(heap: &IrHeap) -> Ref {
         IrHeap::Extern | IrHeap::NoExtern => Ref::Extern(None),
         IrHeap::Exn | IrHeap::NoExn => Ref::Exn(None),
         _ => Ref::Any(None),
-    }
-}
-
-fn val_to_ref(v: Val) -> Result<Ref> {
-    match v {
-        Val::FuncRef(f) => Ok(Ref::Func(f)),
-        Val::ExternRef(e) => Ok(Ref::Extern(e)),
-        Val::AnyRef(a) => Ok(Ref::Any(a)),
-        Val::ExnRef(x) => Ok(Ref::Exn(x)),
-        _ => Err(Error::msg("global is not a reference")),
     }
 }

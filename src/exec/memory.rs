@@ -26,6 +26,12 @@ impl Execution {
         op: &Op,
         instance: Instance,
     ) -> Result<()> {
+        // `data.drop` needs no memory (a module may carry passive data segments without one —
+        // common in GC modules using `array.new_data`); handle it before touching `memories[0]`.
+        if let Op::DataDrop(seg) = op {
+            inner.instance_mut(instance).dropped_data[*seg as usize] = true;
+            return Ok(());
+        }
         let mem = inner.instance(instance).memories[0];
         match op {
             Op::I32Load(m) => {
@@ -160,9 +166,6 @@ impl Execution {
                 let mem_len = inner.memory(mem).bytes.len();
                 checked_range(dst, len, mem_len)?;
                 inner.memory_mut(mem).bytes[dst..dst + len].copy_from_slice(&data[src..src_end]);
-            }
-            Op::DataDrop(seg) => {
-                inner.instance_mut(instance).dropped_data[*seg as usize] = true;
             }
             _ => return Err(Error::msg(format!("not a memory op: {op:?}"))),
         }

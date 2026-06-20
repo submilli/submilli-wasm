@@ -286,6 +286,90 @@ pub(crate) enum Op {
     I64TruncSatF32U,
     I64TruncSatF64S,
     I64TruncSatF64U,
+
+    // --- GC aggregates: structs ---
+    StructNew(TypeIdx),
+    StructNewDefault(TypeIdx),
+    StructGet {
+        ty: TypeIdx,
+        field: u32,
+    },
+    StructGetS {
+        ty: TypeIdx,
+        field: u32,
+    },
+    StructGetU {
+        ty: TypeIdx,
+        field: u32,
+    },
+    StructSet {
+        ty: TypeIdx,
+        field: u32,
+    },
+
+    // --- GC aggregates: arrays ---
+    ArrayNew(TypeIdx),
+    ArrayNewDefault(TypeIdx),
+    ArrayNewFixed {
+        ty: TypeIdx,
+        n: u32,
+    },
+    ArrayNewData {
+        ty: TypeIdx,
+        data: DataIdx,
+    },
+    ArrayNewElem {
+        ty: TypeIdx,
+        elem: ElemIdx,
+    },
+    ArrayGet(TypeIdx),
+    ArrayGetS(TypeIdx),
+    ArrayGetU(TypeIdx),
+    ArraySet(TypeIdx),
+    ArrayLen,
+    ArrayFill(TypeIdx),
+    ArrayCopy {
+        dst: TypeIdx,
+        src: TypeIdx,
+    },
+    ArrayInitData {
+        ty: TypeIdx,
+        data: DataIdx,
+    },
+    ArrayInitElem {
+        ty: TypeIdx,
+        elem: ElemIdx,
+    },
+
+    // --- GC i31 ---
+    RefI31,
+    I31GetS,
+    I31GetU,
+
+    // --- GC casts / equality ---
+    RefTest {
+        ty: IrHeap,
+        nullable: bool,
+    },
+    RefCast {
+        ty: IrHeap,
+        nullable: bool,
+    },
+    RefEq,
+    /// `any.convert_extern`: externref → anyref.
+    AnyConvertExtern,
+    /// `extern.convert_any`: anyref → externref.
+    ExternConvertAny,
+    BrOnCast {
+        ty: IrHeap,
+        nullable: bool,
+        target: BranchTarget,
+    },
+    BrOnCastFail {
+        ty: IrHeap,
+        nullable: bool,
+        target: BranchTarget,
+    },
 }
 
 /// A function compiled to internal bytecode.

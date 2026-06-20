@@ -4,11 +4,10 @@
 
 use super::Execution;
 use crate::instance::Instance;
-use crate::module::inner::ElemItems;
 use crate::module::op::Op;
 use crate::store::StoreInner;
 use crate::trap::Trap;
-use crate::value::{Ref, Val};
+use crate::value::Val;
 use crate::{Error, Result};
 
 fn oob() -> Error {
@@ -29,7 +28,7 @@ impl Execution {
                 src_table,
             } => self.table_copy(inner, instance, *dst_table, *src_table),
             Op::ElemDrop(elem) => {
-                inner.instance_mut(instance).dropped_elems[*elem as usize] = true;
+                inner.instance_mut(instance).elems[*elem as usize] = Vec::new();
                 Ok(())
             }
             Op::TableGet(t) => self.table_get(inner, instance, *t),
@@ -88,14 +87,9 @@ impl Execution {
         let dst = self.pop().unwrap_i32() as u32 as usize;
 
         let entity = inner.instance(instance);
-        let module = entity.module.clone();
-        let dropped = entity.dropped_elems[elem as usize];
         let handle = entity.tables[table as usize];
-        let refs = if dropped {
-            Vec::new()
-        } else {
-            elem_refs(inner, instance, &module.inner().elems[elem as usize].items)?
-        };
+        // The element instance was evaluated once at instantiation (`elem.drop` empties it).
+        let refs = entity.elems[elem as usize].clone();
 
         let src_end = checked_range(src, len, refs.len())?;
         let table_len = inner.table(handle).size() as usize;
@@ -129,24 +123,6 @@ impl Execution {
             inner.table_mut(dst_handle).set((dst + i) as u64, r);
         }
         Ok(())
-    }
-}
-
-/// Builds the reference list of a (live) element segment for `table.init`, resolving
-/// `ref.func`/`ref.null`/`global.get` element expressions against the instance.
-fn elem_refs(inner: &StoreInner, instance: Instance, items: &ElemItems) -> Result<Vec<Ref>> {
-    let entity = inner.instance(instance);
-    match items {
-        ElemItems::Funcs(idxs) => Ok(idxs
-            .iter()
-            .map(|&i| Ref::Func(Some(entity.funcs[i as usize])))
-            .collect()),
-        ElemItems::Exprs(exprs) => exprs
-            .iter()
-            .map(|e| {
-                crate::instance::init::eval_const_ref(inner, &entity.globals, &entity.funcs, e)
-            })
-            .collect(),
     }
 }
 

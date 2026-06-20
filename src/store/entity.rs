@@ -72,10 +72,11 @@ pub(crate) struct InstanceEntity {
     /// segments are marked dropped right after instantiation; `data.drop` marks
     /// passive ones. A `memory.init` from a dropped segment with `len > 0` traps.
     pub dropped_data: Vec<bool>,
-    /// Per-element-segment "dropped" flag (one bool per module element segment).
-    /// Active/declared segments start dropped; `elem.drop` marks passive ones. A
-    /// `table.init` from a dropped segment with `len > 0` traps.
-    pub dropped_elems: Vec<bool>,
+    /// Per-element-segment evaluated reference list (the "element instance"), built once at
+    /// instantiation — so `table.init`/`array.new_elem`/`array.init_elem` copy these refs rather
+    /// than re-evaluating the segment's expressions (which would re-allocate aggregates and break
+    /// reference identity). Active/declared segments and `elem.drop`ped ones hold an empty vec.
+    pub elems: Vec<Vec<Ref>>,
 }
 
 impl MemoryEntity {

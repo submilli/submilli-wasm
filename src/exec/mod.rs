@@ -7,8 +7,11 @@
 
 mod arith;
 mod call;
+mod cast;
 mod convert;
 mod frame;
+mod gc;
+mod gc_array;
 pub(crate) mod host;
 mod memory;
 mod numeric;
@@ -370,7 +373,19 @@ impl Execution {
             | Op::TableSet(_)
             | Op::TableSize(_)
             | Op::TableFill(_)) => self.exec_table(inner, op, instance)?,
-            other => self.exec_numeric(inner, other, instance)?,
+            op @ Op::BrOnCast { .. } => {
+                if let Some(ip) = self.br_on_cast(inner, instance, op, false) {
+                    return Ok(StepOutcome::Advance(ip));
+                }
+            }
+            op @ Op::BrOnCastFail { .. } => {
+                if let Some(ip) = self.br_on_cast(inner, instance, op, true) {
+                    return Ok(StepOutcome::Advance(ip));
+                }
+            }
+            // Straight-line GC + numerics fall through a chain: `exec_gc` (struct/i31) →
+            // `exec_gc_array` (arrays) → `exec_cast` (test/cast/eq/convert) → `exec_numeric`.
+            other => self.exec_gc(inner, other, instance)?,
         }
         Ok(StepOutcome::Advance(next))
     }
