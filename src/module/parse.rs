@@ -12,23 +12,29 @@ use wasmparser::{
     GlobalSectionReader, ImportSectionReader, Operator, Parser, Payload, TypeRef,
 };
 
-use crate::canon::{AggKind, IrGlobalType, IrHeap, IrRef, IrTableType, IrVal, ModuleType};
+use crate::canon::{AggKind, ModuleType};
 use crate::engine::Engine;
-use crate::module::compile::{conv_valtype, translate_function, CompileCtx};
+use crate::module::compile::{
+    conv_globaltype, conv_memtype, conv_reftype_heap, conv_tabletype, translate_function,
+    CompileCtx,
+};
 use crate::module::inner::{
     ConstExpr, ConstOp, DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export,
     ExportKind, GlobalDef, Import, ImportKind, ModuleInner, TableDef, TagDef,
 };
 use crate::module::op::CompiledFunc;
-use crate::value::MemoryType;
 use crate::{Error, Result};
 
 fn wp_err(e: BinaryReaderError) -> Error {
     Error::msg(e.to_string())
 }
 
-/// Decodes and compiles a (pre-validated) wasm binary into a [`ModuleInner`].
+/// Decodes and compiles a (pre-validated) wasm binary into a [`ModuleInner`]. Debug retention is
+/// driven by the engine's config (#29c): `wasm_backtrace` keeps the per-`Op` offset table + `name`
+/// section; `retain_dwarf` (from `debug_info`/`wasm_backtrace_details`) keeps the `.debug_*` bytes.
 pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner> {
+    let keep_offsets = engine.wasm_backtrace_enabled();
+    let keep_dwarf = engine.retain_dwarf();
     let mut m = empty_inner();
     let mut bodies: Vec<FunctionBody<'_>> = Vec::new();
 
@@ -41,18 +47,7 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
                     m.func_types.push(ty.map_err(wp_err)?);
                 }
             }
-            Payload::TableSection(r) => {
-                let kinds = m.type_kinds();
-                for t in r {
-                    let t = t.map_err(wp_err)?;
-                    let ty = conv_tabletype(&kinds, t.ty)?;
-                    let init = match t.init {
-                        wasmparser::TableInit::RefNull => None,
-                        wasmparser::TableInit::Expr(e) => Some(parse_const_expr(&kinds, &e)?),
-                    };
-                    m.tables.push(TableDef { ty, init });
-                }
-            }
+            Payload::TableSection(r) => parse_tables(&mut m, r)?,
             Payload::MemorySection(r) => {
                 for mt in r {
                     m.memories.push(conv_memtype(mt.map_err(wp_err)?));
@@ -73,15 +68,52 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
                 let kinds = m.type_kinds();
                 parse_datas(&kinds, &mut m.datas, r)?;
             }
+            Payload::CodeSectionStart { range, .. } => {
+                m.debug.set_code_base(range.start as u32);
+            }
             Payload::CodeSectionEntry(body) => bodies.push(body),
+            Payload::CustomSection(reader) if keep_offsets || keep_dwarf => {
+                retain_debug_section(&mut m, &reader, keep_offsets, keep_dwarf);
+            }
             _ => {}
         }
     }
 
-    m.functions = compile_bodies(&m, &bodies)?;
+    m.functions = compile_bodies(&m, &bodies, keep_offsets)?;
     // Register the module's rec groups in the engine, baking canonical type ids.
     m.intern(engine);
     Ok(m)
+}
+
+fn parse_tables(m: &mut ModuleInner, reader: wasmparser::TableSectionReader<'_>) -> Result<()> {
+    let kinds = m.type_kinds();
+    for t in reader {
+        let t = t.map_err(wp_err)?;
+        let ty = conv_tabletype(&kinds, t.ty)?;
+        let init = match t.init {
+            wasmparser::TableInit::RefNull => None,
+            wasmparser::TableInit::Expr(e) => Some(parse_const_expr(&kinds, &e)?),
+        };
+        m.tables.push(TableDef { ty, init });
+    }
+    Ok(())
+}
+
+/// Retains the `name` (func names, gated by `keep_offsets`) and `.debug_*` (DWARF, gated by
+/// `keep_dwarf`) custom sections for symbolicated backtraces (#29a/#29c).
+fn retain_debug_section(
+    m: &mut ModuleInner,
+    reader: &wasmparser::CustomSectionReader<'_>,
+    keep_offsets: bool,
+    keep_dwarf: bool,
+) {
+    let name = reader.name();
+    if keep_offsets && name == "name" {
+        m.debug
+            .add_name_section(reader.data(), reader.data_offset());
+    } else if keep_dwarf && name.starts_with(".debug") {
+        m.debug.add_dwarf_section(name, reader.data());
+    }
 }
 
 fn empty_inner() -> ModuleInner {
@@ -104,6 +136,7 @@ fn empty_inner() -> ModuleInner {
         group_handles: Vec::new(),
         layouts: Vec::new(),
         engine: None,
+        debug: crate::module::debug::DebugSections::default(),
     }
 }
 
@@ -329,7 +362,11 @@ fn tag_type_indices(m: &ModuleInner) -> Vec<u32> {
         .collect()
 }
 
-fn compile_bodies(m: &ModuleInner, bodies: &[FunctionBody<'_>]) -> Result<Vec<Arc<CompiledFunc>>> {
+fn compile_bodies(
+    m: &ModuleInner,
+    bodies: &[FunctionBody<'_>],
+    retain_offsets: bool,
+) -> Result<Vec<Arc<CompiledFunc>>> {
     let kinds: Vec<AggKind> = m.types.iter().map(ModuleType::kind).collect();
     let tag_types = tag_type_indices(m);
     let ctx = CompileCtx {
@@ -341,44 +378,12 @@ fn compile_bodies(m: &ModuleInner, bodies: &[FunctionBody<'_>]) -> Result<Vec<Ar
     let mut out = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
         let type_idx = m.func_types[m.num_imported_funcs as usize + i];
-        out.push(Arc::new(translate_function(&ctx, type_idx, body)?));
+        out.push(Arc::new(translate_function(
+            &ctx,
+            type_idx,
+            body,
+            retain_offsets,
+        )?));
     }
     Ok(out)
-}
-
-// --- wasmparser type → our type conversions ---
-
-fn conv_memtype(mt: wasmparser::MemoryType) -> MemoryType {
-    if mt.memory64 {
-        MemoryType::new64(mt.initial, mt.maximum)
-    } else {
-        MemoryType::new(mt.initial as u32, mt.maximum.map(|m| m as u32))
-    }
-}
-
-fn conv_globaltype(kinds: &[AggKind], gt: wasmparser::GlobalType) -> Result<IrGlobalType> {
-    Ok(IrGlobalType {
-        content: conv_valtype(kinds, gt.content_type)?,
-        mutable: gt.mutable,
-    })
-}
-
-fn conv_tabletype(kinds: &[AggKind], tt: wasmparser::TableType) -> Result<IrTableType> {
-    Ok(IrTableType {
-        element: conv_reftype(kinds, tt.element_type)?,
-        min: tt.initial as u32,
-        max: tt.maximum.map(|m| m as u32),
-    })
-}
-
-fn conv_reftype(kinds: &[AggKind], rt: wasmparser::RefType) -> Result<IrRef> {
-    match conv_valtype(kinds, wasmparser::ValType::Ref(rt))? {
-        IrVal::Ref { nullable, heap } => Ok(IrRef { nullable, heap }),
-        _ => unreachable!("Ref maps to Ref"),
-    }
-}
-
-fn conv_reftype_heap(kinds: &[AggKind], hty: wasmparser::HeapType) -> Result<IrHeap> {
-    let rt = wasmparser::RefType::new(true, hty).ok_or_else(|| Error::msg("bad ref type"))?;
-    Ok(conv_reftype(kinds, rt)?.heap)
 }

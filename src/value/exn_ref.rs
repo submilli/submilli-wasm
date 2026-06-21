@@ -43,6 +43,7 @@ impl ExnRef {
         Ok(store.as_context_mut().inner_mut().alloc_exn(ExnEntity {
             tag: *tag,
             args: fields.to_vec(),
+            backtrace: None,
         }))
     }
 }

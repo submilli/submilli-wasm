@@ -14,7 +14,8 @@ use crate::{Error, Result};
 /// Identifies a submilli compiled artifact. (`subm` + format tag.)
 const MAGIC: &[u8; 8] = b"submwc01";
 /// Artifact format version — bump on any `Op`/`ModuleInner`/value-type layout change.
-const ARTIFACT_VERSION: u32 = 4;
+/// v5: retain DWARF/`name` debug info + per-`Op` offsets (#29a) so backtraces survive round-trip.
+const ARTIFACT_VERSION: u32 = 5;
 
 /// Encodes a compiled module into the binary artifact format.
 pub(crate) fn encode(inner: &ModuleInner) -> Result<Vec<u8>> {

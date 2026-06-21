@@ -53,6 +53,10 @@ pub(crate) struct ModuleInner {
     /// The owning engine (for releasing `group_handles` on drop). `None` until `intern`.
     #[serde(skip)]
     pub engine: Option<Engine>,
+    /// Retained DWARF/`name` custom sections + lazily-built line index (#29a). Empty unless debug
+    /// retention was on at parse. Module-intrinsic (not engine-specific), so it serializes with the
+    /// artifact — backtraces survive `serialize`/`deserialize`.
+    pub debug: crate::module::debug::DebugSections,
 }
 
 impl ModuleInner {

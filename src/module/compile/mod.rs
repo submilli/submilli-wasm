@@ -6,6 +6,7 @@
 //! lower to a branch with `ip == ops.len()` (the executor returns when `ip >= ops.len()`).
 
 mod control;
+mod conv;
 mod gc;
 mod memory;
 mod numeric;
@@ -17,12 +18,16 @@ mod tests;
 
 use wasmparser::{BinaryReaderError, FunctionBody, Operator};
 
-use crate::canon::{AggKind, IrHeap, IrVal, ModuleType};
+use crate::canon::{AggKind, IrVal, ModuleType};
 use crate::module::handler::HandlerSpan;
-use crate::module::op::{CompiledFunc, MemArg, Op};
+use crate::module::op::{CompiledFunc, Op};
 use crate::{Error, Result};
 
 use self::control::{BlockKind, CtrlFrame};
+pub(crate) use self::conv::{
+    conv_globaltype, conv_heaptype, conv_memtype, conv_reftype_heap, conv_tabletype, conv_valtype,
+};
+use self::conv::{memarg, ref_target};
 
 /// Per-module context the translator needs: the type table (for func signatures), the per-type
 /// kind table (for concrete references), and the function/tag index → type-index maps.
@@ -38,78 +43,13 @@ fn wp_err(e: BinaryReaderError) -> Error {
     Error::msg(e.to_string())
 }
 
-/// Maps a `wasmparser` value type to the module IR. `kinds` is the per-type-index kind table,
-/// used to tag concrete references with their hierarchy.
-pub(crate) fn conv_valtype(kinds: &[AggKind], ty: wasmparser::ValType) -> Result<IrVal> {
-    Ok(match ty {
-        wasmparser::ValType::I32 => IrVal::I32,
-        wasmparser::ValType::I64 => IrVal::I64,
-        wasmparser::ValType::F32 => IrVal::F32,
-        wasmparser::ValType::F64 => IrVal::F64,
-        wasmparser::ValType::V128 => IrVal::V128,
-        wasmparser::ValType::Ref(rt) => IrVal::Ref {
-            nullable: rt.is_nullable(),
-            heap: conv_heaptype(kinds, rt.heap_type())?,
-        },
-    })
-}
-
-/// A `br_on_cast` target reference type as `(heap, nullable)` for the IR.
-fn ref_target(kinds: &[AggKind], rt: wasmparser::RefType) -> Result<(IrHeap, bool)> {
-    match conv_valtype(kinds, wasmparser::ValType::Ref(rt))? {
-        IrVal::Ref { nullable, heap } => Ok((heap, nullable)),
-        _ => unreachable!("ref type maps to a reference"),
-    }
-}
-
-/// Converts a wasmparser heap type to the module IR: the abstract hierarchies (func/extern/any
-/// and the bottoms, preserved distinctly for canonical identity) plus concrete (defined) types,
-/// carrying a module-relative type index and kind (rewritten to a canonical id by `intern`).
-pub(crate) fn conv_heaptype(kinds: &[AggKind], hty: wasmparser::HeapType) -> Result<IrHeap> {
-    use wasmparser::{AbstractHeapType as A, HeapType as H};
-    Ok(match hty {
-        H::Abstract { shared: false, ty } => match ty {
-            A::Func => IrHeap::Func,
-            A::NoFunc => IrHeap::NoFunc,
-            A::Extern => IrHeap::Extern,
-            A::NoExtern => IrHeap::NoExtern,
-            A::Any => IrHeap::Any,
-            A::Eq => IrHeap::Eq,
-            A::I31 => IrHeap::I31,
-            A::Struct => IrHeap::Struct,
-            A::Array => IrHeap::Array,
-            A::None => IrHeap::None,
-            A::Exn => IrHeap::Exn,
-            A::NoExn => IrHeap::NoExn,
-            A::Cont | A::NoCont => return Err(Error::msg("continuation heap types unsupported")),
-        },
-        H::Concrete(idx) | H::Exact(idx) => {
-            let i = idx
-                .as_module_index()
-                .ok_or_else(|| Error::msg("non-module-relative type index"))?;
-            let kind = *kinds
-                .get(i as usize)
-                .ok_or_else(|| Error::msg("type index out of range"))?;
-            IrHeap::Concrete(i, kind)
-        }
-        H::Abstract { shared: true, .. } => {
-            return Err(Error::msg("shared heap types unsupported"))
-        }
-    })
-}
-
-fn memarg(m: wasmparser::MemArg) -> MemArg {
-    MemArg {
-        offset: m.offset as u32,
-    }
-}
-
 /// Translates a single function body into a [`CompiledFunc`]. Assumes the module
 /// has already been validated (see `Module::validate`).
 pub(crate) fn translate_function(
     ctx: &CompileCtx<'_>,
     type_idx: u32,
     body: &FunctionBody<'_>,
+    retain_offsets: bool,
 ) -> Result<CompiledFunc> {
     let (params, results) = ctx.types[type_idx as usize].func_sig();
     let n_params = params.len() as u32;
@@ -124,10 +64,15 @@ pub(crate) fn translate_function(
         }
     }
 
-    let mut t = Translator::new(ctx);
+    let mut t = Translator::new(ctx, retain_offsets);
     t.push_func_frame(n_results);
-    for op in body.get_operators_reader().map_err(wp_err)? {
-        let op = op.map_err(wp_err)?;
+    for pair in body
+        .get_operators_reader()
+        .map_err(wp_err)?
+        .into_iter_with_offsets()
+    {
+        let (op, offset) = pair.map_err(wp_err)?;
+        t.cur_offset = offset as u32;
         t.translate(&op)?;
         if t.ctrl.is_empty() {
             break; // function-terminal `end` popped the implicit frame
@@ -142,6 +87,7 @@ pub(crate) fn translate_function(
         local_types: local_types.into_boxed_slice(),
         max_operands: t.max_operands,
         handlers: t.handlers.into_boxed_slice(),
+        offsets: t.offsets.map(Vec::into_boxed_slice),
     })
 }
 
@@ -153,10 +99,15 @@ struct Translator<'a> {
     ctrl: Vec<CtrlFrame>,
     reachable: bool,
     handlers: Vec<HandlerSpan>,
+    /// Byte offset of the operator currently being translated; recorded per emitted `Op` into
+    /// `offsets` (when present) so a frame's `ip` can be mapped back to source via DWARF (#29a).
+    cur_offset: u32,
+    /// Parallel to `ops`: one source offset per `Op`. `None` when debug retention is off.
+    offsets: Option<Vec<u32>>,
 }
 
 impl<'a> Translator<'a> {
-    fn new(ctx: &'a CompileCtx<'a>) -> Self {
+    fn new(ctx: &'a CompileCtx<'a>, retain_offsets: bool) -> Self {
         Translator {
             ctx,
             ops: Vec::new(),
@@ -165,10 +116,15 @@ impl<'a> Translator<'a> {
             ctrl: Vec::new(),
             reachable: true,
             handlers: Vec::new(),
+            cur_offset: 0,
+            offsets: retain_offsets.then(Vec::new),
         }
     }
 
     fn emit(&mut self, op: Op) {
+        if let Some(offsets) = &mut self.offsets {
+            offsets.push(self.cur_offset);
+        }
         self.ops.push(op);
     }
 

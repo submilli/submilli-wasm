@@ -19,6 +19,7 @@ mod numeric;
 mod outcome;
 mod ref_;
 mod table;
+pub(crate) mod trace;
 
 use std::sync::Arc;
 
@@ -134,8 +135,7 @@ impl Execution {
                             self.frames.last_mut().expect("current frame").ip = ip;
                             return Ok(Outcome::FuelYield);
                         }
-                        // Unreachable without async (an interval requires an async store),
-                        // but keep the match total.
+                        // Unreachable without async (an interval needs an async store); stays total.
                         #[cfg(not(feature = "async"))]
                         return Err(Trap::OutOfFuel.into());
                     }
@@ -146,10 +146,10 @@ impl Execution {
                 return Ok(Outcome::EpochDeadline);
             }
             match self.step(inner, &code, ip, base, instance) {
-                Err(e) => {
-                    self.unwind(inner, e, ip)?; // catch (#28e); uncaught reaches the embedder
-                    (code, ip, base, instance) = self.top();
-                }
+                Err(e) => match self.unwind(inner, e, ip) {
+                    Ok(()) => (code, ip, base, instance) = self.top(),
+                    Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
+                },
                 Ok(StepOutcome::Advance(next)) => ip = next,
                 Ok(StepOutcome::DoCall(req)) => {
                     if self.stack_bytes() >= stack_limit {
@@ -375,7 +375,7 @@ impl Execution {
             | Op::TableSet(_)
             | Op::TableSize(_)
             | Op::TableFill(_)) => self.exec_table(inner, op, instance)?,
-            Op::Throw(tag) => return self.throw(inner, instance, *tag),
+            Op::Throw(tag) => return self.throw(inner, instance, *tag, ip),
             Op::ThrowRef => return self.throw_ref(),
             op @ Op::BrOnCast { .. } => {
                 if let Some(ip) = self.br_on_cast(inner, instance, op, false) {

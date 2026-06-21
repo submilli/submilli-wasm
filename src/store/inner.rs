@@ -12,11 +12,13 @@ use crate::instance::Instance;
 use crate::value::{ExnRef, Rooted, Val};
 
 use super::arena::Arena;
+use super::entity::{ExternEntry, ExternRefs};
 use super::gc::{
     anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle, GcHeap, GcObject,
 };
 use super::{
-    ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
+    ExnEntity, FuncEntity, GlobalEntity, HostFrame, InstanceEntity, MemoryEntity, TableEntity,
+    TagEntity,
 };
 
 /// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
@@ -28,27 +30,6 @@ pub(crate) enum FuelStep {
     NeedYield,
     /// No fuel left at all → `Trap::OutOfFuel`.
     Exhausted,
-}
-
-/// One externref-arena entry: a host payload, or an *internalized* `anyref` produced by
-/// `extern.convert_any` (carrying that ref's handle so `any.convert_extern` recovers it).
-enum ExternEntry {
-    Host(Box<dyn Any + Send + Sync>),
-    Internal(u32),
-}
-
-/// Store-side arena of `externref` entries. Grow-only for now: entries live for the store's
-/// lifetime (no reclamation until a tracing collector, whose host-root enumeration hook lands
-/// then). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
-#[derive(Default)]
-struct ExternRefs(Vec<ExternEntry>);
-
-impl core::fmt::Debug for ExternRefs {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ExternRefs")
-            .field("len", &self.0.len())
-            .finish()
-    }
 }
 
 /// Non-generic storage for all of a store's runtime entities.
@@ -84,6 +65,8 @@ pub(crate) struct StoreInner {
     epoch_deadline: u64,
     /// Exception surfaced from the last call / a host `throw`; taken via `take_pending_exception`.
     pending_exception: Option<Rooted<ExnRef>>,
+    /// Live wasm frames during a host call, for `WasmBacktrace::capture` (#29d).
+    host_frames: Vec<HostFrame>,
 }
 
 impl StoreInner {
@@ -106,6 +89,7 @@ impl StoreInner {
             fuel_yield_interval: None,
             epoch_deadline: u64::MAX,
             pending_exception: None,
+            host_frames: Vec::new(),
         }
     }
 
@@ -115,6 +99,16 @@ impl StoreInner {
 
     pub(crate) fn take_pending_exception(&mut self) -> Option<Rooted<ExnRef>> {
         self.pending_exception.take()
+    }
+
+    pub(crate) fn host_frames(&self) -> &[HostFrame] {
+        &self.host_frames
+    }
+
+    /// Swaps in a host-call frame snapshot, returning the previous one to restore (re-entrant
+    /// host→wasm→host must not clobber the outer frame's snapshot).
+    pub(crate) fn swap_host_frames(&mut self, frames: Vec<HostFrame>) -> Vec<HostFrame> {
+        std::mem::replace(&mut self.host_frames, frames)
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -328,6 +322,10 @@ impl StoreInner {
         self.exns.get(handle.raw())
     }
 
+    pub(crate) fn exn_mut(&mut self, handle: Rooted<ExnRef>) -> &mut ExnEntity {
+        self.exns.get_mut(handle.raw())
+    }
+
     /// The handle the *next* [`alloc_instance`](Self::alloc_instance) will return,
     /// without allocating. Lets instantiation build `FuncEntity`s that point back
     /// at the instance before it exists (see `instance::init`). Only valid while no
@@ -346,6 +344,11 @@ impl StoreInner {
 
     pub(crate) fn instance(&self, handle: Instance) -> &InstanceEntity {
         self.instances.get(handle.index)
+    }
+
+    /// Fallible instance lookup — `None` for an unregistered handle (synthetic test executions).
+    pub(crate) fn try_instance(&self, handle: Instance) -> Option<&InstanceEntity> {
+        self.instances.get_opt(handle.index)
     }
 
     pub(crate) fn memory_count(&self) -> usize {

@@ -38,6 +38,7 @@ macro_rules! for_each_arity {
 }
 pub(crate) use for_each_arity;
 
+mod backtrace;
 mod canon;
 mod config;
 mod engine;
@@ -57,6 +58,7 @@ mod value;
 // `bail!`/`ensure!`/`format_err!` are exported at the crate root via `#[macro_export]`.
 pub use crate::error::{Error, Result};
 
+pub use crate::backtrace::{FrameInfo, FrameSymbol, WasmBacktrace};
 pub use crate::config::{Collector, Config, OptLevel, WasmBacktraceDetails};
 pub use crate::engine::{Engine, EngineWeak};
 pub use crate::exception::ThrownException;
@@ -73,7 +75,7 @@ pub use crate::store::{
     AsContext, AsContextMut, CallHook, ResourceLimiter, Store, StoreContext, StoreContextMut,
     StoreLimits, StoreLimitsBuilder, UpdateDeadline,
 };
-pub use crate::trap::{FrameInfo, Trap, WasmBacktrace};
+pub use crate::trap::Trap;
 pub use crate::value::{
     AnyRef, ArrayRef, ArrayRefPre, ArraySuperType, ArrayType, CompositeType, ExnRef, ExnRefPre,
     ExnType, ExportType, ExternRef, ExternType, FieldTemplate, FieldType, Finality, FuncSuperType,

@@ -388,11 +388,12 @@ pub(crate) struct CompiledFunc {
     pub n_params: u32,
     /// Number of results (cached from the function type; used on return).
     pub n_results: u32,
-    /// Declared local types (params excluded); used to default-initialize the
-    /// frame's locals to the correctly-typed zero `Val` at call time.
+    /// Declared local types (params excluded); default-zero the frame's locals at call time.
     pub local_types: Box<[IrVal]>,
     /// Peak operand-stack depth above the locals (for stack pre-reservation).
     pub max_operands: u32,
     /// Exception-handler table (one entry per `try_table`; #28d). Consulted only on throw.
     pub handlers: Box<[crate::module::handler::HandlerSpan]>,
+    /// Per-`Op` source wasm byte offset for backtraces (#29a); `None` without debug retention.
+    pub offsets: Option<Box<[u32]>>,
 }

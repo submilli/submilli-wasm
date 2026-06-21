@@ -53,7 +53,7 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
     let mut code = None;
     for payload in Parser::new(0).parse_all(&bytes) {
         if let Payload::CodeSectionEntry(body) = payload.unwrap() {
-            code = Some(translate_function(&ctx, 0, &body)?);
+            code = Some(translate_function(&ctx, 0, &body, false)?);
         }
     }
     let mut store = Store::new(&engine, ());

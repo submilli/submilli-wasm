@@ -1,7 +1,5 @@
 //! `Trap` and the error model (wasmtime-compatible; carried inside `anyhow::Error`).
 
-use crate::store::AsContext;
-
 /// A wasm trap code. Carried *inside* an [`anyhow::Error`]; recover via
 /// `err.downcast_ref::<Trap>()`. Variant names match `wasmtime::Trap`.
 #[non_exhaustive]
@@ -60,39 +58,3 @@ impl core::fmt::Display for Trap {
 }
 
 impl std::error::Error for Trap {}
-
-/// A captured wasm stack backtrace, mirroring `wasmtime::WasmBacktrace`.
-#[derive(Debug)]
-pub struct WasmBacktrace {
-    frames: Vec<FrameInfo>,
-}
-
-impl WasmBacktrace {
-    /// Captures a backtrace from the current execution, if backtraces are enabled.
-    pub fn capture(store: impl AsContext) -> WasmBacktrace {
-        todo!()
-    }
-
-    /// Captures a backtrace unconditionally.
-    pub fn force_capture(store: impl AsContext) -> WasmBacktrace {
-        todo!()
-    }
-
-    /// The captured frames, most-recent first.
-    pub fn frames(&self) -> &[FrameInfo] {
-        &self.frames
-    }
-}
-
-/// Information about a single wasm stack frame, mirroring `wasmtime::FrameInfo`.
-#[derive(Debug)]
-pub struct FrameInfo {
-    func_index: u32,
-}
-
-impl FrameInfo {
-    /// The index of the function in its defining module.
-    pub fn func_index(&self) -> u32 {
-        self.func_index
-    }
-}

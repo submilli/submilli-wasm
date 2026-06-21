@@ -20,6 +20,7 @@ pub struct Engine {
 /// matching wasmtime's 512 KiB default.
 const DEFAULT_MAX_WASM_STACK: usize = 512 * 1024;
 
+#[allow(clippy::struct_excessive_bools)] // independent engine flags derived from `Config`
 #[derive(Debug)]
 struct EngineInner {
     epoch: AtomicU64,
@@ -33,6 +34,11 @@ struct EngineInner {
     /// Engine-wide GC-pressure threshold (bytes); also sizes each store's heap ceiling
     /// for now (the engine-wide aggregate axis lands with the tracing collector).
     gc_memory_threshold: Option<usize>,
+    /// Whether to capture backtraces (`Config::wasm_backtrace`); also gates the per-`Op` offset
+    /// table + `name`-section retention at parse (#29c).
+    wasm_backtrace: bool,
+    /// Whether to retain the module's `.debug_*` DWARF for source-level backtraces (#29c).
+    retain_dwarf: bool,
     /// Engine-wide canonical type registry (cross-module GC type identity). Locked only by
     /// `Module::new`/`Drop` to register/release rec groups — runtime compares the baked
     /// canonical ids without touching it.
@@ -53,6 +59,9 @@ impl Engine {
                 is_async: config.async_support_enabled(),
                 collector: config.collector_kind(),
                 gc_memory_threshold: config.gc_memory_threshold_bytes(),
+                wasm_backtrace: config.wasm_backtrace_enabled(),
+                retain_dwarf: config.debug_info_enabled()
+                    || (config.wasm_backtrace_enabled() && config.wasm_backtrace_details_enabled()),
                 types: RwLock::new(TypeRegistry::default()),
             }),
         })
@@ -235,6 +244,17 @@ impl Engine {
     /// Whether async execution is enabled (`Config::async_support`).
     pub(crate) fn is_async(&self) -> bool {
         self.inner.is_async
+    }
+
+    /// Whether backtraces are captured (`Config::wasm_backtrace`); also whether the per-`Op` offset
+    /// table + `name` section are retained at parse.
+    pub(crate) fn wasm_backtrace_enabled(&self) -> bool {
+        self.inner.wasm_backtrace
+    }
+
+    /// Whether the module's `.debug_*` DWARF is retained for source-level backtraces.
+    pub(crate) fn retain_dwarf(&self) -> bool {
+        self.inner.retain_dwarf
     }
 
     /// The selected garbage collector. Recorded now; consulted once a tracing collector

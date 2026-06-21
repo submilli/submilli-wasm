@@ -60,7 +60,7 @@ fn compile_one(
     };
     for payload in Parser::new(0).parse_all(&bytes) {
         if let Payload::CodeSectionEntry(body) = payload.map_err(wp_err)? {
-            return Ok(translate_function(&ctx, type_idx, &body)?.ops);
+            return Ok(translate_function(&ctx, type_idx, &body, false)?.ops);
         }
     }
     Err(crate::Error::msg("no function body"))

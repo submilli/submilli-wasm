@@ -32,30 +32,48 @@ impl core::fmt::Display for PendingException {
 impl std::error::Error for PendingException {}
 
 /// Maps an error reaching the embedder boundary: an in-flight exception parks its `exnref` on the
-/// store and becomes the public [`ThrownException`]; any other error (a trap, etc.) passes through.
+/// store and becomes the public [`ThrownException`] (carrying the throw-site backtrace captured on
+/// the instance, #29d); any other error (a trap, etc.) passes through.
 pub(super) fn surface_exception(inner: &mut StoreInner, err: Error) -> Error {
     match err.downcast_ref::<PendingException>() {
         Some(p) => {
-            inner.set_pending_exception(p.exn);
-            ThrownException.into()
+            let exn = p.exn;
+            let backtrace = inner.exn(exn).backtrace.clone();
+            inner.set_pending_exception(exn);
+            // Backtrace as source, `ThrownException` as context: `Display` stays the exception
+            // message while `downcast_ref::<WasmBacktrace>()` recovers the throw-site trace.
+            match backtrace {
+                Some(bt) => Error::new(bt).context(ThrownException),
+                None => ThrownException.into(),
+            }
         }
         None => err,
     }
 }
 
 impl Execution {
-    /// `throw $tag`: pop the tag's arguments, allocate an exception instance, and raise it.
+    /// `throw $tag`: pop the tag's arguments, capture the throw-site backtrace, allocate an
+    /// exception instance carrying it, and raise it. `ip` is the throwing op's index (#29d).
     pub(super) fn throw(
         &mut self,
         inner: &mut StoreInner,
         instance: Instance,
         tag_idx: u32,
+        ip: u32,
     ) -> Result<StepOutcome> {
         let tag = inner.instance(instance).tags[tag_idx as usize];
         let n = inner.tag(tag).ty.ty().params().len();
         let mut args: Vec<Val> = (0..n).map(|_| self.pop()).collect();
         args.reverse(); // popped top-first; restore declaration order
-        let exn = inner.alloc_exn(ExnEntity { tag, args });
+        let backtrace = inner
+            .engine()
+            .wasm_backtrace_enabled()
+            .then(|| self.capture_backtrace(inner, ip));
+        let exn = inner.alloc_exn(ExnEntity {
+            tag,
+            args,
+            backtrace,
+        });
         Err(PendingException { exn }.into())
     }
 
@@ -125,6 +143,12 @@ impl Execution {
             .expect("host call frame")
             .ip
             .saturating_sub(1);
+        // A host-thrown exception has no backtrace yet; capture the wasm stack at the host-call
+        // site so an uncaught host exception still reports a backtrace (#29d).
+        if inner.exn(exn).backtrace.is_none() && inner.engine().wasm_backtrace_enabled() {
+            let bt = self.capture_backtrace(inner, fault_ip);
+            inner.exn_mut(exn).backtrace = Some(bt);
+        }
         self.unwind(inner, PendingException { exn }.into(), fault_ip)
     }
 }

@@ -5,11 +5,45 @@
 //! API; these are interpreter internals. Behavior on the handles
 //! reads/writes these through `StoreInner`.
 
+use core::any::Any;
+use std::sync::Arc;
+
 use crate::extern_::{Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
+use crate::module::op::CompiledFunc;
 use crate::module::Module;
 use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, TagType, Val};
+
+/// One entry of the host-call frame snapshot (`StoreInner::host_frames`): enough to rebuild a
+/// `FrameInfo` on demand for `WasmBacktrace::capture` from inside a host fn (#29d).
+#[derive(Debug)]
+pub(crate) struct HostFrame {
+    pub instance: Instance,
+    pub code: Arc<CompiledFunc>,
+    pub ip: u32,
+}
+
+/// One externref-arena entry: a host payload, or an *internalized* `anyref` produced by
+/// `extern.convert_any` (carrying that ref's handle so `any.convert_extern` recovers it).
+pub(crate) enum ExternEntry {
+    Host(Box<dyn Any + Send + Sync>),
+    Internal(u32),
+}
+
+/// Store-side arena of `externref` entries. Grow-only for now: entries live for the store's
+/// lifetime (no reclamation until a tracing collector, whose host-root enumeration hook lands
+/// then). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
+#[derive(Default)]
+pub(crate) struct ExternRefs(pub Vec<ExternEntry>);
+
+impl core::fmt::Debug for ExternRefs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ExternRefs")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
 
 /// Size of a WebAssembly memory page, in bytes.
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
@@ -52,6 +86,10 @@ pub(crate) struct TagEntity {
 pub(crate) struct ExnEntity {
     pub tag: Tag,
     pub args: Vec<Val>,
+    /// Backtrace captured at the original throw site (#29d). Carried on the instance so a
+    /// `throw_ref` rethrow preserves the original site; `None` for host-created or when
+    /// `wasm_backtrace` is off.
+    pub backtrace: Option<crate::backtrace::WasmBacktrace>,
 }
 
 /// Runtime data backing a [`Func`](crate::Func): either a defined wasm function

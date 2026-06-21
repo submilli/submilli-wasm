@@ -1,7 +1,8 @@
 //! `Config` — engine/runtime configuration (wasmtime-compatible builder).
 
 /// Global configuration for an [`crate::Engine`]. Builder methods return `&mut Self`.
-#[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // independent on/off knobs, mirroring `wasmtime::Config`
+#[derive(Clone, Debug)]
 pub struct Config {
     consume_fuel: bool,
     epoch_interruption: bool,
@@ -9,6 +10,26 @@ pub struct Config {
     collector: Collector,
     gc_memory_threshold: Option<usize>,
     async_support: bool,
+    wasm_backtrace: bool,
+    wasm_backtrace_details: WasmBacktraceDetails,
+    debug_info: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            consume_fuel: false,
+            epoch_interruption: false,
+            max_wasm_stack: None,
+            collector: Collector::default(),
+            gc_memory_threshold: None,
+            async_support: false,
+            // wasmtime defaults: backtraces on, DWARF detail from the environment, no debug info.
+            wasm_backtrace: true,
+            wasm_backtrace_details: WasmBacktraceDetails::default(),
+            debug_info: false,
+        }
+    }
 }
 
 impl Config {
@@ -120,10 +141,48 @@ impl Config {
         self
     }
 
-    /// Accepted for wasmtime parity; backtrace-detail behavior arrives with DWARF
-    /// debug-info support, so this is currently a no-op.
-    pub fn wasm_backtrace_details(&mut self, enable: WasmBacktraceDetails) -> &mut Self {
+    /// Whether to capture a wasm backtrace on traps/exceptions. On by default. Also gates the
+    /// cheap per-`Op` offset table + `name`-section retention used to symbolicate frames.
+    pub fn wasm_backtrace(&mut self, enable: bool) -> &mut Self {
+        self.wasm_backtrace = enable;
         self
+    }
+
+    /// Whether wasm backtraces carry DWARF file/line detail. Defaults to
+    /// [`WasmBacktraceDetails::Environment`].
+    pub fn wasm_backtrace_details(&mut self, enable: WasmBacktraceDetails) -> &mut Self {
+        self.wasm_backtrace_details = enable;
+        self
+    }
+
+    /// Whether to retain the module's DWARF debug info. Off by default. The native-debugger aspect
+    /// is a no-op for an interpreter, but the retained DWARF symbolicates backtraces (ARCHITECTURE
+    /// §16), so enabling this gives source-level frames regardless of `wasm_backtrace_details`.
+    pub fn debug_info(&mut self, enable: bool) -> &mut Self {
+        self.debug_info = enable;
+        self
+    }
+
+    /// Whether backtrace capture is enabled (`Config::wasm_backtrace`).
+    pub(crate) fn wasm_backtrace_enabled(&self) -> bool {
+        self.wasm_backtrace
+    }
+
+    /// Whether DWARF debug info is retained (`Config::debug_info`).
+    pub(crate) fn debug_info_enabled(&self) -> bool {
+        self.debug_info
+    }
+
+    /// Whether backtraces should resolve DWARF file/line, resolving `Environment` against
+    /// `WASMTIME_BACKTRACE_DETAILS` (`"1"` enables).
+    pub(crate) fn wasm_backtrace_details_enabled(&self) -> bool {
+        match self.wasm_backtrace_details {
+            WasmBacktraceDetails::Enable => true,
+            WasmBacktraceDetails::Disable => false,
+            WasmBacktraceDetails::Environment => {
+                std::env::var("WASMTIME_BACKTRACE_DETAILS").is_ok_and(|v| v == "1")
+            }
+        }
     }
 
     /// Engine-wide GC-pressure high-water mark, in bytes.
@@ -202,12 +261,44 @@ pub enum OptLevel {
     SpeedAndSize,
 }
 
-/// Whether to retain detailed backtrace info, mirroring `wasmtime::WasmBacktraceDetails`.
-/// Currently accepted for parity; real effect arrives with DWARF debug-info support.
+/// Whether captured backtraces carry DWARF file/line detail, mirroring
+/// `wasmtime::WasmBacktraceDetails`. `Environment` (the default) reads the
+/// `WASMTIME_BACKTRACE_DETAILS` env var (`"1"` enables).
 #[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub enum WasmBacktraceDetails {
-    #[default]
     Enable,
     Disable,
+    #[default]
+    Environment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, WasmBacktraceDetails};
+
+    #[test]
+    fn backtrace_knob_defaults() {
+        let c = Config::new();
+        assert!(c.wasm_backtrace_enabled(), "backtrace on by default");
+        assert!(!c.debug_info_enabled(), "debug_info off by default");
+    }
+
+    #[test]
+    fn details_enable_disable_resolve_without_env() {
+        assert!(Config::new()
+            .wasm_backtrace_details(WasmBacktraceDetails::Enable)
+            .wasm_backtrace_details_enabled());
+        assert!(!Config::new()
+            .wasm_backtrace_details(WasmBacktraceDetails::Disable)
+            .wasm_backtrace_details_enabled());
+    }
+
+    #[test]
+    fn knobs_round_trip() {
+        let mut c = Config::new();
+        c.wasm_backtrace(false).debug_info(true);
+        assert!(!c.wasm_backtrace_enabled());
+        assert!(c.debug_info_enabled());
+    }
 }

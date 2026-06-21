@@ -206,11 +206,16 @@ impl Execution {
         };
         let params = self.values.split_off(self.values.len() - n_params);
         let cb = store.host_funcs[host_index as usize].clone();
-        if let Err(e) = cb(
+        // Expose the live wasm frames to `WasmBacktrace::capture(caller)` for the host call's
+        // duration; restore the previous snapshot after (so re-entrant calls don't clobber it).
+        let prev = store.inner.swap_host_frames(self.host_frame_snapshot());
+        let result = cb(
             Caller::new(store.as_context_mut(), Some(instance)),
             &params,
             &mut results,
-        ) {
+        );
+        store.inner.swap_host_frames(prev);
+        if let Err(e) = result {
             return self.host_call_error(&mut store.inner, e);
         }
         // The host returned normally, so it did not throw. Drop any exception it set via
@@ -262,11 +267,13 @@ impl Execution {
         };
         let params = self.values.split_off(self.values.len() - n_params);
         let cb = store.async_host_funcs[host_index as usize].clone();
+        let prev = store.inner.swap_host_frames(self.host_frame_snapshot());
         let outcome = {
             let caller = Caller::new(store.as_context_mut(), Some(instance));
             let fut = cb(caller, &params, &mut results);
             std::boxed::Box::into_pin(fut).await
         };
+        store.inner.swap_host_frames(prev);
         if let Err(e) = outcome {
             return self.host_call_error(&mut store.inner, e);
         }

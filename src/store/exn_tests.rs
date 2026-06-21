@@ -14,6 +14,7 @@ fn exn_arena_round_trip() {
     let handle = inner.alloc_exn(ExnEntity {
         tag,
         args: vec![Val::I32(7), Val::ExnRef(None)],
+        backtrace: None,
     });
 
     let exn = inner.exn(handle);
