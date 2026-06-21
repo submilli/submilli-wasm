@@ -6,11 +6,11 @@
 // No inner attributes here: the including files set crate-level allows.
 
 use wasmtime::{
-    AnyRef, ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, Extern, ExternRef, FieldType,
-    Finality, Func, FuncType, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType,
-    Module, Mutability, Ref, RefType, ResourceLimiter, Result, RootScope, StorageType, Store,
-    StoreLimits, StoreLimitsBuilder, StructRef, StructRefPre, StructType, Table, TableType,
-    TypedFunc, UpdateDeadline, Val, ValType,
+    AnyRef, ArrayRef, ArrayRefPre, ArrayType, Caller, Config, Engine, ExnRef, ExnRefPre, ExnType,
+    Extern, ExternRef, FieldType, Finality, Func, FuncType, Global, GlobalType, HeapType, Instance,
+    Linker, Memory, MemoryType, Module, Mutability, Ref, RefType, ResourceLimiter, Result, RootScope,
+    StorageType, Store, StoreLimits, StoreLimitsBuilder, StructRef, StructRefPre, StructType, Table,
+    TableType, Tag, TagType, ThrownException, TypedFunc, UpdateDeadline, Val, ValType,
 };
 
 struct HostState {
@@ -121,6 +121,13 @@ fn entities(store: &mut Store<HostState>) -> Result<()> {
     let tt = TableType::new(RefType::new(true, HeapType::Func), 1, None);
     let t = Table::new(&mut *store, tt, Ref::Func(None))?;
     let _old = t.grow(&mut *store, 1, Ref::Func(None))?;
+
+    let engine = store.engine().clone();
+    let tag_ty = TagType::new(FuncType::new(&engine, [ValType::I32], []));
+    let _sig = tag_ty.ty();
+    let tag = Tag::new(&mut *store, &tag_ty)?;
+    let _ty = tag.ty(&*store);
+    let _ext = Extern::Tag(tag);
     Ok(())
 }
 
@@ -176,6 +183,31 @@ fn gc_host_api(engine: &Engine, store: &mut Store<HostState>) -> Result<()> {
     let _e = a.get(&mut *store, 0)?;
     let any: wasmtime::Rooted<AnyRef> = s.into();
     let _back = any.unwrap_struct(&*store)?;
+    Ok(())
+}
+
+// Exception host API (#28g): type descriptors, host-construct/inspect an exception, throw from the
+// host, and recover the pending exception at the embedder boundary.
+fn exn_host_api(engine: &Engine, store: &mut Store<HostState>) -> Result<()> {
+    let et = ExnType::new(engine, [ValType::I32, ValType::I64])?;
+    let et2 = ExnType::from_tag_type(&et.tag_type())?;
+    let _ = et.matches(&et2);
+    let _ = et.field(0);
+    let _ = et.fields().count();
+    let _ = et.engine();
+
+    let tag = Tag::new(&mut *store, &et.tag_type())?;
+    let pre = ExnRefPre::new(&mut *store, et);
+    let exn: wasmtime::Rooted<ExnRef> =
+        ExnRef::new(&mut *store, &pre, &tag, &[Val::I32(1), Val::I64(2)])?;
+    let _f = exn.field(&mut *store, 0)?;
+    let _t = exn.tag(&mut *store)?;
+    let _ty = exn.ty(&*store)?;
+    let _m = exn.matches_ty(&*store, &HeapType::Exn)?;
+
+    // Throw from the host; the embedder recovers the exception after the trapping call.
+    let _r: core::result::Result<(), ThrownException> = store.throw(exn);
+    let _pending: Option<wasmtime::Rooted<ExnRef>> = store.take_pending_exception();
     Ok(())
 }
 

@@ -214,6 +214,8 @@ fn is_deferred_op(err: &Error) -> bool {
     let msg = err.to_string();
     // Tail calls (#39) and the GC aggregate/cast instructions (their own subtasks) validate
     // under our feature set but aren't compiled yet; their modules skip rather than fail.
+    // EH (`throw`/`throw_ref`/`try_table`) is implemented (#28c/#28d/#28e). Only tail calls (#39)
+    // remain deferred: `return_call*` validates under our feature set but isn't compiled yet.
     const DEFERRED: &[&str] = &["ReturnCall"];
     DEFERRED.iter().any(|op| msg.contains(op))
 }
@@ -439,8 +441,18 @@ fn run_directives(
                     Err(_) => summary.skip_assert(file),
                 }
             }
-            // Exception handling is Phase 6.
-            WastDirective::AssertException { .. } => summary.skip_assert(file),
+            WastDirective::AssertException { exec, .. } => match execute(ctx, exec) {
+                ExecResult::Vals(_) => {
+                    failures.push(format!("{file}: expected an exception, but it returned"))
+                }
+                ExecResult::Skip => summary.skip_assert(file),
+                ExecResult::Trap(e) if e.is::<submilli_wasm::ThrownException>() => {
+                    summary.pass_assert(file);
+                }
+                ExecResult::Trap(e) => {
+                    failures.push(format!("{file}: expected an exception, got: {e}"))
+                }
+            },
             _ => {}
         }
     }

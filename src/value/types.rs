@@ -88,6 +88,7 @@ impl HeapType {
             (H::NoFunc, H::Func | H::ConcreteFunc(_))
                 | (H::ConcreteFunc(_), H::Func)
                 | (H::NoExtern, H::Extern)
+                | (H::NoExn, H::Exn)
                 | (H::I31 | H::Struct | H::Array | H::Eq, H::Any)
                 | (H::I31 | H::Struct | H::Array, H::Eq)
                 | (H::ConcreteStruct(_), H::Struct | H::Eq | H::Any)
@@ -164,6 +165,10 @@ impl FuncType {
     /// The engine-canonical type id (internal identity).
     pub(crate) fn canonical_id(&self) -> CanonicalTypeId {
         self.id
+    }
+
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub fn params(&self) -> impl ExactSizeIterator<Item = ValType> {
@@ -305,6 +310,24 @@ impl TableType {
     }
 }
 
+/// An exception tag type: the function type whose params are the exception's argument types
+/// (results are always empty). Identity at runtime is by store address (see [`Tag`](crate::Tag)),
+/// not by this type; this is the signature used for import matching and payload access.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TagType {
+    func: FuncType,
+}
+
+impl TagType {
+    pub fn new(func: FuncType) -> TagType {
+        TagType { func }
+    }
+
+    pub fn ty(&self) -> &FuncType {
+        &self.func
+    }
+}
+
 /// The type of an importable/exportable external item.
 #[derive(Clone, Debug)]
 pub enum ExternType {
@@ -312,6 +335,7 @@ pub enum ExternType {
     Memory(MemoryType),
     Global(GlobalType),
     Table(TableType),
+    Tag(TagType),
 }
 
 /// Metadata about a module import.

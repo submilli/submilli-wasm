@@ -8,11 +8,23 @@ use crate::canon::IrHeap;
 use crate::module::op::{BranchTarget, Op};
 use crate::Result;
 
+mod try_table;
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum BlockKind {
     Block,
     Loop,
     If,
+    TryTable,
+}
+
+/// A compile-time catch clause (one per `try_table` catch), resolved into a `HandlerRec` at the
+/// matching `end` (see [`try_table`]). `tag` is `None` for `catch_all`/`catch_all_ref`.
+struct HandlerClause {
+    tag: Option<u32>,
+    label: u32,
+    payload_args: bool,
+    payload_ref: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -37,6 +49,8 @@ pub(super) struct CtrlFrame {
     else_patch: Option<u32>,
     reachable_on_entry: bool,
     end_targeted: bool,
+    /// Catch clauses (only for `BlockKind::TryTable`; empty otherwise).
+    clauses: Vec<HandlerClause>,
 }
 
 impl CtrlFrame {
@@ -61,6 +75,7 @@ impl Translator<'_> {
             else_patch: None,
             reachable_on_entry: true,
             end_targeted: false,
+            clauses: Vec::new(),
         });
     }
 
@@ -88,6 +103,7 @@ impl Translator<'_> {
             else_patch: None,
             reachable_on_entry: self.reachable,
             end_targeted: false,
+            clauses: Vec::new(),
         });
     }
 
@@ -114,6 +130,7 @@ impl Translator<'_> {
             else_patch,
             reachable_on_entry: self.reachable,
             end_targeted: false,
+            clauses: Vec::new(),
         });
     }
 
@@ -150,6 +167,12 @@ impl Translator<'_> {
     }
 
     pub(super) fn do_end(&mut self) {
+        // A reachable `try_table` emits landing pads + an exception-table span; a dead one (and
+        // every other block) falls through to the plain block path below.
+        let top = self.ctrl.last().expect("end without frame");
+        if top.kind == BlockKind::TryTable && top.reachable_on_entry {
+            return self.end_try_table();
+        }
         let frame = self.ctrl.pop().expect("end without frame");
         let end_ip = self.ops.len() as u32;
         if let Some(idx) = frame.else_patch {
@@ -224,6 +247,19 @@ impl Translator<'_> {
             slot: PatchSlot::Single,
         });
         self.ctrl[0].end_targeted = true;
+        self.reachable = false;
+    }
+
+    /// `throw $tag` / `throw_ref`: stack-polymorphic terminators (like `unreachable`/`ret`). No
+    /// compile-time pop — the rest of the block is dead and `do_end` resets height absolutely; the
+    /// interpreter pops the tag args / `exnref` at runtime.
+    pub(super) fn throw(&mut self, tag_index: u32) {
+        self.emit(Op::Throw(tag_index));
+        self.reachable = false;
+    }
+
+    pub(super) fn throw_ref(&mut self) {
+        self.emit(Op::ThrowRef);
         self.reachable = false;
     }
 

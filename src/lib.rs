@@ -42,6 +42,7 @@ mod canon;
 mod config;
 mod engine;
 mod error;
+mod exception;
 mod exec;
 mod extern_;
 mod func;
@@ -58,7 +59,8 @@ pub use crate::error::{Error, Result};
 
 pub use crate::config::{Collector, Config, OptLevel, WasmBacktraceDetails};
 pub use crate::engine::{Engine, EngineWeak};
-pub use crate::extern_::{Extern, Global, Memory, MemoryAccessError, Table};
+pub use crate::exception::ThrownException;
+pub use crate::extern_::{Extern, Global, Memory, MemoryAccessError, Table, Tag};
 pub use crate::func::{
     Caller, Func, IntoFunc, TypedFunc, WasmParams, WasmResults, WasmRet, WasmTy,
 };
@@ -73,10 +75,10 @@ pub use crate::store::{
 };
 pub use crate::trap::{FrameInfo, Trap, WasmBacktrace};
 pub use crate::value::{
-    AnyRef, ArrayRef, ArrayRefPre, ArraySuperType, ArrayType, CompositeType, ExnRef, ExportType,
-    ExternRef, ExternType, FieldTemplate, FieldType, Finality, FuncSuperType, FuncType, GlobalType,
-    HeapType, HeapTypeTemplate, ImportType, MemoryType, Mutability, PendingArrayId, PendingFuncId,
-    PendingStructId, RecGroup, RecGroupBuilder, RecGroupType, Ref, RefType, RootScope, Rooted,
-    StorageType, StorageTypeTemplate, StructRef, StructRefPre, StructSuperType, StructType,
-    TableType, Val, ValType, ValTypeTemplate, V128,
+    AnyRef, ArrayRef, ArrayRefPre, ArraySuperType, ArrayType, CompositeType, ExnRef, ExnRefPre,
+    ExnType, ExportType, ExternRef, ExternType, FieldTemplate, FieldType, Finality, FuncSuperType,
+    FuncType, GlobalType, HeapType, HeapTypeTemplate, ImportType, MemoryType, Mutability,
+    PendingArrayId, PendingFuncId, PendingStructId, RecGroup, RecGroupBuilder, RecGroupType, Ref,
+    RefType, RootScope, Rooted, StorageType, StorageTypeTemplate, StructRef, StructRefPre,
+    StructSuperType, StructType, TableType, TagType, Val, ValType, ValTypeTemplate, V128,
 };

@@ -17,7 +17,7 @@ use crate::engine::Engine;
 use crate::module::compile::{conv_valtype, translate_function, CompileCtx};
 use crate::module::inner::{
     ConstExpr, ConstOp, DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export,
-    ExportKind, GlobalDef, Import, ImportKind, ModuleInner, TableDef,
+    ExportKind, GlobalDef, Import, ImportKind, ModuleInner, TableDef, TagDef,
 };
 use crate::module::op::CompiledFunc;
 use crate::value::MemoryType;
@@ -62,6 +62,7 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
                 let kinds = m.type_kinds();
                 parse_globals(&kinds, &mut m.globals, r)?;
             }
+            Payload::TagSection(r) => parse_tags(&mut m.tags, r)?,
             Payload::ExportSection(r) => parse_exports(&mut m.exports, r)?,
             Payload::StartSection { func, .. } => m.start = Some(func),
             Payload::ElementSection(r) => {
@@ -77,7 +78,7 @@ pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner>
         }
     }
 
-    m.functions = compile_bodies(&m.types, &m.func_types, m.num_imported_funcs, &bodies)?;
+    m.functions = compile_bodies(&m, &bodies)?;
     // Register the module's rec groups in the engine, baking canonical type ids.
     m.intern(engine);
     Ok(m)
@@ -94,6 +95,8 @@ fn empty_inner() -> ModuleInner {
         memories: Vec::new(),
         tables: Vec::new(),
         globals: Vec::new(),
+        tags: Vec::new(),
+        num_imported_tags: 0,
         datas: Vec::new(),
         elems: Vec::new(),
         start: None,
@@ -125,9 +128,11 @@ fn push_import(m: &mut ModuleInner, imp: &wasmparser::Import<'_>) -> Result<()> 
         TypeRef::Table(tt) => ImportKind::Table(conv_tabletype(&kinds, tt)?),
         TypeRef::Memory(mt) => ImportKind::Memory(conv_memtype(mt)),
         TypeRef::Global(gt) => ImportKind::Global(conv_globaltype(&kinds, gt)?),
-        TypeRef::Tag(_) | TypeRef::FuncExact(_) => {
-            return Err(Error::msg("unsupported import kind"))
+        TypeRef::Tag(t) => {
+            m.num_imported_tags += 1;
+            ImportKind::Tag(t.func_type_idx)
         }
+        TypeRef::FuncExact(_) => return Err(Error::msg("unsupported import kind")),
     };
     m.imports.push(Import {
         module: imp.module.to_string(),
@@ -152,6 +157,15 @@ fn parse_globals(
     Ok(())
 }
 
+fn parse_tags(out: &mut Vec<TagDef>, reader: wasmparser::TagSectionReader<'_>) -> Result<()> {
+    for t in reader {
+        out.push(TagDef {
+            type_index: t.map_err(wp_err)?.func_type_idx,
+        });
+    }
+    Ok(())
+}
+
 fn parse_exports(out: &mut Vec<Export>, reader: wasmparser::ExportSectionReader<'_>) -> Result<()> {
     for e in reader {
         let e = e.map_err(wp_err)?;
@@ -160,9 +174,8 @@ fn parse_exports(out: &mut Vec<Export>, reader: wasmparser::ExportSectionReader<
             ExternalKind::Table => ExportKind::Table(e.index),
             ExternalKind::Memory => ExportKind::Memory(e.index),
             ExternalKind::Global => ExportKind::Global(e.index),
-            ExternalKind::Tag | ExternalKind::FuncExact => {
-                return Err(Error::msg("unsupported export kind"))
-            }
+            ExternalKind::Tag => ExportKind::Tag(e.index),
+            ExternalKind::FuncExact => return Err(Error::msg("unsupported export kind")),
         };
         out.push(Export {
             name: e.name.to_string(),
@@ -304,21 +317,30 @@ fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>
     }))
 }
 
-fn compile_bodies(
-    types: &[ModuleType],
-    func_types: &[u32],
-    num_imported_funcs: u32,
-    bodies: &[FunctionBody<'_>],
-) -> Result<Vec<Arc<CompiledFunc>>> {
-    let kinds: Vec<AggKind> = types.iter().map(ModuleType::kind).collect();
+/// Tag-index → type-index (imported tags first, then defined), for `try_table` catch arity.
+fn tag_type_indices(m: &ModuleInner) -> Vec<u32> {
+    m.imports
+        .iter()
+        .filter_map(|i| match i.kind {
+            ImportKind::Tag(t) => Some(t),
+            _ => None,
+        })
+        .chain(m.tags.iter().map(|t| t.type_index))
+        .collect()
+}
+
+fn compile_bodies(m: &ModuleInner, bodies: &[FunctionBody<'_>]) -> Result<Vec<Arc<CompiledFunc>>> {
+    let kinds: Vec<AggKind> = m.types.iter().map(ModuleType::kind).collect();
+    let tag_types = tag_type_indices(m);
     let ctx = CompileCtx {
-        types,
+        types: &m.types,
         kinds: &kinds,
-        func_types,
+        func_types: &m.func_types,
+        tag_types: &tag_types,
     };
     let mut out = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
-        let type_idx = func_types[num_imported_funcs as usize + i];
+        let type_idx = m.func_types[m.num_imported_funcs as usize + i];
         out.push(Arc::new(translate_function(&ctx, type_idx, body)?));
     }
     Ok(out)

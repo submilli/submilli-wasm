@@ -3,20 +3,20 @@
 
 use super::const_eval::{elem_refs, eval_const, eval_const_ref, ConstCtx};
 use crate::canon::{self, AggKind, IrGlobalType, IrHeap, IrTableType};
-use crate::extern_::{Extern, Global, Memory, Table};
+use crate::extern_::{Extern, Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::inner::{DataMode, ElemMode, ImportKind};
 use crate::module::Module;
 use crate::store::{
-    FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, StoreInner, TableEntity,
+    FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, StoreInner, TableEntity, TagEntity,
 };
 use crate::trap::Trap;
 use crate::value::{MemoryType, Mutability, Ref, Val};
 use crate::{Error, Result};
 
 /// Index spaces built from a module's imports.
-type Imported = (Vec<Func>, Vec<Memory>, Vec<Global>, Vec<Table>);
+type Imported = (Vec<Func>, Vec<Memory>, Vec<Global>, Vec<Table>, Vec<Tag>);
 
 /// Instantiates `module` against `imports` (positional, matching the module's
 /// import declarations), returning the new instance handle.
@@ -30,9 +30,15 @@ pub(crate) fn instantiate(
         return Err(Error::msg("wrong number of imports"));
     }
 
-    let (mut funcs, mut memories, mut globals, mut tables) = link_imports(inner, module, imports)?;
+    let (mut funcs, mut memories, mut globals, mut tables, mut tags) =
+        link_imports(inner, module, imports)?;
     for mt in &m.memories {
         memories.push(inner.alloc_memory(MemoryEntity::new(mt.clone())));
+    }
+    // Allocate a fresh entity per defined tag — this mints its store-address identity.
+    for t in &m.tags {
+        let ty = m.tag_type(t.type_index);
+        tags.push(inner.alloc_tag(TagEntity { ty }));
     }
     // Function handles are allocated before tables/globals so a table or global
     // initializer can `ref.func` a defined function (reference-types / function-references).
@@ -60,6 +66,7 @@ pub(crate) fn instantiate(
         memories: memories.clone(),
         globals: globals.clone(),
         tables: tables.clone(),
+        tags,
         dropped_data: vec![false; m.datas.len()],
         elems,
     });
@@ -141,7 +148,7 @@ fn init_defined_globals(
 }
 
 fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Result<Imported> {
-    let mut spaces: Imported = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut spaces: Imported = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (imp, ext) in module.inner().imports.iter().zip(imports) {
         match (&imp.kind, ext) {
             (ImportKind::Func(t), Extern::Func(f)) => {
@@ -160,10 +167,25 @@ fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Resu
                 check_table(inner, module, tt, *t)?;
                 spaces.3.push(*t);
             }
+            (ImportKind::Tag(t), Extern::Tag(tag)) => {
+                check_tag(inner, module, *t, *tag)?;
+                spaces.4.push(*tag);
+            }
             _ => return Err(Error::msg("import kind mismatch")),
         }
     }
     Ok(spaces)
+}
+
+/// Tag imports match by **exact** func-type identity (invariant — unlike covariant funcs/globals):
+/// the provided tag's signature must canonically equal the importer's declared one.
+fn check_tag(inner: &StoreInner, module: &Module, type_idx: u32, tag: Tag) -> Result<()> {
+    let expected_id = module.inner().canonical_type_id(type_idx);
+    if inner.tag(tag).ty.ty().canonical_id() == expected_id {
+        Ok(())
+    } else {
+        Err(Error::msg("imported tag type mismatch"))
+    }
 }
 
 fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Result<()> {

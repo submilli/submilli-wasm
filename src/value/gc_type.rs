@@ -4,7 +4,7 @@
 
 use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
-use crate::value::{Mutability, ValType};
+use crate::value::{FuncType, Mutability, TagType, ValType};
 use crate::Result;
 
 /// Whether a GC type may be subtyped further (`final` vs `non-final`).
@@ -191,6 +191,57 @@ macro_rules! handle_id_traits {
 
 handle_id_traits!(StructType);
 handle_id_traits!(ArrayType);
+
+/// An exception type — the value types an exception carries. Internally the tag's function type
+/// (`[fields] → []`), so it shares `FuncType`'s engine-canonical identity + refcounting (#27i).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ExnType {
+    func: FuncType,
+}
+
+impl ExnType {
+    pub fn new(engine: &Engine, fields: impl IntoIterator<Item = ValType>) -> Result<ExnType> {
+        Ok(ExnType {
+            func: FuncType::new(engine, fields, []),
+        })
+    }
+
+    pub fn from_tag_type(tag: &TagType) -> Result<ExnType> {
+        Ok(ExnType {
+            func: tag.ty().clone(),
+        })
+    }
+
+    /// The tag type an exception of this type is thrown with.
+    pub fn tag_type(&self) -> TagType {
+        TagType::new(self.func.clone())
+    }
+
+    pub fn field(&self, i: usize) -> Option<FieldType> {
+        self.func.params().nth(i).map(exn_field)
+    }
+
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = FieldType> {
+        self.func.params().map(exn_field)
+    }
+
+    pub fn engine(&self) -> &Engine {
+        self.func.engine()
+    }
+
+    pub fn matches(&self, other: &ExnType) -> bool {
+        self.func == other.func
+    }
+
+    pub(crate) fn func(&self) -> &FuncType {
+        &self.func
+    }
+}
+
+/// An exception field is one of the tag's params: an immutable value-type slot.
+fn exn_field(ty: ValType) -> FieldType {
+    FieldType::new(Mutability::Const, StorageType::ValType(ty))
+}
 
 /// An engine-level recursion-group handle (`StructType`/`ArrayType` belong to one).
 /// Opaque stub — real canonicalized rec-groups arrive with the host rec-group builder.

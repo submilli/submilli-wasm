@@ -1,6 +1,7 @@
 //! `Module` — parse + validate + compile a wasm binary to internal bytecode.
 
 pub(crate) mod compile;
+pub(crate) mod handler;
 pub(crate) mod inner;
 pub(crate) mod op;
 pub(crate) mod parse;
@@ -36,6 +37,11 @@ pub(crate) fn enabled_features() -> WasmFeatures {
         // Full GC: struct/array type definitions, rec groups, sub/final. The aggregate
         // instructions + casts are deferred — validated modules using them skip in the harness.
         | WasmFeatures::GC
+        // Exception handling (`exnref` + `try_table`). Tags + their imports/exports are decoded
+        // here (#28a); the `throw`/`throw_ref`/`try_table` instructions are deferred — validated
+        // modules using them skip in the harness until #28c–#28e. Legacy `try/catch/delegate`
+        // (`LEGACY_EXCEPTIONS`) stays off.
+        | WasmFeatures::EXCEPTIONS
 }
 
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same

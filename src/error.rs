@@ -44,6 +44,14 @@ impl Error {
     }
 
     #[must_use]
+    pub fn is<E>(&self) -> bool
+    where
+        E: Display + Debug + Send + Sync + 'static,
+    {
+        self.0.is::<E>()
+    }
+
+    #[must_use]
     pub fn downcast_ref<E>(&self) -> Option<&E>
     where
         E: Display + Debug + Send + Sync + 'static,

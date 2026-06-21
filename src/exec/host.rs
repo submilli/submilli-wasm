@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
+use super::exn::surface_exception;
 use super::{Execution, Outcome};
+use crate::exception::ThrownException;
 use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
 use crate::instance::Instance;
@@ -29,9 +31,17 @@ pub(crate) fn execute<T>(
     };
     exec.push_call(instance, code);
     loop {
-        match exec.run(&mut store.inner)? {
+        let outcome = match exec.run(&mut store.inner) {
+            Ok(o) => o,
+            Err(e) => return Err(surface_exception(&mut store.inner, e)),
+        };
+        match outcome {
             Outcome::Finished => return Ok(exec.values),
-            Outcome::HostCall { func, instance } => exec.invoke_host(store, func, instance)?,
+            Outcome::HostCall { func, instance } => {
+                if let Err(e) = exec.invoke_host(store, func, instance) {
+                    return Err(surface_exception(&mut store.inner, e));
+                }
+            }
             #[cfg(feature = "async")]
             Outcome::HostAsync { .. } => {
                 return Err(crate::Error::msg(
@@ -67,11 +77,21 @@ pub(crate) async fn execute_async<T>(
     };
     exec.push_call(instance, code);
     loop {
-        match exec.run(&mut store.inner)? {
+        let outcome = match exec.run(&mut store.inner) {
+            Ok(o) => o,
+            Err(e) => return Err(surface_exception(&mut store.inner, e)),
+        };
+        match outcome {
             Outcome::Finished => return Ok(exec.values),
-            Outcome::HostCall { func, instance } => exec.invoke_host(store, func, instance)?,
+            Outcome::HostCall { func, instance } => {
+                if let Err(e) = exec.invoke_host(store, func, instance) {
+                    return Err(surface_exception(&mut store.inner, e));
+                }
+            }
             Outcome::HostAsync { func, instance } => {
-                exec.invoke_host_async(store, func, instance).await?;
+                if let Err(e) = exec.invoke_host_async(store, func, instance).await {
+                    return Err(surface_exception(&mut store.inner, e));
+                }
             }
             Outcome::FuelYield => {
                 yield_now().await;
@@ -186,13 +206,38 @@ impl Execution {
         };
         let params = self.values.split_off(self.values.len() - n_params);
         let cb = store.host_funcs[host_index as usize].clone();
-        cb(
+        if let Err(e) = cb(
             Caller::new(store.as_context_mut(), Some(instance)),
             &params,
             &mut results,
-        )?;
+        ) {
+            return self.host_call_error(&mut store.inner, e);
+        }
+        // The host returned normally, so it did not throw. Drop any exception it set via
+        // `Store::throw` but swallowed instead of propagating (host misuse) — the pending slot is
+        // scoped to a single host call and must be empty once one completes without throwing.
+        store.inner.take_pending_exception();
         self.values.extend(results);
         Ok(())
+    }
+
+    /// Handles a host function's `Err`. A host *throw* both returns `ThrownException` **and** leaves a
+    /// pending exception (`Store::throw`); only that combination re-enters the guest's handlers. Any
+    /// other host error — or a `ThrownException` with no pending exception — propagates as an ordinary
+    /// error that `try_table` must not catch. Keying on the error type (not just the slot) keeps an
+    /// unrelated error, or a stale pending from an undrained earlier exception, from being mistaken
+    /// for a throw.
+    fn host_call_error(
+        &mut self,
+        inner: &mut crate::store::StoreInner,
+        e: crate::Error,
+    ) -> Result<()> {
+        if e.is::<ThrownException>() {
+            if let Some(exn) = inner.take_pending_exception() {
+                return self.raise_host_exception(inner, exn);
+            }
+        }
+        Err(e)
     }
 
     /// Async sibling of [`invoke_host`](Self::invoke_host): runs the suspended async host
@@ -217,11 +262,16 @@ impl Execution {
         };
         let params = self.values.split_off(self.values.len() - n_params);
         let cb = store.async_host_funcs[host_index as usize].clone();
-        {
+        let outcome = {
             let caller = Caller::new(store.as_context_mut(), Some(instance));
             let fut = cb(caller, &params, &mut results);
-            std::boxed::Box::into_pin(fut).await?;
+            std::boxed::Box::into_pin(fut).await
+        };
+        if let Err(e) = outcome {
+            return self.host_call_error(&mut store.inner, e);
         }
+        // See `invoke_host`: a host that returned normally leaves no pending exception.
+        store.inner.take_pending_exception();
         self.values.extend(results);
         Ok(())
     }

@@ -61,6 +61,11 @@ pub(crate) enum Op {
     /// Branch when the popped reference is non-null, keeping it on the branch target;
     /// on fall-through (null) the reference is dropped.
     BrOnNonNull(BranchTarget),
+    /// `throw $tag`: pop the tag's args, build an exception instance, and unwind
+    /// (stack-polymorphic, like `unreachable`). Carries the module-relative tag index.
+    Throw(u32),
+    /// `throw_ref`: pop an `exnref` and re-throw it (null traps; stack-polymorphic).
+    ThrowRef,
 
     // --- parametric ---
     Drop,
@@ -388,4 +393,6 @@ pub(crate) struct CompiledFunc {
     pub local_types: Box<[IrVal]>,
     /// Peak operand-stack depth above the locals (for stack pre-reservation).
     pub max_operands: u32,
+    /// Exception-handler table (one entry per `try_table`; #28d). Consulted only on throw.
+    pub handlers: Box<[crate::module::handler::HandlerSpan]>,
 }

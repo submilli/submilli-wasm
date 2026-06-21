@@ -10,7 +10,7 @@ use crate::canon::{
 };
 use crate::engine::Engine;
 use crate::module::op::CompiledFunc;
-use crate::value::{ExternType, FuncType, GlobalType, MemoryType, TableType};
+use crate::value::{ExternType, FuncType, GlobalType, MemoryType, TableType, TagType};
 
 /// A module decoded and compiled to internal bytecode. Immutable and shareable.
 ///
@@ -34,6 +34,9 @@ pub(crate) struct ModuleInner {
     pub memories: Vec<MemoryType>,
     pub tables: Vec<TableDef>,
     pub globals: Vec<GlobalDef>,
+    /// *Defined* tags (imported ones live in `imports`). Each references a func type index.
+    pub tags: Vec<TagDef>,
+    pub num_imported_tags: u32,
     pub datas: Vec<DataSegment>,
     pub elems: Vec<ElemSegment>,
     pub start: Option<u32>,
@@ -112,6 +115,8 @@ pub(crate) enum ImportKind {
     Table(IrTableType),
     Memory(MemoryType),
     Global(IrGlobalType),
+    /// An imported tag, carrying its referenced func-type index (module-relative).
+    Tag(u32),
 }
 
 /// One module export, in declaration order. Indices are module-space.
@@ -127,6 +132,7 @@ pub(crate) enum ExportKind {
     Table(u32),
     Memory(u32),
     Global(u32),
+    Tag(u32),
 }
 
 /// A defined table: its type plus an optional constant initializer expression
@@ -142,6 +148,12 @@ pub(crate) struct TableDef {
 pub(crate) struct GlobalDef {
     pub ty: IrGlobalType,
     pub init: ConstExpr,
+}
+
+/// A defined tag: the module-relative index of the func type it references.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct TagDef {
+    pub type_index: u32,
 }
 
 /// A data segment. Active segments copy into a memory at instantiation; passive
@@ -244,6 +256,10 @@ impl ModuleInner {
             ImportKind::Global(gt) => {
                 ExternType::Global(canon::materialize_global(engine, ids, gt))
             }
+            ImportKind::Tag(t) => ExternType::Tag(TagType::new(canon::func_handle(
+                engine,
+                self.canonical_type_id(*t),
+            ))),
         }
     }
 
@@ -255,6 +271,7 @@ impl ModuleInner {
             ExportKind::Table(i) => ExternType::Table(self.nth_table(i)),
             ExportKind::Memory(i) => ExternType::Memory(self.nth_memory(i)),
             ExportKind::Global(i) => ExternType::Global(self.nth_global(i)),
+            ExportKind::Tag(i) => ExternType::Tag(self.nth_tag(i)),
         }
     }
 
@@ -297,5 +314,26 @@ impl ModuleInner {
             }
         }
         canon::materialize_global(engine, ids, &self.globals[(idx - n) as usize].ty)
+    }
+
+    fn nth_tag(&self, idx: u32) -> TagType {
+        let mut n = 0;
+        for imp in &self.imports {
+            if let ImportKind::Tag(t) = &imp.kind {
+                if n == idx {
+                    return self.tag_type(*t);
+                }
+                n += 1;
+            }
+        }
+        self.tag_type(self.tags[(idx - n) as usize].type_index)
+    }
+
+    /// The [`TagType`] for a tag referencing the given module-relative func-type index.
+    pub(crate) fn tag_type(&self, type_index: u32) -> TagType {
+        TagType::new(canon::func_handle(
+            self.engine(),
+            self.canonical_type_id(type_index),
+        ))
     }
 }

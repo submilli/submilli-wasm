@@ -164,6 +164,7 @@ impl Instance {
             ExportKind::Table(i) => Extern::Table(entity.tables[i as usize]),
             ExportKind::Memory(i) => Extern::Memory(entity.memories[i as usize]),
             ExportKind::Global(i) => Extern::Global(entity.globals[i as usize]),
+            ExportKind::Tag(i) => Extern::Tag(entity.tags[i as usize]),
         })
     }
 }

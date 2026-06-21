@@ -1,5 +1,6 @@
 //! `Store<T>` — owns runtime entities and host state; the context spine.
 
+mod arena;
 mod context;
 mod entity;
 mod gc;
@@ -10,7 +11,8 @@ mod limits;
 
 pub use context::{AsContext, AsContextMut, StoreContext, StoreContextMut};
 pub(crate) use entity::{
-    FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, PAGE_SIZE,
+    ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
+    PAGE_SIZE,
 };
 pub(crate) use gc::{
     anyref_handle_i31, anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle,
@@ -27,8 +29,9 @@ pub use limits::{ResourceLimiter, StoreLimits, StoreLimitsBuilder};
 use std::sync::Arc;
 
 use crate::engine::Engine;
+use crate::exception::ThrownException;
 use crate::func::Caller;
-use crate::value::Val;
+use crate::value::{ExnRef, Rooted, Val};
 use crate::{Error, Result};
 
 /// The store's resource limiter — a sync or (under `async`) async projection of host
@@ -127,6 +130,21 @@ impl<T: 'static> Store<T> {
 
     pub fn engine(&self) -> &Engine {
         self.inner.engine()
+    }
+
+    /// Throws `exception` from a host function so the guest's `try_table` can catch it (#28g).
+    /// Returns `Err(ThrownException)`; the generic result lets it slot into any host-fn return type.
+    pub fn throw<R>(
+        &mut self,
+        exception: Rooted<ExnRef>,
+    ) -> core::result::Result<R, ThrownException> {
+        self.inner.set_pending_exception(exception);
+        Err(ThrownException)
+    }
+
+    /// Takes the exception that surfaced from the last call (or a host `throw`), if any.
+    pub fn take_pending_exception(&mut self) -> Option<Rooted<ExnRef>> {
+        self.inner.take_pending_exception()
     }
 
     pub fn set_fuel(&mut self, fuel: u64) -> Result<()> {

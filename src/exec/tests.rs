@@ -48,6 +48,7 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         types: &types,
         kinds: &kinds,
         func_types: &[0],
+        tag_types: &[],
     };
     let mut code = None;
     for payload in Parser::new(0).parse_all(&bytes) {

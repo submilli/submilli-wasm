@@ -6,15 +6,18 @@ use std::num::NonZeroU64;
 
 use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
-use crate::extern_::{Global, Memory, Table};
+use crate::extern_::{Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
-use crate::value::{Rooted, Val};
+use crate::value::{ExnRef, Rooted, Val};
 
+use super::arena::Arena;
 use super::gc::{
     anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle, GcHeap, GcObject,
 };
-use super::{FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity};
+use super::{
+    ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
+};
 
 /// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
 pub(crate) enum FuelStep {
@@ -25,36 +28,6 @@ pub(crate) enum FuelStep {
     NeedYield,
     /// No fuel left at all → `Trap::OutOfFuel`.
     Exhausted,
-}
-
-/// An index-keyed arena; a handle is a `u32` index into the backing `Vec`.
-#[derive(Debug)]
-pub(crate) struct Arena<E>(Vec<E>);
-
-impl<E> Default for Arena<E> {
-    fn default() -> Self {
-        Arena(Vec::new())
-    }
-}
-
-impl<E> Arena<E> {
-    fn alloc(&mut self, entity: E) -> u32 {
-        let index = self.0.len() as u32;
-        self.0.push(entity);
-        index
-    }
-
-    fn get(&self, index: u32) -> &E {
-        &self.0[index as usize]
-    }
-
-    fn get_mut(&mut self, index: u32) -> &mut E {
-        &mut self.0[index as usize]
-    }
-
-    fn len(&self) -> u32 {
-        self.0.len() as u32
-    }
 }
 
 /// One externref-arena entry: a host payload, or an *internalized* `anyref` produced by
@@ -86,17 +59,19 @@ pub(crate) struct StoreInner {
     memories: Arena<MemoryEntity>,
     tables: Arena<TableEntity>,
     globals: Arena<GlobalEntity>,
+    tags: Arena<TagEntity>,
+    /// Exception instances backing `exnref` values; `Rooted<ExnRef>` indexes here. Grow-only
+    /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) must enumerate.
+    exns: Arena<ExnEntity>,
     instances: Arena<InstanceEntity>,
     /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here.
     externrefs: ExternRefs,
     /// Managed `struct`/`array` objects; `Rooted<AnyRef>` slot handles index here.
     /// Allocate-only (null collector); reclamation comes with a tracing collector.
     gc: GcHeap,
-    /// Canonical type ids of **host-allocated** GC objects, each pinned with one type-registration
-    /// (decref'd on store drop). A `GcHeader` holds only a bare `CanonicalTypeId`; guest-object
-    /// types stay alive via the defining instance's module, but a host object could outlive the
-    /// embedder's `StructType` handle — so the store pins host-alloc types for its lifetime (#27i,
-    /// mirrors wasmtime's `gc_host_alloc_types`).
+    /// Canonical type ids of host-allocated GC objects, each pinned with one type-registration
+    /// (decref'd on store drop) so a host object outliving its `StructType` handle keeps its type
+    /// (#27i; mirrors wasmtime's `gc_host_alloc_types`).
     gc_host_alloc_types: std::collections::HashSet<CanonicalTypeId>,
     /// Active fuel — charged per op (meaningful only when `engine.consume_fuel()`).
     /// With an async yield interval this is the current slice; total = `fuel + fuel_reserve`.
@@ -107,6 +82,8 @@ pub(crate) struct StoreInner {
     fuel_yield_interval: Option<NonZeroU64>,
     /// Absolute epoch value at/after which execution interrupts (`u64::MAX` = none).
     epoch_deadline: u64,
+    /// Exception surfaced from the last call / a host `throw`; taken via `take_pending_exception`.
+    pending_exception: Option<Rooted<ExnRef>>,
 }
 
 impl StoreInner {
@@ -118,6 +95,8 @@ impl StoreInner {
             memories: Arena::default(),
             tables: Arena::default(),
             globals: Arena::default(),
+            tags: Arena::default(),
+            exns: Arena::default(),
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
             gc,
@@ -126,14 +105,22 @@ impl StoreInner {
             fuel_reserve: 0,
             fuel_yield_interval: None,
             epoch_deadline: u64::MAX,
+            pending_exception: None,
         }
+    }
+
+    pub(crate) fn set_pending_exception(&mut self, exn: Rooted<ExnRef>) {
+        self.pending_exception = Some(exn);
+    }
+
+    pub(crate) fn take_pending_exception(&mut self) -> Option<Rooted<ExnRef>> {
+        self.pending_exception.take()
     }
 
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
     }
 
-    /// Stores a host `externref` payload, returning its index (held by `Rooted<ExternRef>`).
     pub(crate) fn alloc_externref(&mut self, value: Box<dyn Any + Send + Sync>) -> u32 {
         self.push_extern(ExternEntry::Host(value))
     }
@@ -190,8 +177,7 @@ impl StoreInner {
         Ok(anyref_value(anyref_handle_slot(slot)))
     }
 
-    /// Allocates a managed `struct`/`array` object, returning its heap slot index (held by a
-    /// `Rooted<AnyRef>`). Traps on heap exhaustion.
+    /// Allocates a managed `struct`/`array`, returning its heap slot index; traps on exhaustion.
     pub(crate) fn alloc_gc(&mut self, object: GcObject) -> crate::Result<u32> {
         self.gc.alloc(object)
     }
@@ -211,17 +197,14 @@ impl StoreInner {
         self.gc.check_capacity(extra_bytes)
     }
 
-    /// The managed object at a heap slot index, if present.
     pub(crate) fn gc_object(&self, index: u32) -> Option<&GcObject> {
         self.gc.get(index)
     }
 
-    /// Mutable access to the managed object at a heap slot index, if present.
     pub(crate) fn gc_object_mut(&mut self, index: u32) -> Option<&mut GcObject> {
         self.gc.get_mut(index)
     }
 
-    /// Total remaining fuel (active slice + reserve).
     pub(crate) fn fuel(&self) -> u64 {
         self.fuel + self.fuel_reserve
     }
@@ -270,7 +253,6 @@ impl StoreInner {
         self.epoch_deadline = deadline;
     }
 
-    /// True once the engine's epoch has reached this store's deadline.
     pub(crate) fn epoch_deadline_reached(&self) -> bool {
         self.engine.current_epoch() >= self.epoch_deadline
     }
@@ -327,6 +309,25 @@ impl StoreInner {
         self.globals.get_mut(handle.index)
     }
 
+    pub(crate) fn alloc_tag(&mut self, entity: TagEntity) -> Tag {
+        Tag {
+            index: self.tags.alloc(entity),
+        }
+    }
+
+    pub(crate) fn tag(&self, handle: Tag) -> &TagEntity {
+        self.tags.get(handle.index)
+    }
+
+    /// Allocates an exception instance, returning its `exnref` handle.
+    pub(crate) fn alloc_exn(&mut self, entity: ExnEntity) -> Rooted<ExnRef> {
+        Rooted::from_raw(self.exns.alloc(entity))
+    }
+
+    pub(crate) fn exn(&self, handle: Rooted<ExnRef>) -> &ExnEntity {
+        self.exns.get(handle.raw())
+    }
+
     /// The handle the *next* [`alloc_instance`](Self::alloc_instance) will return,
     /// without allocating. Lets instantiation build `FuncEntity`s that point back
     /// at the instance before it exists (see `instance::init`). Only valid while no
@@ -372,6 +373,10 @@ impl Drop for StoreInner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "exn_tests.rs"]
+mod exn_tests;
 
 #[cfg(test)]
 mod tests {

@@ -127,7 +127,8 @@ enum Op {
     Call(FuncIdx),
     CallIndirect { type_idx: TypeIdx, table: TableIdx },
     Unreachable, Nop,
-    // later phases: RefNull/RefFunc/CallRef/StructNew/.../Throw/TryTableEnter/...
+    // later phases: RefNull/RefFunc/CallRef/StructNew/.../Throw/ThrowRef/...
+    // (`try_table` adds no op — it lowers to a `block` + an exception side-table; see §15)
 }
 
 struct BranchTarget {
@@ -167,6 +168,25 @@ struct CtrlFrame {
 
 Dead code after an unconditional control transfer is dropped (no `Op` emitted) until the matching `else`/`end`, mirroring validation's stack-polymorphic state.
 
+### One principle, two encodings
+All control metadata is a **compile-time control sidetable** — resolved targets plus the `keep`/`pop`
+operand fixup, computed once during decode and consulted to transfer control. It takes one of two
+encodings depending on the *key* used to look an entry up:
+
+- **Folded inline**, when the key is the *instruction itself* (`br`/`br_if`/`br_table`/`return`, and
+  the `br_on_*` family). The entry is a `BranchTarget` stored directly in the op — O(1), no separate
+  structure, blocks vanish entirely.
+- **A range table**, when the key is an *instruction range* rather than a single op. The only such
+  case is `try_table` (§15): a thrown exception can originate at *any* ip inside the try body — or in
+  a callee, where the relevant ip is the call site in this frame — so the lookup is "which try-range
+  encloses this ip," which can't attach to one instruction. These entries live in a per-`CompiledFunc`
+  `HandlerSpan` table, scanned only on throw.
+
+Both are built at compile time and both *dispatch* through the same inline `BranchTarget` (a caught
+exception jumps to a landing-pad `Br`). The difference is purely how the active set is recovered:
+eagerly-keyed-by-op (folded) vs. lazily-keyed-by-ip-range (table). The range form pays nothing on the
+normal path — the table is inert unless an exception is actually in flight.
+
 ## 6. Value model
 
 The value enum is **`Val`** (`src/value/val.rs`) — the public, `wasmtime`-compatible value type *and* the value the interpreter operates on (no separate internal type). It is enriched progressively across phases so later proposals never force a rework:
@@ -200,9 +220,10 @@ struct Frame {
     ip: u32,
     locals_base: u32,         // index into the operand stack
     instance: InstanceHandle,
-    handlers: Vec<HandlerRec>,// exception-handling (phase 6)
 }
 ```
+`Frame` keeps **no** exception-handler state: `try_table` handlers live in a per-`CompiledFunc`
+ip-range table consulted only on throw (see §15), so the normal path is unaffected.
 
 ### Calls (zero-copy args)
 On `Call`, callee args are already the top `n_params` operands; the callee's `locals_base = caller_top − n_params`, so arguments become the callee's first locals with no copy (the long-promised "JVM trick", per Wizard). On `Return`, the top `n_results` operands are moved down to `locals_base`, the frame is popped, and execution continues in the caller. Tail calls (`return_call`) reuse the caller's frame slot.
@@ -374,10 +395,12 @@ Fuel is deterministic but charges per-instruction; epoch is cheap but non-determ
 
 Target the **current** standardized proposal (`exnref` + `try_table`), not legacy `try/catch/delegate` (decode-only for compat, if at all).
 
-- **Tag section**: a tag references a function type whose params are the exception's argument types (results must be empty); tags are matched at runtime by **store address identity**, not signature.
+- **Tag section** (decoded — #28a): a tag references a function type whose params are the exception's argument types (results must be empty); tags are matched at runtime by **store address identity**, not signature. Implemented as a `TagEntity` in its own store arena — a fresh entity is allocated per *defined* tag (minting its identity, distinct per instantiation), while an *imported* tag is the same handle shared across modules (`InstanceEntity.tags`, imported-then-defined). Import matching is **exact** (tags are invariant): `check_tag` compares the canonical func-type ids. Public `Tag`/`TagType` + `Extern::Tag`/`ExternType::Tag` match wasmtime; `WasmFeatures::EXCEPTIONS` is enabled, with the `throw`/`throw_ref`/`try_table` instructions deferred in the harness until #28c–#28e.
 - **`try_table`** is a normal control block with a `blocktype` and a fixed vector of catch clauses (`catch`, `catch_ref`, `catch_all`, `catch_all_ref`). Each clause is precompiled into the **same `BranchTarget` machinery** as `br`: target ip + the values pushed to the label (params; params+exnref; nothing; exnref) + the operand-height restore.
-- **`throw`** builds an exception instance and unwinds; **`throw_ref`** re-throws an `exnref` (traps if null). Both are stack-polymorphic (validated like `unreachable`).
-- **Unwinding**: each `Frame` keeps a handler stack. On throw, search the current frame's handlers in order (tag-address match for `catch`/`catch_ref`, always for `*_all`); on match, restore the operand stack to the handler's recorded height, push the clause payload, and transfer control like a `br`. No match in the frame ⇒ pop the frame and continue in the caller. Exhausted ⇒ surface to the embedder. Handler records are exactly the `try_table` labels, so this reuses §5 + §7 structures.
+- **Exception instances** (value model — #28b): an `exnref` is a `Rooted<ExnRef>` handle into a per-store arena of `ExnEntity { tag: Tag, args: Vec<Val> }` (grow-only, freed on `Store` drop, the same lifecycle as the externref arena / GC heap). The `RefKind::Exn` slot codec, `ref.null exn`/`noexn`, defaultability, and the runtime cast matcher are all wired; `noexn` is the hierarchy bottom (`HeapType::matches` covers `noexn <: exn`). The arena's `args` are **GC roots** the tracing collector (#27g) must enumerate (inert under the null collector). The host construction/inspection API (`ExnType`/`ExnRefPre`/`ExnRef::new`/`field`/`tag`) lands in #28g.
+- **`throw`/`throw_ref`** (implemented — #28c): `throw $tag` reads the instance's tag handle, pops the tag's args, allocates an `ExnEntity`, and raises; `throw_ref` re-raises an `exnref` (null traps). Both compile like `unreachable` (emit + mark the rest of the block dead — stack-polymorphic; the interpreter pops the args at runtime), in `src/exec/exn.rs`. A raised exception is carried as an internal `PendingException { exn: Rooted<ExnRef> }` (impls `std::error::Error`) and, **until the in-frame handler search lands (#28e)**, propagates straight to the embedder through the run loop's existing `?` path — exactly like a trap. #28g re-surfaces it to the embedder as the public `ThrownException`.
+- **`try_table` + unwinding** (implemented — #28d/#28e): handlers are the **range-keyed form of the §5 control sidetable** — a per-`CompiledFunc` ip-range exception table, not a runtime `Frame` stack (a runtime stack would need handler-depth fixups on every branch, since structured control is fully lowered). `try_table` compiles like a `block` plus, at its `end`, a skip-`Br` (normal completion jumps the landing pads) and one **landing pad** (`Op::Br` to the clause's label, reusing the forward-patch machinery) per catch clause; it records a `HandlerSpan { start_ip, end_ip, clauses }`. Catch labels resolve in the **outer** context (the try_table's own label excluded, per the spec typing rule). On throw, the run loop intercepts the in-flight `PendingException` and walks frames outward — the throwing frame's throw-site ip, then each caller's call-site ip (`frame.ip − 1`) — finding the **innermost** span containing the ip whose clause tag matches (store-address identity; `None` = `catch_all`); it truncates the operand stack to the clause's restore-height, pushes the clause payload (`catch`: tag args; `catch_ref`: args + `exnref`; `catch_all`: nothing; `catch_all_ref`: `exnref`), and jumps to the landing pad (which `Br`s to the label like §5). No matching span in any frame ⇒ surface to the embedder; **traps are not caught**. `throw_ref` after `catch_all_ref` re-raises the same instance.
+- **Host exception API** (implemented — #28g): the host constructs/inspects exceptions with `ExnType`/`ExnRefPre`/`ExnRef` (mirroring the GC host API), and **throws** a guest-catchable exception via `Store::throw`/`StoreContextMut::throw`, which parks the `exnref` on a store **pending-exception slot** and returns `Err(ThrownException)`. The pending slot is the host-throw channel, **scoped to a single host call**: a host that returns `Ok` did not throw, so the slot is cleared right after the call (dropping a swallowed `throw` — host misuse — rather than letting it leak); on the `Err` path a host error re-enters the unwinder from the call site **only when it is a `ThrownException` and a pending exception is present**, so neither an unrelated host error nor a stale pending is mistaken for a throw. An ordinary host `Err` (no `throw`) is not catchable. At the embedder boundary the internal `PendingException` becomes the public **`ThrownException`** (a unit error, like wasmtime); the surfaced `exnref` is parked on the slot and recovered via `Store::take_pending_exception` (retrieve it right after the call).
 
 ## 16. Error & trap model (`wasmtime`-compatible)
 

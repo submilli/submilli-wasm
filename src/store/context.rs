@@ -1,7 +1,9 @@
 //! `AsContext`/`AsContextMut` and the `StoreContext[Mut]` borrow wrappers.
 
 use crate::engine::Engine;
+use crate::exception::ThrownException;
 use crate::store::{Store, StoreInner};
+use crate::value::{ExnRef, Rooted};
 use crate::Result;
 
 /// Read-only access to a store, implemented by `Store`, `Caller`, `StoreContext`, and refs.
@@ -67,6 +69,19 @@ impl<'a, T: 'static> StoreContextMut<'a, T> {
 
     pub fn get_fuel(&self) -> Result<u64> {
         self.0.get_fuel()
+    }
+
+    /// Throws `exception` from a host function (see [`Store::throw`](crate::Store::throw)).
+    pub fn throw<R>(
+        &mut self,
+        exception: Rooted<ExnRef>,
+    ) -> core::result::Result<R, ThrownException> {
+        self.0.throw(exception)
+    }
+
+    /// Takes the pending exception (see [`Store::take_pending_exception`]).
+    pub fn take_pending_exception(&mut self) -> Option<Rooted<ExnRef>> {
+        self.0.take_pending_exception()
     }
 
     pub(crate) fn inner(&self) -> &StoreInner {

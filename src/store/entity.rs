@@ -5,11 +5,11 @@
 //! API; these are interpreter internals. Behavior on the handles
 //! reads/writes these through `StoreInner`.
 
-use crate::extern_::{Global, Memory, Table};
+use crate::extern_::{Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::Module;
-use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, Val};
+use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, TagType, Val};
 
 /// Size of a WebAssembly memory page, in bytes.
 pub(crate) const PAGE_SIZE: usize = 64 * 1024;
@@ -35,6 +35,23 @@ pub(crate) struct GlobalEntity {
 pub(crate) struct TableEntity {
     pub elems: Vec<Ref>,
     pub ty: TableType,
+}
+
+/// Runtime data backing a [`Tag`](crate::Tag). A tag carries no mutable state — its identity is
+/// the arena slot (store address), so two instantiations get distinct tags; an imported tag is
+/// the same handle shared across modules. The `ty` is the exception signature.
+#[derive(Debug)]
+pub(crate) struct TagEntity {
+    pub ty: TagType,
+}
+
+/// An exception instance backing an `exnref`: the throwing tag plus the argument values it carries.
+/// `Rooted<ExnRef>` indexes the store's exn arena. The `args` are **GC roots** the future tracing
+/// collector (#27g) must enumerate (inert under the null collector; freed on `Store` drop).
+#[derive(Debug)]
+pub(crate) struct ExnEntity {
+    pub tag: Tag,
+    pub args: Vec<Val>,
 }
 
 /// Runtime data backing a [`Func`](crate::Func): either a defined wasm function
@@ -68,6 +85,8 @@ pub(crate) struct InstanceEntity {
     pub memories: Vec<Memory>,
     pub globals: Vec<Global>,
     pub tables: Vec<Table>,
+    /// Resolved tag handles (imported first, then defined) — store-address identity (#28a).
+    pub tags: Vec<Tag>,
     /// Per-data-segment "dropped" flag (one bool per module data segment). Active
     /// segments are marked dropped right after instantiation; `data.drop` marks
     /// passive ones. A `memory.init` from a dropped segment with `len > 0` traps.

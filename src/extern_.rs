@@ -5,9 +5,10 @@
 
 use crate::func::Func;
 use crate::store::{
-    AsContext, AsContextMut, GlobalEntity, MemoryEntity, StoreContext, StoreContextMut, TableEntity,
+    AsContext, AsContextMut, GlobalEntity, MemoryEntity, StoreContext, StoreContextMut,
+    TableEntity, TagEntity,
 };
-use crate::value::{GlobalType, MemoryType, Mutability, Ref, TableType, Val, ValType};
+use crate::value::{GlobalType, MemoryType, Mutability, Ref, TableType, TagType, Val, ValType};
 use crate::{Error, Result};
 
 /// An external value importable into / exportable from a module.
@@ -17,6 +18,7 @@ pub enum Extern {
     Global(Global),
     Table(Table),
     Memory(Memory),
+    Tag(Tag),
 }
 
 impl From<Func> for Extern {
@@ -40,6 +42,12 @@ impl From<Table> for Extern {
 impl From<Memory> for Extern {
     fn from(m: Memory) -> Extern {
         Extern::Memory(m)
+    }
+}
+
+impl From<Tag> for Extern {
+    fn from(t: Tag) -> Extern {
+        Extern::Tag(t)
     }
 }
 
@@ -294,6 +302,27 @@ impl Table {
         } else {
             Err(Error::msg("table fill out of bounds"))
         }
+    }
+}
+
+/// An exception tag instance. Identity is the store slot (store address): two instantiations of
+/// the same module produce distinct tags, while an imported tag is shared. Catch-clause matching
+/// (#28e) compares these handles; the `ty` is the exception signature.
+#[derive(Copy, Clone, Debug)]
+pub struct Tag {
+    pub(crate) index: u32,
+}
+
+impl Tag {
+    pub fn new(mut store: impl AsContextMut, ty: &TagType) -> Result<Tag> {
+        Ok(store
+            .as_context_mut()
+            .inner_mut()
+            .alloc_tag(TagEntity { ty: ty.clone() }))
+    }
+
+    pub fn ty(&self, store: impl AsContext) -> TagType {
+        store.as_context().inner().tag(*self).ty.clone()
     }
 }
 

@@ -90,8 +90,142 @@ concern, not strict execution order, but #27g deliberately comes after the featu
 - [ ] **#27h** Phase-5 gate — **interim (null-collector) milestone MET; final milestone pending #27g.** Interim, now verified: the full `gc` spec suite passes under the allocate-only engine (no tracing GC exists yet, so this *is* `Collector::Null`) — **29,699 / 0**, every in-scope GC file fully ok (`array*`/`struct`/`i31`/`ref_test`/`ref_cast`/`br_on_cast`/`br_on_cast_fail`/`ref_eq`/`type-canon`/`type-rec`/`type-equivalence`/`type-subtyping`/`binary-gc`), **0 GC failures and 0 GC-caused skips** — the lone GC-file skip is `ref_null.wast`, skipped only because both its modules use `exnref`/`exn` (exception-handling, Phase 6 #28), not for any GC reason; host construct/inspect covered by `tests/gc_host.rs`; and the **cross-module clause** is now covered by new `tests/gc_cross_module.rs` — two modules defining the **same** struct rec group exchange a GC ref (typed `(ref $s)` import *and* `anyref` + guest `ref.cast`) and read it correctly (shared canonical id), while a **mismatched** rec group **fails to link** at instantiation (`Err("imported function signature mismatch")` from `check_func` → `is_subtype`, a distinct canonical id) — no `src/` change needed (import-matching already compares engine-canonical ids cross-module, #27c). **Final milestone (after #27g):** collection reclaims garbage **including cycles**, a stale `GcHandle` reused after sweep faults via the generation check, and the suite still passes under `Collector::Auto`. ⚠️ relative-vs-canonical type-index audit (CVE-2024-12053, gated again in #34).
 
 ## Phase 6 — Exception handling
-- [ ] **#28** exception-handling — `exnref` + `try_table` on the branch machinery *(stub)*
-- [ ] **#28b** Exception embedder/host API — host-side throw/catch compatibility: a `ThrownException` error type carried on `anyhow::Error` so an uncaught guest exception surfaces to the embedder as `err.is::<ThrownException>()`/`downcast_ref`; `ExnRef` host accessors (`ExnRef::new`, `ExnRef::field`, tag access) to read an exception's payload from a host fn; and host functions that **throw a catchable guest exception** (the `__throw_error` thunk pattern — a host `Err` carrying a `ThrownException` re-enters guest `try_table` handling instead of unwinding straight to the embedder). Backtrace capture-at-throw is #29. *(stub)*
+Target the **current** standardized proposal (`exnref` + `try_table`), reusing the existing
+branch/handler machinery (ARCHITECTURE §15) — *not* legacy `try/catch/delegate` (decode-only, if at
+all). Lettered like Phases 3–5, grouped by concern (not strict execution order). Foundations
+(#28a/#28b) land first; the value/instruction/control/unwind core (#28c–#28f) builds on them; host
+API (#28g) and the gate (#28h) close the phase. Several slots already exist **stubbed**:
+`Val::ExnRef`/`Ref::Exn` + `ExnRef` in `src/value/gc_ref.rs`, `RefKind::Exn` codec arms, and the
+`Exn`/`NoExn` heap bottoms; tags are currently **rejected** at decode (`src/module/parse.rs:128`,
+`TypeRef::Tag`); `HandlerRec` is designed (ARCHITECTURE §6/§15) but not yet in `src/`. `exnref` is a
+**GC root** (#27g root enumeration must learn it; no-op under the null collector). Enabling
+`WasmFeatures::EXCEPTIONS` is what un-skips the EH spec files and the `ref_null.wast` GC skip noted
+in #27h.
+
+- [x] **#28a** Tag section & tag identity — **done.** `WasmFeatures::EXCEPTIONS` enabled; the
+  **tag section** + tag imports/exports decode (`src/module/parse.rs` `parse_tags` + the `TypeRef::Tag`
+  / `ExternalKind::Tag` arms, previously rejected) into `ModuleInner.tags`/`num_imported_tags` +
+  `ImportKind::Tag`/`ExportKind::Tag`. Store-side `TagEntity { ty: TagType }` in its own arena
+  (`src/store/inner.rs`, mirroring globals) — a fresh entity per **defined** tag mints its
+  **store-address identity** (distinct per instantiation; an imported tag is the same handle shared
+  across modules, via `InstanceEntity.tags` imported-then-defined). Public `Tag` handle (`Tag::new`/
+  `ty`) + `TagType` (`new`/`ty`) match wasmtime 45 exactly (`embedder_example` dual-compiles);
+  `Extern::Tag`/`ExternType::Tag` round-trip through `Linker`/exports. Import matching is **exact**
+  (tags invariant) — `check_tag` compares canonical func-type ids, `Err("imported tag type mismatch")`
+  on a mismatch. The `throw`/`throw_ref`/`try_table` **instructions** are deferred in the harness
+  (`is_deferred_op` += `Throw`/`TryTable`) until #28c–#28e, so EH-instruction modules skip cleanly.
+  **Spec: 29,740 passed (+41), 1,355 skipped (−44), 0 failed**; `ref_null.wast` now fully runs
+  (32/2 — the exact GC-file skip flagged in #27h, now resolved), `tag.wast` fully ok (4/4),
+  `throw`/`throw_ref`/`try_table` partial (tag-decl asserts pass, instruction asserts defer). No
+  panics on newly-validating paths; zero `unsafe`. New `tests/tags.rs` (decode/export signature,
+  matching import links, mismatched import fails, host `Tag::new`/`ty` round-trip). Foundation for
+  #28b–#28f.
+- [x] **#28b** Exception instances & `exnref` value model — **done (value model only; public host
+  API deferred to #28g per scope decision).** An **exception instance** `ExnEntity { tag: Tag, args:
+  Vec<Val> }` (`src/store/entity.rs`) now lives in a Store arena (`exns: Arena<ExnEntity>` on
+  `StoreInner`), with `alloc_exn(..) -> Rooted<ExnRef>` / `exn(Rooted<ExnRef>) -> &ExnEntity`
+  accessors — the handle space the `RefKind::Exn` codec already round-trips. Most `exnref` plumbing
+  was **already wired** by #28a (`Val::ExnRef`/`Ref::Exn`, `ref.null exn`/`noexn`, defaultability,
+  `IrHeap`↔`HeapType` materialization, `exec/cast.rs` runtime matcher); the one **type-system gap**
+  fixed here: `HeapType::matches` now includes `(NoExn, Exn)` so `noexn` is a proper hierarchy
+  bottom for import/global/element subtyping. The arena + accessors are ahead of their callers (guest
+  `throw` #28c, catch payload #28e, host API #28g) so they land `#[allow(dead_code)]`, unit-tested
+  crate-internally (`src/store/exn_tests.rs`: arena tag+args round-trip; `noexn <: exn` and no
+  cross-hierarchy leak). Prep refactor: extracted the generic `Arena<E>` to `src/store/arena.rs`
+  (`inner.rs` was at the 400-line cap). **Spec unchanged: 29,740 / 0** (pure value-model addition);
+  zero `unsafe`; `embedder_example` dual-compile unchanged (no public API in #28b). Public host API
+  (`ExnType`/`ExnRefPre`/`ExnRef::new`/`field`/`fields`/`tag`/`ty` + dual-compile) → **#28g**.
+  *(original spec below)* — make the stubbed `ExnRef`
+  (`src/value/gc_ref.rs`) real: an **exception instance** = `{ tag, args: Vec<Val> }` stored in a
+  Store arena (alongside the GC/externref arenas); `ExnRef` is a `Rooted` handle to it. Wire
+  `ref.null exn`/`noexn`, defaultability, and the `RefKind::Exn` codec round-trip (already stubbed in
+  `src/store/gc_codec.rs`). Register `exnref` payloads as **GC roots** for #27g (enumeration hook;
+  inert under the null collector). Depends on #28a (tag). *(stub)*
+- [x] **#28c** `throw` / `throw_ref` instructions — **done.** New `Op::Throw(u32)`/`Op::ThrowRef`;
+  compile (`src/module/compile/control.rs` helpers, dispatched from `translate`) mirrors
+  `unreachable` — emit + `reachable = false`, **no compile-time pop** (stack-polymorphic; `do_end`
+  resets height, so the runtime pops authoritatively). Execute (`src/exec/exn.rs`): `throw` reads the
+  tag handle from `InstanceEntity.tags` (#28a), pops the tag's param count, allocs `ExnEntity` via
+  #28b's `alloc_exn`, and raises; `throw_ref` re-raises a caught `exnref` (**null → `Trap`**). With no
+  `try_table`/handler yet, a raised exception propagates as an internal `PendingException` (carries the
+  `Rooted<ExnRef>`; impls `std::error::Error`) straight to the embedder via the run loop's existing
+  `?` — the seed #28e intercepts for handler search and #28g re-surfaces as the public
+  `ThrownException`. Validation (arity/types/stack-polymorphism) is wasmparser's (EXCEPTIONS on since
+  #28a); `throw.wast`'s `assert_invalid` cases already pass via it. `"Throw"` removed from the harness
+  deferral (`"TryTable"` kept). **Spec: 29,740 passed / 0 failed (unchanged)** — every
+  `assert_exception` case lives in a `try_table`-containing module, still deferred until #28d, so no
+  assertion delta (removing `Throw` only un-deferred one `try_table.wast` throw-only helper module:
+  modules 1448 ok / 129 skipped). Verified by new **`tests/exceptions.rs`** (uncaught throw → non-trap
+  error; throw with args; cross-call propagation; stack-polymorphism; `throw_ref` null → `NullReference`).
+  Depends on #28a/#28b.
+- [x] **#28d + #28e** `try_table` + exception unwinding (catch) — **done together** (handler records
+  are inert without the unwinder). **Design: a per-`CompiledFunc` ip-range exception side-table
+  (wasmtime-style), not a runtime handler stack** — chosen because blocks are fully lowered (no
+  runtime block markers; a handler stack would need per-branch handler-depth accounting). `try_table`
+  compiles almost exactly like a `block` (`src/module/compile/control/try_table.rs`): at its `end`,
+  emit a skip-`Br` (normal completion jumps the landing pads) + one **landing pad** (`Op::Br` to the
+  clause's label) per catch clause — reusing the existing forward-patch machinery — and record a
+  `HandlerSpan { start_ip, end_ip, clauses }` (`src/module/handler.rs`) on the function. **No new
+  `Op` variant, no `Frame` field, zero normal-path cost.** Catch labels resolve in the **outer**
+  context (the try_table's own label excluded — per the spec typing rule), so the frame is popped
+  first. Per-clause payload arity: `catch` pushes the tag args; `catch_ref` args **+ `exnref`**;
+  `catch_all` nothing; `catch_all_ref` just the `exnref`. **Unwinder** (`Execution::unwind`,
+  `src/exec/exn.rs`): the run loop intercepts a raised `PendingException`, walks frames outward (top
+  frame's throw-site ip, then each caller's call-site ip = `frame.ip − 1`), finds the innermost
+  `HandlerSpan` containing the ip whose clause tag matches (store-address identity, `None` =
+  `catch_all`), truncates the operand stack to the clause's restore-height, pushes the payload, and
+  jumps to the landing pad (which `Br`s to the label). No match in any frame ⇒ propagates to the
+  embedder; traps (non-exception errors) are **not** caught. Prep refactor: `control.rs` →
+  `control/{mod,try_table}.rs` (child module sees the parent's private `CtrlFrame`/`branch_target`
+  with no visibility leakage); extracted `Execution::top`. Harness: `AssertException` directive
+  implemented (invoke ⇒ expect an "uncaught exception" error), `"TryTable"` dropped from deferral
+  (only `"ReturnCall"`/#39 remains). **Spec: 29,769 passed / 0 failed (+29)** — `throw.wast` (12/0)
+  and `throw_ref.wast` (14/0) now **fully pass** (catch, catch_ref, throw_ref, uncaught); `tag.wast`
+  + `ref_null.wast` stay green; `try_table.wast` is partial only because its main module uses
+  `return_call*` (tail calls, #39), not for any EH reason. Verified further by `tests/exceptions.rs`
+  (10 tests: catch binds args across a call, catch_all, catch_ref→throw_ref re-raise, inner-miss→
+  outer-catch, non-throwing body, + the #28c throw cases). Capture-at-throw backtrace is Phase 7
+  (#29); the public `ThrownException` surfacing is #28g.
+- [x] **#28g** Exception embedder/host API — **done.** Mirrors wasmtime 45 exactly (dual-compiled).
+  Public **`ThrownException`** (`src/exception.rs`) — a **unit** error like wasmtime; an uncaught guest
+  exception (or an uncaught host `throw`) surfaces from `Func::call` as `ThrownException`
+  (`err.is::<ThrownException>()`/`downcast_ref`; added `Error::is`), with the `exnref` parked on the
+  store's pending slot and retrieved via **`Store::take_pending_exception`** /
+  `StoreContextMut::take_pending_exception`. Host construction/inspection: **`ExnType`**
+  (`src/value/gc_type.rs`, thin wrapper over the tag's `FuncType` — `new`/`from_tag_type`/`tag_type`/
+  `field`/`fields`/`engine`/`matches`), **`ExnRefPre`** + **`ExnRef::new(store, &pre, &tag, &fields)`**
+  + `Rooted<ExnRef>::{field,tag,ty,matches_ty}` (`src/value/exn_ref.rs`, new — `gc_ref.rs` was at the
+  cap), allocating into the #28b exn arena. Host **throw**: `Store::throw`/`StoreContextMut::throw`
+  set the pending slot + return `Err(ThrownException)`; the boundary (`exec/host.rs`) routes a host
+  error that left a pending exception back into the unwinder (`raise_host_exception`) from the call
+  site, so a guest `try_table` catches it (the `__throw_error` pattern); an ordinary host `Err` (no
+  `throw`) is **not** catchable and passes through. `surface_exception` does the
+  `PendingException`→`ThrownException` conversion at both boundaries (uncaught run + uncaught host
+  throw). Harness `AssertException` retargeted to `is::<ThrownException>()`. **Spec unchanged:
+  29,769 / 0** (host API only). New `tests/exceptions.rs` cases: host build/inspect, uncaught →
+  `ThrownException` + `take_pending_exception` (field matches), host-throw guest-catches + host-throw
+  uncaught, ordinary host error not catchable. `embedder_example.rs` dual-compiles the full surface vs
+  real wasmtime 45. Zero `unsafe`. Host-fn **panic containment** deferred to Phase-8 **#33** (it owns
+  that comprehensively); `WasmTy` for `Rooted<ExnRef>` deferred (untyped `Val::ExnRef` already flows).
+- [ ] **#28f** *(optional)* Legacy `try/catch/delegate` **decode-only** compat — accept (and skip or
+  trap-on-execute) the legacy EH opcodes so legacy modules don't fail to *decode*; do not implement
+  legacy semantics. Drop if it proves unnecessary for the suite. *(stub)*
+- [x] **#28h** Phase-6 gate — **met; Phase 6 complete.** The `exception-handling` spec suite passes
+  with **zero EH-caused failures or skips**: `ref_null.wast` 32/0 (the GC-file skip flagged in #27h
+  now runs), `tag.wast` 4/0, `throw.wast` 12/0, `throw_ref.wast` 14/0 (incl. `catchall-throw_ref-*` —
+  `throw_ref` **reproduces the instance** after `catch_all_ref`). `try_table.wast` is **PARTIAL
+  (19/41)** **solely because its one remaining module uses `return_call*`** (tail calls, **#39**) —
+  every one of those 41 skips is tail-call-gated, none EH; it re-checks green when #39 lands. Gate
+  criteria are all met and regression-covered by `tests/exceptions.rs` (14 tests): throw/catch across
+  call frames (`catch_binds_args_across_a_call`, `throw_propagates_across_a_call`), `catch_ref`→
+  `throw_ref` re-raise, inner-miss→outer-catch, host build/inspect, host-throw guest-catches, uncaught
+  → `ThrownException` + `take_pending_exception`, ordinary-host-error-not-catchable; the `embedder_example`
+  dual-compiles the host surface vs real wasmtime 45. Hygiene: dropped the now-stale `#[allow(dead_code)]`
+  on `ExnEntity`/`alloc_exn`/`exn` (exercised since #28c/#28g). **Spec: 29,769 passed / 0 failed**;
+  build sync+async, clippy default+`--all-features`, fmt, line-count, zero `unsafe` all green. The
+  current `exnref` + `try_table` proposal is **done**; legacy `try/catch/delegate` (the `legacy/`
+  suite) stays **out of scope** — decode-only compat is the optional **#28f** (deferred;
+  `LEGACY_EXCEPTIONS` off), consistent with the #43 "legacy EH excepted" note.
 
 ## Phase 7 — DWARF & backtraces
 - [ ] **#29** DWARF debug-info retention (`gimli`) + lazily-symbolicated trap/exception backtraces; `Config::wasm_backtrace[_details]`/`debug_info`; capture-at-throw so the exception proposal reports the full throw-site frame chain (closes the wasmtime gap) *(stub)*
@@ -122,6 +256,12 @@ concern, not strict execution order, but #27g deliberately comes after the featu
 
 **Note:** during an active session the harness task tracker is the source of truth
 (it carries ownership/blocking metadata); this file is the durable, version-controlled
-mirror. Phases 3–5 are broken into fine-grained subtasks (#25a–e, #26a–e, #27a–h);
-the later-phase tasks (#28–#43, Phases 6–9) stay intentionally coarse and get broken
-down as their phase nears (as #1–#27 were).
+mirror. Phases 3–6 are broken into fine-grained subtasks (#25a–e, #26a–e, #27a–i,
+#28a–h); the remaining later-phase tasks (#29–#43, Phases 7–9) stay intentionally
+coarse and get broken down as their phase nears (as #1–#28 were).
+
+**Status:** Phases 0–6 are closed. Phase 6 (exception handling) is **complete** for the current
+`exnref` + `try_table` proposal (#28a–#28h); the only open Phase-6 item is the **optional** #28f
+(legacy `try/catch/delegate` decode-only). Next feature phase: **Phase 7 — DWARF & backtraces (#29)**.
+Open dependency noted by the #28h gate: `try_table.wast`'s remaining assertions ride on tail calls
+(#39, Phase 9).

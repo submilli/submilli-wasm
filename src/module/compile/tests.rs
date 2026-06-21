@@ -56,6 +56,7 @@ fn compile_one(
         types: &types,
         kinds: &kinds,
         func_types,
+        tag_types: &[],
     };
     for payload in Parser::new(0).parse_all(&bytes) {
         if let Payload::CodeSectionEntry(body) = payload.map_err(wp_err)? {

@@ -1,11 +1,9 @@
 //! Single-pass decoder: wasm operators -> internal `Op` stream.
 //!
-//! `straight_line` (below) dispatches each non-control operator by category: core
-//! ops (constants/parametric/variable) inline, then [`numeric`]/[`memory`]/[`table`].
-//! Structured control flow and the folded sidetable live in [`control`]. The function
-//! body is wrapped in an implicit `Block` frame so `return`/branches to the outermost
-//! label lower to a branch whose `ip == ops.len()` (the executor returns when
-//! `ip >= ops.len()`).
+//! `straight_line` (below) dispatches each non-control operator by category: core ops inline, then
+//! [`numeric`]/[`memory`]/[`table`]. Structured control flow + the folded sidetable live in
+//! [`control`]. The body is wrapped in an implicit `Block` frame so `return`/outermost branches
+//! lower to a branch with `ip == ops.len()` (the executor returns when `ip >= ops.len()`).
 
 mod control;
 mod gc;
@@ -20,18 +18,20 @@ mod tests;
 use wasmparser::{BinaryReaderError, FunctionBody, Operator};
 
 use crate::canon::{AggKind, IrHeap, IrVal, ModuleType};
+use crate::module::handler::HandlerSpan;
 use crate::module::op::{CompiledFunc, MemArg, Op};
 use crate::{Error, Result};
 
 use self::control::{BlockKind, CtrlFrame};
 
-/// Per-module context the translator needs: the type table (for func signatures), the
-/// per-type kind table (for resolving concrete references), and the function-index →
-/// type-index map (imports + defined functions).
+/// Per-module context the translator needs: the type table (for func signatures), the per-type
+/// kind table (for concrete references), and the function/tag index → type-index maps.
 pub(crate) struct CompileCtx<'a> {
     pub types: &'a [ModuleType],
     pub kinds: &'a [AggKind],
     pub func_types: &'a [u32],
+    /// Tag-index → type-index (imported then defined), for `try_table` catch-payload arity.
+    pub tag_types: &'a [u32],
 }
 
 fn wp_err(e: BinaryReaderError) -> Error {
@@ -141,6 +141,7 @@ pub(crate) fn translate_function(
         n_results,
         local_types: local_types.into_boxed_slice(),
         max_operands: t.max_operands,
+        handlers: t.handlers.into_boxed_slice(),
     })
 }
 
@@ -151,6 +152,7 @@ struct Translator<'a> {
     max_operands: u32,
     ctrl: Vec<CtrlFrame>,
     reachable: bool,
+    handlers: Vec<HandlerSpan>,
 }
 
 impl<'a> Translator<'a> {
@@ -162,6 +164,7 @@ impl<'a> Translator<'a> {
             max_operands: 0,
             ctrl: Vec::new(),
             reachable: true,
+            handlers: Vec::new(),
         }
     }
 
@@ -335,6 +338,7 @@ impl<'a> Translator<'a> {
             W::Block { blockty } => self.push_block(blockty, BlockKind::Block),
             W::Loop { blockty } => self.push_block(blockty, BlockKind::Loop),
             W::If { blockty } => self.push_if(blockty),
+            W::TryTable { ref try_table } => self.push_try_table(try_table),
             W::Else => self.do_else(),
             W::End => self.do_end(),
             W::Br { relative_depth } if self.reachable => self.br(relative_depth),
@@ -371,6 +375,8 @@ impl<'a> Translator<'a> {
                 self.emit(Op::Unreachable);
                 self.reachable = false;
             }
+            W::Throw { tag_index } if self.reachable => self.throw(tag_index),
+            W::ThrowRef if self.reachable => self.throw_ref(),
             // Skipped while unreachable; otherwise straight-line numeric/mem/var/const.
             W::Br { .. }
             | W::BrIf { .. }
@@ -383,6 +389,8 @@ impl<'a> Translator<'a> {
             | W::BrOnNonNull { .. }
             | W::BrOnCast { .. }
             | W::BrOnCastFail { .. }
+            | W::Throw { .. }
+            | W::ThrowRef
             | W::Unreachable => {}
             _ if self.reachable => self.straight_line(op)?,
             _ => {}

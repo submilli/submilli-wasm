@@ -9,6 +9,7 @@ mod arith;
 mod call;
 mod cast;
 mod convert;
+mod exn;
 mod frame;
 mod gc;
 mod gc_array;
@@ -92,6 +93,11 @@ impl Execution {
         self.values.truncate(dst + keep);
     }
 
+    fn top(&self) -> (Arc<CompiledFunc>, u32, u32, Instance) {
+        let f = self.frames.last().expect("current frame");
+        (f.code.clone(), f.ip, f.locals_base, f.instance)
+    }
+
     /// Pops the current frame, moving its top `n_results` operands down to the
     /// frame base. Returns true if no frames remain (execution finished).
     fn do_return(&mut self, n_results: u32) -> bool {
@@ -109,21 +115,13 @@ impl Execution {
         let stack_limit = inner.engine().max_wasm_stack();
         let fuel_enabled = inner.engine().consume_fuel();
         let epoch_enabled = inner.engine().epoch_interruption();
-        let frame = self.frames.last().expect("no initial frame");
-        let mut code = frame.code.clone();
-        let mut ip = frame.ip;
-        let mut base = frame.locals_base;
-        let mut instance = frame.instance;
+        let (mut code, mut ip, mut base, mut instance) = self.top();
         loop {
             if ip as usize >= code.ops.len() {
                 if self.do_return(code.n_results) {
                     return Ok(Outcome::Finished);
                 }
-                let f = self.frames.last().expect("caller frame");
-                code = f.code.clone();
-                ip = f.ip;
-                base = f.locals_base;
-                instance = f.instance;
+                (code, ip, base, instance) = self.top();
                 continue;
             }
             if fuel_enabled {
@@ -147,9 +145,13 @@ impl Execution {
                 self.frames.last_mut().expect("current frame").ip = ip;
                 return Ok(Outcome::EpochDeadline);
             }
-            match self.step(inner, &code, ip, base, instance)? {
-                StepOutcome::Advance(next) => ip = next,
-                StepOutcome::DoCall(req) => {
+            match self.step(inner, &code, ip, base, instance) {
+                Err(e) => {
+                    self.unwind(inner, e, ip)?; // catch (#28e); uncaught reaches the embedder
+                    (code, ip, base, instance) = self.top();
+                }
+                Ok(StepOutcome::Advance(next)) => ip = next,
+                Ok(StepOutcome::DoCall(req)) => {
                     if self.stack_bytes() >= stack_limit {
                         return Err(Trap::StackOverflow.into());
                     }
@@ -160,37 +162,37 @@ impl Execution {
                     base = self.frames.last().expect("callee frame").locals_base;
                     instance = req.instance;
                 }
-                StepOutcome::DoHostCall {
+                Ok(StepOutcome::DoHostCall {
                     func,
                     instance,
                     return_ip,
-                } => {
+                }) => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::HostCall { func, instance });
                 }
                 #[cfg(feature = "async")]
-                StepOutcome::DoHostAsyncCall {
+                Ok(StepOutcome::DoHostAsyncCall {
                     func,
                     instance,
                     return_ip,
-                } => {
+                }) => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::HostAsync { func, instance });
                 }
-                StepOutcome::DoGrow {
+                Ok(StepOutcome::DoGrow {
                     memory,
                     delta,
                     return_ip,
-                } => {
+                }) => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::Grow { memory, delta });
                 }
-                StepOutcome::DoTableGrow {
+                Ok(StepOutcome::DoTableGrow {
                     table,
                     delta,
                     init,
                     return_ip,
-                } => {
+                }) => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::TableGrow { table, delta, init });
                 }
@@ -373,6 +375,8 @@ impl Execution {
             | Op::TableSet(_)
             | Op::TableSize(_)
             | Op::TableFill(_)) => self.exec_table(inner, op, instance)?,
+            Op::Throw(tag) => return self.throw(inner, instance, *tag),
+            Op::ThrowRef => return self.throw_ref(),
             op @ Op::BrOnCast { .. } => {
                 if let Some(ip) = self.br_on_cast(inner, instance, op, false) {
                     return Ok(StepOutcome::Advance(ip));
