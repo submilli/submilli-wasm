@@ -16,4 +16,7 @@ pub(crate) struct Frame {
     pub locals_base: u32,
     /// The instance this frame executes in (resolves globals/memories/callees).
     pub instance: Instance,
+    /// This function's index in its defining module — for backtraces (#29e), avoiding a
+    /// pointer-scan over `module.functions` at capture time.
+    pub func_index: u32,
 }

@@ -20,6 +20,7 @@ use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, TagType, Va
 #[derive(Debug)]
 pub(crate) struct HostFrame {
     pub instance: Instance,
+    pub func_index: u32,
     pub code: Arc<CompiledFunc>,
     pub ip: u32,
 }

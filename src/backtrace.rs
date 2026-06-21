@@ -229,6 +229,27 @@ mod tests {
         let _clone: FrameSymbol = symbols[0].clone(); // FrameSymbol: Clone
     }
 
+    /// #29e: DWARF is parsed only when `symbols()` is inspected, never at frame construction
+    /// (capture). The frame's `Module` clone shares the original's `OnceLock`, so we observe it
+    /// through the original handle.
+    #[test]
+    fn symbolication_is_lazy() {
+        let engine = Engine::new(Config::new().debug_info(true)).unwrap();
+        let module = Module::new(&engine, FIXTURE).unwrap();
+        let offset = module.inner().functions[0].offsets.as_deref().unwrap()[0];
+
+        let frame = FrameInfo::new(module.clone(), 0, Some(offset));
+        assert!(
+            !module.inner().debug.index_built(),
+            "constructing a frame must not parse DWARF"
+        );
+        let _ = frame.symbols();
+        assert!(
+            module.inner().debug.index_built(),
+            "inspecting symbols() parses DWARF"
+        );
+    }
+
     #[test]
     fn frame_without_debug_info_is_empty() {
         let engine = Engine::default();

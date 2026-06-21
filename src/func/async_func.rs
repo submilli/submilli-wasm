@@ -90,6 +90,7 @@ impl Func {
                 crate::exec::host::execute_async(
                     store.as_context_mut().store_mut(),
                     instance,
+                    func_index,
                     code,
                     params.to_vec(),
                 )

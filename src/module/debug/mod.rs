@@ -89,4 +89,10 @@ impl DebugSections {
         let addr = code_offset.checked_sub(self.code_base)?;
         table.as_ref()?.lookup(addr)
     }
+
+    /// Whether the lazy DWARF line index has been built yet — for the laziness regression test.
+    #[cfg(test)]
+    pub(crate) fn index_built(&self) -> bool {
+        self.index.get().is_some()
+    }
 }

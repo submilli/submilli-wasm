@@ -13,28 +13,20 @@ use crate::Error;
 use super::Execution;
 
 /// Builds one frame's [`FrameInfo`], or `None` if the instance isn't registered (only happens in
-/// synthetic, instance-free test executions). `func_index` is recovered by pointer-identity over
-/// the module's compiled functions (only on the error/capture path, so the O(funcs) scan is fine).
+/// synthetic, instance-free test executions). `func_index` is carried on the frame (#29e), so this
+/// only reads `offsets[ip]` — no scan.
 pub(crate) fn frame_info(
     inner: &StoreInner,
     instance: Instance,
+    func_index: u32,
     code: &Arc<CompiledFunc>,
     ip: u32,
 ) -> Option<FrameInfo> {
     let module = inner.try_instance(instance)?.module.clone();
-    let (func_index, code_offset) = {
-        let mi = module.inner();
-        let func_index = mi
-            .functions
-            .iter()
-            .position(|f| Arc::ptr_eq(f, code))
-            .map_or(0, |i| i as u32 + mi.num_imported_funcs);
-        let code_offset = code
-            .offsets
-            .as_deref()
-            .and_then(|o| o.get(ip as usize).copied());
-        (func_index, code_offset)
-    };
+    let code_offset = code
+        .offsets
+        .as_deref()
+        .and_then(|o| o.get(ip as usize).copied());
     Some(FrameInfo::new(module, func_index, code_offset))
 }
 
@@ -44,7 +36,7 @@ pub(crate) fn from_host_frames(inner: &StoreInner) -> WasmBacktrace {
         .host_frames()
         .iter()
         .rev()
-        .filter_map(|hf: &HostFrame| frame_info(inner, hf.instance, &hf.code, hf.ip))
+        .filter_map(|hf: &HostFrame| frame_info(inner, hf.instance, hf.func_index, &hf.code, hf.ip))
         .collect();
     WasmBacktrace::from_frames(frames)
 }
@@ -65,7 +57,7 @@ impl Execution {
                 } else {
                     f.ip.saturating_sub(1)
                 };
-                frame_info(inner, f.instance, &f.code, ip)
+                frame_info(inner, f.instance, f.func_index, &f.code, ip)
             })
             .collect();
         WasmBacktrace::from_frames(frames)
@@ -78,6 +70,7 @@ impl Execution {
             .iter()
             .map(|f| HostFrame {
                 instance: f.instance,
+                func_index: f.func_index,
                 code: f.code.clone(),
                 ip: f.ip.saturating_sub(1),
             })

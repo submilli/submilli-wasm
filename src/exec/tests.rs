@@ -60,6 +60,7 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
     host::execute(
         &mut store,
         Instance { index: 0 },
+        0,
         Arc::new(code.unwrap()),
         args,
     )

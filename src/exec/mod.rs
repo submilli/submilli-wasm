@@ -1,9 +1,7 @@
 //! The interpreter run loop and transient execution state.
 //!
-//! Each frame holds its code as `Arc<CompiledFunc>` so the loop can read ops
-//! from the (immutable) `Arc` while freely mutating the value/frame stacks and
-//! the store. `step` returns an owned outcome so we never reassign the active
-//! `code` while a borrow of it is live. See ARCHITECTURE §7.
+//! Each frame holds its code as `Arc<CompiledFunc>` so the loop reads ops while mutating the
+//! value/frame stacks and the store. `step` returns an owned outcome. See ARCHITECTURE §7.
 
 mod arith;
 mod call;
@@ -43,9 +41,8 @@ struct Execution {
     frames: Vec<Frame>,
 }
 
-// Parkability: keep `Execution` `Send` so async can await with it at rest and the
-// executor can move it between tasks. Compile-time check — if a future field adds a
-// non-`Send` member (e.g. an `Rc`), this fails here rather than at an `.await`.
+// Parkability: keep `Execution` `Send` so async can await with it at rest. Compile-time check —
+// a future non-`Send` field (e.g. an `Rc`) fails here rather than at an `.await`.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Execution>();
@@ -71,7 +68,7 @@ impl Execution {
             + self.frames.len() * std::mem::size_of::<Frame>()
     }
 
-    fn push_call(&mut self, instance: Instance, code: Arc<CompiledFunc>) {
+    fn push_call(&mut self, instance: Instance, func_index: u32, code: Arc<CompiledFunc>) {
         let locals_base = self.values.len() as u32 - code.n_params;
         for ty in &code.local_types {
             self.values.push(Val::default_for(ty));
@@ -81,6 +78,7 @@ impl Execution {
             ip: 0,
             locals_base,
             instance,
+            func_index,
         });
     }
 
@@ -156,7 +154,7 @@ impl Execution {
                         return Err(Trap::StackOverflow.into());
                     }
                     self.frames.last_mut().expect("caller frame").ip = req.return_ip;
-                    self.push_call(req.instance, req.code.clone());
+                    self.push_call(req.instance, req.func_index, req.code.clone());
                     code = req.code;
                     ip = 0;
                     base = self.frames.last().expect("callee frame").locals_base;
@@ -273,11 +271,14 @@ impl Execution {
             Op::Call(f) => {
                 let callee = inner.instance(instance).funcs[*f as usize];
                 return Ok(match call::resolve(inner, callee) {
-                    ResolvedCall::Wasm(callee_instance, code) => StepOutcome::DoCall(CallReq {
-                        return_ip: next,
-                        instance: callee_instance,
-                        code,
-                    }),
+                    ResolvedCall::Wasm(callee_instance, func_index, code) => {
+                        StepOutcome::DoCall(CallReq {
+                            return_ip: next,
+                            instance: callee_instance,
+                            func_index,
+                            code,
+                        })
+                    }
                     ResolvedCall::Host(func) => StepOutcome::DoHostCall {
                         func,
                         instance,
@@ -387,8 +388,7 @@ impl Execution {
                     return Ok(StepOutcome::Advance(ip));
                 }
             }
-            // Straight-line GC + numerics fall through a chain: `exec_gc` (struct/i31) →
-            // `exec_gc_array` (arrays) → `exec_cast` (test/cast/eq/convert) → `exec_numeric`.
+            // Straight-line GC + numerics: exec_gc → exec_gc_array → exec_cast → exec_numeric.
             other => self.exec_gc(inner, other, instance)?,
         }
         Ok(StepOutcome::Advance(next))

@@ -110,7 +110,13 @@ impl Func {
                     .module
                     .inner()
                     .compiled(func_index);
-                crate::exec::host::execute(ctx.store_mut(), instance, code, params.to_vec())?
+                crate::exec::host::execute(
+                    ctx.store_mut(),
+                    instance,
+                    func_index,
+                    code,
+                    params.to_vec(),
+                )?
             }
             Callee::Host(host_index) => {
                 let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();

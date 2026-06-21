@@ -22,6 +22,7 @@ use crate::Result;
 pub(crate) fn execute<T>(
     store: &mut Store<T>,
     instance: Instance,
+    func_index: u32,
     code: Arc<CompiledFunc>,
     args: Vec<Val>,
 ) -> Result<Vec<Val>> {
@@ -29,7 +30,7 @@ pub(crate) fn execute<T>(
         values: args,
         frames: Vec::new(),
     };
-    exec.push_call(instance, code);
+    exec.push_call(instance, func_index, code);
     loop {
         let outcome = match exec.run(&mut store.inner) {
             Ok(o) => o,
@@ -68,6 +69,7 @@ pub(crate) fn execute<T>(
 pub(crate) async fn execute_async<T>(
     store: &mut Store<T>,
     instance: Instance,
+    func_index: u32,
     code: Arc<CompiledFunc>,
     args: Vec<Val>,
 ) -> Result<Vec<Val>> {
@@ -75,7 +77,7 @@ pub(crate) async fn execute_async<T>(
         values: args,
         frames: Vec::new(),
     };
-    exec.push_call(instance, code);
+    exec.push_call(instance, func_index, code);
     loop {
         let outcome = match exec.run(&mut store.inner) {
             Ok(o) => o,

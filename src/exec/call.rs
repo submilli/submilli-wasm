@@ -20,7 +20,7 @@ pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
         } => {
             let def_inst = *instance;
             let module = inner.instance(def_inst).module.clone();
-            ResolvedCall::Wasm(def_inst, module.inner().compiled(*func_index))
+            ResolvedCall::Wasm(def_inst, *func_index, module.inner().compiled(*func_index))
         }
         FuncEntity::Host { .. } => ResolvedCall::Host(f),
         #[cfg(feature = "async")]
@@ -50,7 +50,7 @@ impl Execution {
         // Engine-canonical id of the expected type (cross-module, recursion-safe identity).
         let expected_id = expected_module.inner().canonical_type_id(type_idx);
         match resolve(inner, f) {
-            ResolvedCall::Wasm(def_inst, code) => {
+            ResolvedCall::Wasm(def_inst, func_index, code) => {
                 let actual_id = inner
                     .instance(def_inst)
                     .module
@@ -63,6 +63,7 @@ impl Execution {
                 Ok(StepOutcome::DoCall(CallReq {
                     return_ip,
                     instance: def_inst,
+                    func_index,
                     code,
                 }))
             }
@@ -101,9 +102,10 @@ impl Execution {
             _ => return Err(Trap::BadSignature.into()),
         };
         Ok(match resolve(inner, f) {
-            ResolvedCall::Wasm(def_inst, code) => StepOutcome::DoCall(CallReq {
+            ResolvedCall::Wasm(def_inst, func_index, code) => StepOutcome::DoCall(CallReq {
                 return_ip,
                 instance: def_inst,
+                func_index,
                 code,
             }),
             ResolvedCall::Host(func) => StepOutcome::DoHostCall {

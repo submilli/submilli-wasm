@@ -70,9 +70,10 @@ pub(super) enum StepOutcome {
     },
 }
 
-/// A resolved callee: a wasm body to push a frame for, or a host func to suspend on.
+/// A resolved callee: a wasm body (defining instance + func index + code) to push a frame for,
+/// or a host func to suspend on.
 pub(super) enum ResolvedCall {
-    Wasm(Instance, Arc<CompiledFunc>),
+    Wasm(Instance, u32, Arc<CompiledFunc>),
     Host(Func),
     #[cfg(feature = "async")]
     HostAsync(Func),
@@ -82,5 +83,6 @@ pub(super) enum ResolvedCall {
 pub(super) struct CallReq {
     pub return_ip: u32,
     pub instance: Instance,
+    pub func_index: u32,
     pub code: Arc<CompiledFunc>,
 }
