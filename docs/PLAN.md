@@ -268,7 +268,7 @@ The remaining gaps are exactly the spec-runner's current skip buckets (`cargo te
 - **M2 (Phases 2–3):** full sync + async embedder API; fuel/epoch/limits/linker/host-fns; concurrent stores.
 - **M3 (Phase 4):** references + typed function references.
 - **M4 (Phases 5–6):** GC + exception handling — feature-complete against the target set.
-- **M5 (Phase 7):** DWARF-symbolicated trap/exception backtraces; exception-propagation backtrace correctness verified.
+- **M5 (Phase 7):** ✅ **done** — DWARF-symbolicated trap/exception backtraces; exception-propagation backtrace correctness verified (#29a–#29f; gated in `tests/backtrace.rs`).
 - **M6 (Phase 8):** multi-tenant-safe — bounded resources, panic-free on validated input, store isolation verified, fuzzers green, threat model published.
 - **M7 (Phase 9):** full Wasm 2.0 + 3.0 — the vendored spec suite runs with **zero skips/partials** (SIMD, relaxed-SIMD, tail-calls, extended-const, multi-memory, memory64).
 

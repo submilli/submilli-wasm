@@ -7,8 +7,12 @@
 
 use submilli_wasm::{
     Caller, Config, Engine, Extern, Func, Instance, Module, Store, ThrownException, Trap,
-    WasmBacktrace,
+    WasmBacktrace, WasmBacktraceDetails,
 };
+
+/// A multi-function DWARF module: `trap_chain → level_b → level_c`, where `level_c` does an
+/// out-of-bounds load (`MemoryOutOfBounds`). Source lines: level_c=12, level_b=13, trap_chain=14.
+const TRAP_CHAIN: &[u8] = include_bytes!("../src/module/debug/testdata/trap_chain.wasm");
 
 /// Instantiates `wat`, calls a no-arg export, and returns the resulting error.
 fn call_err(engine: &Engine, wat: &str, export: &str) -> submilli_wasm::Error {
@@ -17,6 +21,16 @@ fn call_err(engine: &Engine, wat: &str, export: &str) -> submilli_wasm::Error {
     let inst = Instance::new(&mut store, &module, &[]).unwrap();
     let f = inst.get_func(&mut store, export).unwrap();
     f.call(&mut store, &[], &mut []).unwrap_err()
+}
+
+/// Instantiates a binary module, calls a no-arg `() -> i32` export, returns the resulting error.
+fn call_err_bin(engine: &Engine, bytes: &[u8], export: &str) -> submilli_wasm::Error {
+    let mut store = Store::new(engine, ());
+    let module = Module::new(engine, bytes).unwrap();
+    let inst = Instance::new(&mut store, &module, &[]).unwrap();
+    let f = inst.get_func(&mut store, export).unwrap();
+    f.call(&mut store, &[], &mut [submilli_wasm::Val::I32(0)])
+        .unwrap_err()
 }
 
 fn frame_names(bt: &WasmBacktrace) -> Vec<String> {
@@ -166,4 +180,50 @@ fn force_capture_ignores_disabled_backtrace() {
         (0, 1),
         "capture empty when disabled; force not"
     );
+}
+
+/// Phase-7 gate: a trap in a DWARF module yields a backtrace with correct `file:line` per frame.
+/// `trap_chain → level_b → level_c`, `level_c` traps; under `debug_info(true)` each frame resolves
+/// to its own source line.
+#[test]
+fn dwarf_trap_reports_file_line_per_frame() {
+    let engine = Engine::new(Config::new().debug_info(true)).unwrap();
+    let err = call_err_bin(&engine, TRAP_CHAIN, "trap_chain");
+    assert!(matches!(
+        err.downcast_ref::<Trap>(),
+        Some(Trap::MemoryOutOfBounds)
+    ));
+    let bt = err.downcast_ref::<WasmBacktrace>().expect("backtrace");
+
+    // Most-recent first: the trapping callee, then its callers (source lines 12/13/14).
+    let expected = [("level_c", 12u32), ("level_b", 13), ("trap_chain", 14)];
+    assert_eq!(frame_names(bt), ["level_c", "level_b", "trap_chain"]);
+    for (frame, (name, line)) in bt.frames().iter().zip(expected) {
+        let sym = frame.symbols().first().expect("symbol");
+        assert_eq!(sym.name(), Some(name));
+        assert!(
+            sym.file().unwrap().ends_with("trap_chain.rs"),
+            "file: {:?}",
+            sym.file()
+        );
+        assert_eq!(sym.line(), Some(line), "line for {name}");
+    }
+}
+
+/// Phase-7 gate: `wasm_backtrace_details(Disable)` (with `debug_info` off) keeps the frames — func
+/// names + the chain — but drops file/line. (`debug_info(true)` is the override that forces source
+/// resolution; with it off, `Disable` means no DWARF retained.)
+#[test]
+fn details_disabled_keeps_frames_drops_file_line() {
+    let engine =
+        Engine::new(Config::new().wasm_backtrace_details(WasmBacktraceDetails::Disable)).unwrap();
+    let err = call_err_bin(&engine, TRAP_CHAIN, "trap_chain");
+    let bt = err.downcast_ref::<WasmBacktrace>().expect("backtrace");
+    assert_eq!(frame_names(bt), ["level_c", "level_b", "trap_chain"]);
+    for frame in bt.frames() {
+        let sym = frame.symbols().first().expect("symbol (name only)");
+        assert!(sym.name().is_some(), "func name kept");
+        assert_eq!(sym.file(), None, "no DWARF file");
+        assert_eq!(sym.line(), None, "no DWARF line");
+    }
 }
