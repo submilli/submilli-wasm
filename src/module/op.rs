@@ -19,7 +19,7 @@ pub(crate) type ElemIdx = u32;
 #[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MemArg {
     pub memory: u32,
-    pub offset: u32,
+    pub offset: u64,
 }
 
 /// A resolved branch edge: on a taken branch the top `keep` operands are moved down over

@@ -288,11 +288,9 @@ impl Execution {
     /// Services a suspended `memory.grow`: consults the limiter and pushes the new
     /// page count, or `-1` on a soft failure (a trap propagates from `grow_memory`).
     fn do_grow<T>(&mut self, store: &mut Store<T>, memory: Memory, delta: u64) -> Result<()> {
-        let result = match store.grow_memory(memory, delta)? {
-            Some(old) => old as i32,
-            None => -1,
-        };
-        self.push(Val::I32(result));
+        let is_64 = store.inner.memory(memory).ty.is_64();
+        let old = store.grow_memory(memory, delta)?;
+        self.push_index(is_64, old.unwrap_or(u64::MAX)); // soft-fail → -1 in either width
         Ok(())
     }
 
@@ -304,11 +302,9 @@ impl Execution {
         memory: Memory,
         delta: u64,
     ) -> Result<()> {
-        let result = match store.grow_memory_async(memory, delta).await? {
-            Some(old) => old as i32,
-            None => -1,
-        };
-        self.push(Val::I32(result));
+        let is_64 = store.inner.memory(memory).ty.is_64();
+        let old = store.grow_memory_async(memory, delta).await?;
+        self.push_index(is_64, old.unwrap_or(u64::MAX));
         Ok(())
     }
 
@@ -321,11 +317,9 @@ impl Execution {
         delta: u64,
         init: Ref,
     ) -> Result<()> {
-        let result = match store.grow_table(table, delta, init)? {
-            Some(old) => old as i32,
-            None => -1,
-        };
-        self.push(Val::I32(result));
+        let is_64 = store.inner.table(table).ty.is_64();
+        let old = store.grow_table(table, delta, init)?;
+        self.push_index(is_64, old.unwrap_or(u64::MAX));
         Ok(())
     }
 
@@ -338,11 +332,9 @@ impl Execution {
         delta: u64,
         init: Ref,
     ) -> Result<()> {
-        let result = match store.grow_table_async(table, delta, init).await? {
-            Some(old) => old as i32,
-            None => -1,
-        };
-        self.push(Val::I32(result));
+        let is_64 = store.inner.table(table).ty.is_64();
+        let old = store.grow_table_async(table, delta, init).await?;
+        self.push_index(is_64, old.unwrap_or(u64::MAX));
         Ok(())
     }
 }

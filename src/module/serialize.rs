@@ -18,7 +18,8 @@ const MAGIC: &[u8; 8] = b"submwc01";
 /// v6: extended-const arithmetic `ConstOp`s (#40).
 /// v7: per-op memory index (`MemArg.memory` + management-op indices) for multi-memory (#41).
 /// v8: tail-call `Op`s (`ReturnCall`/`ReturnCallIndirect`/`ReturnCallRef`, #39).
-const ARTIFACT_VERSION: u32 = 8;
+/// v9: memory64/table64 — `MemArg.offset` widened to u64, `IrTableType` gains `table64` + u64 limits (#42).
+const ARTIFACT_VERSION: u32 = 9;
 
 /// Encodes a compiled module into the binary artifact format.
 pub(crate) fn encode(inner: &ModuleInner) -> Result<Vec<u8>> {

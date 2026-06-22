@@ -140,8 +140,9 @@ pub(crate) struct IrRef {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IrTableType {
     pub element: IrRef,
-    pub min: u32,
-    pub max: Option<u32>,
+    pub min: u64,
+    pub max: Option<u64>,
+    pub table64: bool,
 }
 
 /// A global type in the module IR.
@@ -239,7 +240,12 @@ pub(crate) fn materialize_table(
     type_ids: &[CanonicalTypeId],
     t: &IrTableType,
 ) -> TableType {
-    TableType::new(materialize_ref(engine, type_ids, &t.element), t.min, t.max)
+    let element = materialize_ref(engine, type_ids, &t.element);
+    if t.table64 {
+        TableType::new64(element, t.min, t.max)
+    } else {
+        TableType::new(element, t.min as u32, t.max.map(|m| m as u32))
+    }
 }
 
 /// Wraps a func type's canonical id as a public handle (for `func_type` reflection).

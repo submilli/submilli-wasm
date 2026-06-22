@@ -36,7 +36,7 @@ impl Execution {
             Op::TableSize(t) => {
                 let handle = inner.instance(instance).tables[*t as usize];
                 let size = inner.table(handle).size();
-                self.push(Val::I32(size as i32));
+                self.push_index(inner.table(handle).ty.is_64(), size);
                 Ok(())
             }
             Op::TableFill(t) => self.table_fill(inner, instance, *t),
@@ -45,7 +45,7 @@ impl Execution {
     }
 
     fn table_get(&mut self, inner: &StoreInner, instance: Instance, table: u32) -> Result<()> {
-        let idx = u64::from(self.pop_i32() as u32);
+        let idx = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
         let r = inner.table(handle).get(idx).ok_or_else(oob)?;
         self.push(Val::from_ref(r));
@@ -54,7 +54,7 @@ impl Execution {
 
     fn table_set(&mut self, inner: &mut StoreInner, instance: Instance, table: u32) -> Result<()> {
         let val = self.pop().to_ref();
-        let idx = u64::from(self.pop_i32() as u32);
+        let idx = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
         if inner.table_mut(handle).set(idx, val) {
             Ok(())
@@ -64,9 +64,9 @@ impl Execution {
     }
 
     fn table_fill(&mut self, inner: &mut StoreInner, instance: Instance, table: u32) -> Result<()> {
-        let len = u64::from(self.pop_i32() as u32);
+        let len = self.pop_index();
         let val = self.pop().to_ref();
-        let dst = u64::from(self.pop_i32() as u32);
+        let dst = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
         if inner.table_mut(handle).fill(dst, val, len) {
             Ok(())
@@ -82,18 +82,19 @@ impl Execution {
         elem: u32,
         table: u32,
     ) -> Result<()> {
-        let len = self.pop().unwrap_i32() as u32 as usize;
-        let src = self.pop().unwrap_i32() as u32 as usize;
-        let dst = self.pop().unwrap_i32() as u32 as usize;
+        // The element segment is 32-bit (src/len are i32); only the table dst is index-typed (#42).
+        let len = u64::from(self.pop_i32() as u32);
+        let src = u64::from(self.pop_i32() as u32);
+        let dst = self.pop_index();
 
         let entity = inner.instance(instance);
         let handle = entity.tables[table as usize];
         // The element instance was evaluated once at instantiation (`elem.drop` empties it).
         let refs = entity.elems[elem as usize].clone();
 
-        let src_end = checked_range(src, len, refs.len())?;
-        let table_len = inner.table(handle).size() as usize;
-        checked_range(dst, len, table_len)?;
+        let src_end = checked_range(src, len, refs.len() as u64)?;
+        checked_range(dst, len, inner.table(handle).size())?;
+        let (dst, src, src_end) = (dst as usize, src as usize, src_end as usize);
         for (i, r) in refs[src..src_end].iter().enumerate() {
             inner.table_mut(handle).set((dst + i) as u64, r.clone());
         }
@@ -107,16 +108,17 @@ impl Execution {
         dst_table: u32,
         src_table: u32,
     ) -> Result<()> {
-        let len = self.pop().unwrap_i32() as u32 as usize;
-        let src = self.pop().unwrap_i32() as u32 as usize;
-        let dst = self.pop().unwrap_i32() as u32 as usize;
+        let len = self.pop_index();
+        let src = self.pop_index();
+        let dst = self.pop_index();
 
         let entity = inner.instance(instance);
         let dst_handle = entity.tables[dst_table as usize];
         let src_handle = entity.tables[src_table as usize];
 
-        let src_end = checked_range(src, len, inner.table(src_handle).size() as usize)?;
-        checked_range(dst, len, inner.table(dst_handle).size() as usize)?;
+        let src_end = checked_range(src, len, inner.table(src_handle).size())?;
+        checked_range(dst, len, inner.table(dst_handle).size())?;
+        let (dst, src, src_end) = (dst as usize, src as usize, src_end as usize);
         // Snapshot the source range so overlap (and two-table aliasing) is safe.
         let snapshot = inner.table(src_handle).elems[src..src_end].to_vec();
         for (i, r) in snapshot.into_iter().enumerate() {
@@ -126,8 +128,9 @@ impl Execution {
     }
 }
 
-/// Returns `start + len` if the whole range fits in `total`, else an OOB error.
-fn checked_range(start: usize, len: usize, total: usize) -> Result<usize> {
+/// Returns `start + len` if the whole range fits in `total`, else an OOB error. u64 so table64
+/// (#42) indices can't truncate before the bounds check; callers cast to `usize` after.
+fn checked_range(start: u64, len: u64, total: u64) -> Result<u64> {
     match start.checked_add(len) {
         Some(end) if end <= total => Ok(end),
         _ => Err(oob()),

@@ -215,13 +215,16 @@ fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Re
 
 fn check_memory(inner: &StoreInner, declared: &MemoryType, m: Memory) -> Result<()> {
     let entity = inner.memory(m);
-    // Current page count is the effective minimum (mirrors `check_table`).
-    if limits_ok(
-        entity.size_pages(),
-        entity.ty.maximum(),
-        declared.minimum(),
-        declared.maximum(),
-    ) {
+    // Current page count is the effective minimum (mirrors `check_table`). The index type
+    // (memory64 vs memory32, #42) must match exactly.
+    if entity.ty.is_64() == declared.is_64()
+        && limits_ok(
+            entity.size_pages(),
+            entity.ty.maximum(),
+            declared.minimum(),
+            declared.maximum(),
+        )
+    {
         Ok(())
     } else {
         Err(Error::msg("imported memory limits mismatch"))
@@ -242,6 +245,7 @@ fn check_table(
     // Import matching uses the table's *current size* as its effective minimum (a table
     // grown past its declared minimum still satisfies imports declaring that larger min).
     let ok = entity.ty.element() == declared.element()
+        && entity.ty.is_64() == declared.is_64()
         && limits_ok(
             entity.size(),
             entity.ty.maximum(),

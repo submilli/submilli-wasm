@@ -130,16 +130,17 @@ impl Execution {
                 self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::MemorySize(i) => {
-                let pages = inner.memory(mem(inner, instance, *i)).size_pages();
-                self.push(Val::I32(pages as i32));
+                let memory = mem(inner, instance, *i);
+                let pages = inner.memory(memory).size_pages();
+                self.push_index(inner.memory(memory).ty.is_64(), pages);
             }
             Op::MemoryFill(i) => {
-                let len = self.pop().unwrap_i32() as u32 as usize;
+                let len = self.pop_index();
                 let val = self.pop().unwrap_i32() as u8;
-                let dst = self.pop().unwrap_i32() as u32 as usize;
+                let dst = self.pop_index();
                 let bytes = &mut inner.memory_mut(mem(inner, instance, *i)).bytes;
-                let end = checked_range(dst, len, bytes.len())?;
-                bytes[dst..end].fill(val);
+                let end = checked_range(dst, len, bytes.len() as u64)?;
+                bytes[dst as usize..end as usize].fill(val);
             }
             Op::MemoryCopy(dst_i, src_i) => self.memory_copy(inner, instance, *dst_i, *src_i)?,
             Op::MemoryInit(seg, i) => self.memory_init(inner, instance, *seg, *i)?,
@@ -157,12 +158,13 @@ impl Execution {
         dst_i: u32,
         src_i: u32,
     ) -> Result<()> {
-        let len = self.pop().unwrap_i32() as u32 as usize;
-        let src = self.pop().unwrap_i32() as u32 as usize;
-        let dst = self.pop().unwrap_i32() as u32 as usize;
+        let len = self.pop_index();
+        let src = self.pop_index();
+        let dst = self.pop_index();
         let (dst_mem, src_mem) = (mem(inner, instance, dst_i), mem(inner, instance, src_i));
-        checked_range(src, len, inner.memory(src_mem).bytes.len())?;
-        checked_range(dst, len, inner.memory(dst_mem).bytes.len())?;
+        checked_range(src, len, inner.memory(src_mem).bytes.len() as u64)?;
+        checked_range(dst, len, inner.memory(dst_mem).bytes.len() as u64)?;
+        let (src, dst, len) = (src as usize, dst as usize, len as usize);
         if dst_i == src_i {
             inner
                 .memory_mut(dst_mem)
@@ -183,17 +185,18 @@ impl Execution {
         seg: u32,
         mem_i: u32,
     ) -> Result<()> {
-        let len = self.pop().unwrap_i32() as u32 as usize;
-        let src = self.pop().unwrap_i32() as u32 as usize;
-        let dst = self.pop().unwrap_i32() as u32 as usize;
+        let len = u64::from(self.pop_i32() as u32);
+        let src = u64::from(self.pop_i32() as u32);
+        let dst = self.pop_index();
         let entity = inner.instance(instance);
         let module = entity.module.clone();
         let dropped = entity.dropped_data[seg as usize];
         let data = &module.inner().datas[seg as usize].bytes;
         let data_len = if dropped { 0 } else { data.len() };
-        let src_end = checked_range(src, len, data_len)?;
+        let src_end = checked_range(src, len, data_len as u64)?;
         let mem = mem(inner, instance, mem_i);
-        checked_range(dst, len, inner.memory(mem).bytes.len())?;
+        checked_range(dst, len, inner.memory(mem).bytes.len() as u64)?;
+        let (dst, src, src_end, len) = (dst as usize, src as usize, src_end as usize, len as usize);
         inner.memory_mut(mem).bytes[dst..dst + len].copy_from_slice(&data[src..src_end]);
         Ok(())
     }
@@ -206,8 +209,8 @@ impl Execution {
         m: &MemArg,
     ) -> Result<(Memory, usize)> {
         let memory = mem(inner, instance, m.memory);
-        let addr = u64::from(self.pop().unwrap_i32() as u32);
-        let ea = addr.checked_add(u64::from(m.offset)).ok_or_else(oob)?;
+        let addr = self.pop_index();
+        let ea = addr.checked_add(m.offset).ok_or_else(oob)?;
         let end = ea.checked_add(N as u64).ok_or_else(oob)?;
         if end > inner.memory(memory).bytes.len() as u64 {
             return Err(oob());
@@ -240,8 +243,9 @@ impl Execution {
     }
 }
 
-/// Returns `start + len` if the whole range fits in `total`, else an OOB error.
-fn checked_range(start: usize, len: usize, total: usize) -> Result<usize> {
+/// Returns `start + len` if the whole range fits in `total`, else an OOB error. Operates in u64 so
+/// memory64 (#42) addresses can't truncate before the bounds check; callers cast to `usize` after.
+fn checked_range(start: u64, len: u64, total: u64) -> Result<u64> {
     match start.checked_add(len) {
         Some(end) if end <= total => Ok(end),
         _ => Err(oob()),

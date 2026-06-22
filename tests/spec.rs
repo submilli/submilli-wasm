@@ -56,13 +56,10 @@ enum Class {
 /// Decides whether to execute a whole file. In-file unsupported modules are caught
 /// per-module via the validation oracle ([`is_unsupported_module`]); here we only
 /// short-circuit whole files that are wholly out of scope (faster, cleaner summary).
-fn classify(path: &Path, text: &str) -> Class {
+fn classify(path: &Path, _text: &str) -> Class {
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     if name.starts_with("simd") {
         return Class::Skip("simd (out of scope)");
-    }
-    if text.contains("(memory i64") || text.contains("(table i64") {
-        return Class::Skip("memory64 (out of scope)");
     }
     Class::Run
 }
@@ -294,6 +291,10 @@ struct SpecContext {
     current_skipped: bool,
     named: HashMap<String, Instance>,
     skipped_names: HashSet<String>,
+    /// `(module definition $M …)` modules: validated/compiled but not yet instantiated, awaiting a
+    /// `(module instance $I $M)`. `last_def` is the most recent one (for an unnamed reference).
+    defs: HashMap<String, Module>,
+    last_def: Option<Module>,
 }
 
 impl SpecContext {
@@ -311,6 +312,8 @@ impl SpecContext {
             current_skipped: false,
             named: HashMap::new(),
             skipped_names: HashSet::new(),
+            defs: HashMap::new(),
+            last_def: None,
         }
     }
 
@@ -359,6 +362,12 @@ fn register_spectest(store: &mut Store<()>, linker: &mut Linker<()>) {
     let table_ty = TableType::new(RefType::new(true, HeapType::Func), 10, Some(20));
     let table = Table::new(&mut *store, table_ty, Ref::Func(None)).unwrap();
     linker.define(&*store, "spectest", "table", table).unwrap();
+    // 64-bit table for the table64 proposal (#42).
+    let table64_ty = TableType::new64(RefType::new(true, HeapType::Func), 10, Some(20));
+    let table64 = Table::new(&mut *store, table64_ty, Ref::Func(None)).unwrap();
+    linker
+        .define(&*store, "spectest", "table64", table64)
+        .unwrap();
 }
 
 fn run_directives(
@@ -371,6 +380,15 @@ fn run_directives(
     for directive in wast.directives {
         match directive {
             WastDirective::Module(quoted) => handle_module(ctx, quoted, file, failures, summary),
+            // `(module definition $M …)`: validate + compile, but do NOT instantiate (so a huge
+            // `(memory 65536)` definition allocates nothing); stored for a later `(module instance)`.
+            WastDirective::ModuleDefinition(quoted) => {
+                handle_module_def(ctx, quoted, file, failures, summary)
+            }
+            // `(module instance $I $M)`: instantiate a stored definition under a fresh instance name.
+            WastDirective::ModuleInstance {
+                instance, module, ..
+            } => handle_module_instance(ctx, instance, module, file, failures, summary),
             WastDirective::Invoke(invoke) => match invoke_export(ctx, &invoke) {
                 ExecResult::Vals(_) => summary.pass_assert(file),
                 ExecResult::Skip => summary.skip_assert(file),
@@ -499,6 +517,104 @@ fn handle_module(
         Err(e) => {
             failures.push(format!("{file}: instantiation failed: {e}"));
             ctx.set_current_skipped(name.as_deref());
+        }
+    }
+}
+
+/// Handles `(module definition …)`: validate + compile and stash the module (named and as
+/// `last_def`) without instantiating it. An unsupported one is skipped; a validated-but-uncompilable
+/// one is a real bug.
+fn handle_module_def(
+    ctx: &mut SpecContext,
+    mut quoted: QuoteWat<'_>,
+    file: &str,
+    failures: &mut Vec<String>,
+    summary: &mut Summary,
+) {
+    let name = quoted.name().map(|id| id.name().to_string());
+    let bytes = match encode(&mut quoted) {
+        Ok(b) => b,
+        Err(_) => {
+            return mark_def_skipped(
+                ctx,
+                summary,
+                file,
+                name.as_deref(),
+                "module failed to encode",
+            )
+        }
+    };
+    if let Some(reason) = unsupported_reason(ctx, &bytes) {
+        return mark_def_skipped(ctx, summary, file, name.as_deref(), &reason);
+    }
+    match Module::new(&ctx.engine, &bytes) {
+        Ok(m) => {
+            ctx.last_def = Some(m.clone());
+            if let Some(n) = name {
+                ctx.defs.insert(n, m);
+            }
+        }
+        Err(e) => {
+            failures.push(format!(
+                "{file}: definition validated but failed to compile: {e}"
+            ));
+            mark_def_skipped(ctx, summary, file, name.as_deref(), "compile failed");
+        }
+    }
+}
+
+fn mark_def_skipped(
+    ctx: &mut SpecContext,
+    summary: &mut Summary,
+    file: &str,
+    name: Option<&str>,
+    reason: &str,
+) {
+    summary.skip_module(file, reason);
+    ctx.last_def = None;
+    if let Some(n) = name {
+        ctx.skipped_names.insert(n.to_string());
+    }
+}
+
+/// Handles `(module instance $I $M)`: instantiate a stored definition (by name, or the most recent
+/// for an unnamed reference) under a fresh instance name. Generative — each instance is independent.
+fn handle_module_instance(
+    ctx: &mut SpecContext,
+    instance: Option<Id<'_>>,
+    module: Option<Id<'_>>,
+    file: &str,
+    failures: &mut Vec<String>,
+    summary: &mut Summary,
+) {
+    let inst_name = instance.map(|id| id.name().to_string());
+    let def = match module {
+        Some(id) if ctx.skipped_names.contains(id.name()) => None,
+        Some(id) => ctx.defs.get(id.name()).cloned(),
+        None => ctx.last_def.clone(),
+    };
+    let Some(def) = def else {
+        summary.skip_module(file, "instantiates a skipped module definition");
+        ctx.set_current_skipped(inst_name.as_deref());
+        return;
+    };
+    if !imports_available(ctx, &def) {
+        summary.skip_module(file, "imports a module that was skipped");
+        ctx.set_current_skipped(inst_name.as_deref());
+        return;
+    }
+    match ctx.linker.instantiate(&mut ctx.store, &def) {
+        Ok(inst) => {
+            summary.module_ok(file);
+            ctx.current = Some(inst);
+            ctx.current_skipped = false;
+            if let Some(n) = inst_name {
+                ctx.named.insert(n, inst);
+            }
+        }
+        Err(e) => {
+            failures.push(format!("{file}: instantiation failed: {e}"));
+            ctx.set_current_skipped(inst_name.as_deref());
         }
     }
 }
@@ -633,6 +749,21 @@ fn arg_to_val(store: &mut Store<()>, arg: &WastArg<'_>) -> Result<Val> {
             ty: AbstractHeapType::Func | AbstractHeapType::NoFunc,
             ..
         }) => Val::FuncRef(None),
+        // Null refs across the `any` hierarchy (GC) and the `exn` hierarchy (EH).
+        WastArgCore::RefNull(WastHeap::Abstract {
+            ty:
+                AbstractHeapType::Any
+                | AbstractHeapType::Eq
+                | AbstractHeapType::I31
+                | AbstractHeapType::Struct
+                | AbstractHeapType::Array
+                | AbstractHeapType::None,
+            ..
+        }) => Val::AnyRef(None),
+        WastArgCore::RefNull(WastHeap::Abstract {
+            ty: AbstractHeapType::Exn | AbstractHeapType::NoExn,
+            ..
+        }) => Val::ExnRef(None),
         _ => return Err(Error::msg("unsupported argument")),
     })
 }

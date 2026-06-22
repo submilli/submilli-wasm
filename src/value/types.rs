@@ -3,6 +3,7 @@
 use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
 use crate::value::gc_type::{ArrayType, StructType};
+use crate::value::tag_type::TagType;
 
 /// A wasm value type. (Public/boundary type — the serializable internal form is `canon::IrVal`.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -280,12 +281,14 @@ impl GlobalType {
     }
 }
 
-/// A table type: element reference type plus limits. (Boundary type; internal storage is IR.)
+/// A table type: element reference type plus limits and index width. (Boundary type; internal
+/// storage is IR.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TableType {
     element: RefType,
     minimum: u64,
     maximum: Option<u64>,
+    table64: bool,
 }
 
 impl TableType {
@@ -294,6 +297,16 @@ impl TableType {
             element,
             minimum: u64::from(min),
             maximum: max.map(u64::from),
+            table64: false,
+        }
+    }
+
+    pub fn new64(element: RefType, min: u64, max: Option<u64>) -> TableType {
+        TableType {
+            element,
+            minimum: min,
+            maximum: max,
+            table64: true,
         }
     }
 
@@ -308,23 +321,9 @@ impl TableType {
     pub fn maximum(&self) -> Option<u64> {
         self.maximum
     }
-}
 
-/// An exception tag type: the function type whose params are the exception's argument types
-/// (results are always empty). Identity at runtime is by store address (see [`Tag`](crate::Tag)),
-/// not by this type; this is the signature used for import matching and payload access.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct TagType {
-    func: FuncType,
-}
-
-impl TagType {
-    pub fn new(func: FuncType) -> TagType {
-        TagType { func }
-    }
-
-    pub fn ty(&self) -> &FuncType {
-        &self.func
+    pub fn is_64(&self) -> bool {
+        self.table64
     }
 }
 

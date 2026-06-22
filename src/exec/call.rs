@@ -47,7 +47,7 @@ impl Execution {
         table: u32,
         kind: CallKind,
     ) -> Result<StepOutcome> {
-        let idx = u64::from(self.pop_i32() as u32);
+        let idx = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
         let f = match inner.table(handle).get(idx) {
             Some(Ref::Func(Some(f))) => f,

@@ -125,7 +125,7 @@ impl Execution {
             Op::MemoryGrow(i) => {
                 // Routed through the driver so the (T-generic) limiter is consulted.
                 let memory = inner.instance(instance).memories[*i as usize];
-                let delta = u64::from(self.pop_i32() as u32);
+                let delta = self.pop_index();
                 return Ok(StepOutcome::DoGrow {
                     memory,
                     delta,
@@ -135,7 +135,7 @@ impl Execution {
             Op::TableGrow(t) => {
                 // Routed through the driver (limiter-consulted), like `memory.grow`.
                 let table = inner.instance(instance).tables[*t as usize];
-                let delta = u64::from(self.pop_i32() as u32);
+                let delta = self.pop_index();
                 let init = self.pop().to_ref();
                 return Ok(StepOutcome::DoTableGrow {
                     table,

@@ -48,6 +48,8 @@ pub(crate) fn enabled_features() -> WasmFeatures {
         | WasmFeatures::EXTENDED_CONST
         // More than one memory per module; every memory op carries an explicit index (#41).
         | WasmFeatures::MULTI_MEMORY
+        // 64-bit memories and tables (`i64` index type); one flag covers both (#42).
+        | WasmFeatures::MEMORY64
 }
 
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same

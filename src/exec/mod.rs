@@ -62,6 +62,26 @@ impl Execution {
         self.pop().unwrap_i32()
     }
 
+    /// Pops an index/length/address operand that is i32 (32-bit memory/table) or i64 (memory64/
+    /// table64, #42), widening to u64. Validation fixes the variant, so reading whichever int is
+    /// present is correct — the executor needn't know the entity's index width here.
+    fn pop_index(&mut self) -> u64 {
+        match self.pop() {
+            Val::I32(v) => u64::from(v as u32),
+            Val::I64(v) => v as u64,
+            _ => unreachable!("validated index operand is i32/i64"),
+        }
+    }
+
+    /// Pushes a size/grow result as i64 for a 64-bit memory/table, else i32 (#42).
+    fn push_index(&mut self, is_64: bool, v: u64) {
+        self.push(if is_64 {
+            Val::I64(v as i64)
+        } else {
+            Val::I32(v as u32 as i32)
+        });
+    }
+
     /// Estimated byte footprint of the wasm execution stacks, checked against
     /// `Config::max_wasm_stack` at each call to bound runaway recursion.
     fn stack_bytes(&self) -> usize {

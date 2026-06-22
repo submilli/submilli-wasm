@@ -69,7 +69,7 @@ pub(crate) fn conv_heaptype(kinds: &[AggKind], hty: wasmparser::HeapType) -> Res
 pub(super) fn memarg(m: wasmparser::MemArg) -> MemArg {
     MemArg {
         memory: m.memory,
-        offset: m.offset as u32,
+        offset: m.offset,
     }
 }
 
@@ -94,8 +94,9 @@ pub(crate) fn conv_globaltype(
 pub(crate) fn conv_tabletype(kinds: &[AggKind], tt: wasmparser::TableType) -> Result<IrTableType> {
     Ok(IrTableType {
         element: conv_reftype(kinds, tt.element_type)?,
-        min: tt.initial as u32,
-        max: tt.maximum.map(|m| m as u32),
+        min: tt.initial,
+        max: tt.maximum,
+        table64: tt.table64,
     })
 }
 

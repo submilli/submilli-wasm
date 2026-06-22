@@ -147,16 +147,27 @@ impl MemoryEntity {
         (self.bytes.len() / PAGE_SIZE) as u64
     }
 
-    /// Grows by `delta` pages; returns the previous page count, or `None` if it
-    /// would exceed the declared/architectural maximum.
+    /// Grows by `delta` pages; returns the previous page count, or `None` if it would exceed the
+    /// declared/architectural maximum **or** the host can't allocate it. The architectural ceiling
+    /// is the index width's (memory64 → 2^48 pages, #42), and the allocation is fallible
+    /// (`try_reserve_exact`) so an over-large guest grow returns -1 rather than OOM-aborting.
     pub(crate) fn grow(&mut self, delta: u64) -> Option<u64> {
         let old = self.size_pages();
         let new = old.checked_add(delta)?;
-        let max = self.ty.maximum().unwrap_or(MAX_PAGES).min(MAX_PAGES);
+        let arch_max = if self.ty.is_64() {
+            1u64 << 48
+        } else {
+            MAX_PAGES
+        };
+        let max = self.ty.maximum().unwrap_or(arch_max).min(arch_max);
         if new > max {
             return None;
         }
-        self.bytes.resize(new as usize * PAGE_SIZE, 0);
+        let new_bytes = (new as usize).checked_mul(PAGE_SIZE)?;
+        self.bytes
+            .try_reserve_exact(new_bytes.saturating_sub(self.bytes.len()))
+            .ok()?;
+        self.bytes.resize(new_bytes, 0);
         Some(old)
     }
 }
@@ -185,15 +196,23 @@ impl TableEntity {
         }
     }
 
-    /// Grows by `delta` elements (filled with `init`); returns the previous size,
-    /// or `None` if it would exceed the declared maximum.
+    /// Grows by `delta` elements (filled with `init`); returns the previous size, or `None` if it
+    /// would exceed the declared/architectural maximum **or** the host can't allocate it. table64
+    /// (#42) lifts the architectural ceiling to `u64::MAX`; the allocation is fallible so an
+    /// over-large guest grow returns -1 rather than OOM-aborting.
     pub(crate) fn grow(&mut self, delta: u64, init: Ref) -> Option<u64> {
         let old = self.size();
         let new = old.checked_add(delta)?;
-        let max = self.ty.maximum().unwrap_or(u64::from(u32::MAX));
+        let arch_max = if self.ty.is_64() {
+            u64::MAX
+        } else {
+            u64::from(u32::MAX)
+        };
+        let max = self.ty.maximum().unwrap_or(arch_max).min(arch_max);
         if new > max {
             return None;
         }
+        self.elems.try_reserve_exact(delta as usize).ok()?;
         self.elems.resize(new as usize, init);
         Some(old)
     }
