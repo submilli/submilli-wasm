@@ -133,6 +133,11 @@ impl<T: 'static> Store<T> {
         self.inner.engine()
     }
 
+    /// The number of bytes backing the store's GC heap (mirrors `wasmtime::Store::gc_heap_capacity`).
+    pub fn gc_heap_capacity(&self) -> usize {
+        self.inner.gc.byte_size()
+    }
+
     /// Throws `exception` from a host function so the guest's `try_table` can catch it (#28g).
     /// Returns `Err(ThrownException)`; the generic result lets it slot into any host-fn return type.
     pub fn throw<R>(

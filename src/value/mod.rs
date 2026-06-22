@@ -7,6 +7,7 @@ mod gc_type;
 mod rec_group;
 mod ref_const;
 mod tag_type;
+mod type_access;
 mod types;
 mod val;
 

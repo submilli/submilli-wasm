@@ -155,6 +155,12 @@ pub(crate) struct GcHeap {
 }
 
 impl GcHeap {
+    /// Bytes currently backing live GC objects (the heap is allocate-only under the null
+    /// collector, so this is everything allocated so far). Wasmtime's `Store::gc_heap_capacity`.
+    pub(crate) fn byte_size(&self) -> usize {
+        self.used_bytes
+    }
+
     /// Creates a heap whose byte ceiling is `threshold` (else [`DEFAULT_GC_HEAP_LIMIT`]).
     pub(crate) fn new(threshold: Option<usize>) -> Self {
         GcHeap {

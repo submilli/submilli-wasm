@@ -49,7 +49,7 @@ pub(crate) struct StoreInner {
     externrefs: ExternRefs,
     /// Managed `struct`/`array` objects; `Rooted<AnyRef>` slot handles index here.
     /// Allocate-only (null collector); reclamation comes with a tracing collector.
-    gc: GcHeap,
+    pub(crate) gc: GcHeap,
     /// Canonical type ids of host-allocated GC objects, each pinned with one type-registration
     /// (decref'd on store drop) so a host object outliving its `StructType` handle keeps its type
     /// (#27i; mirrors wasmtime's `gc_host_alloc_types`).
