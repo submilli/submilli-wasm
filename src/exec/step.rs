@@ -197,6 +197,8 @@ impl Execution {
                     return Ok(StepOutcome::Advance(ip));
                 }
             }
+            #[cfg(feature = "simd")]
+            Op::Simd(s) => self.exec_simd(inner, s, instance)?,
             // Straight-line GC + numerics: exec_gc → exec_gc_array → exec_cast → exec_numeric.
             other => self.exec_gc(inner, other, instance)?,
         }

@@ -12,6 +12,9 @@ name = "submilli_wasm"
 [features]
 default = []
 async = ["dep:async-trait"]
+# Fixed-width SIMD (`v128`, #37). Off by default to keep the SIMD-free build's
+# compile time / binary size lean; enable for the full Wasm-3.0 surface.
+simd = []
 
 [dependencies]
 wasmparser = "0.252"
@@ -54,3 +57,5 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
 cast_lossless = "allow"
+# wasm `f32x4.convert_i32x4` etc. are defined to round — precision loss is the semantics (#37).
+cast_precision_loss = "allow"

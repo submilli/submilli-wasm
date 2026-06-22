@@ -37,6 +37,8 @@ pub(crate) fn eval_const(inner: &mut StoreInner, ctx: &ConstCtx<'_>, e: &ConstEx
             ConstOp::I64(v) => Val::I64(*v),
             ConstOp::F32(v) => Val::F32(*v),
             ConstOp::F64(v) => Val::F64(*v),
+            #[cfg(feature = "simd")]
+            ConstOp::V128(v) => Val::V128(crate::value::V128::from(*v)),
             ConstOp::RefNull(heap) => Val::null_for_heap(heap),
             ConstOp::RefFunc(i) => Val::FuncRef(Some(ctx.funcs[*i as usize])),
             ConstOp::GlobalGet(g) => inner.global(ctx.globals[*g as usize]).value,

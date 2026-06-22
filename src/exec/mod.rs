@@ -16,6 +16,8 @@ mod memory;
 mod numeric;
 mod outcome;
 mod ref_;
+#[cfg(feature = "simd")]
+mod simd;
 mod step;
 mod table;
 pub(crate) mod trace;

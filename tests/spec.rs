@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 use std::any::Any;
 use submilli_wasm::{
     Engine, Error, ExternRef, Global, GlobalType, HeapType, Instance, Linker, Memory, MemoryType,
-    Module, Mutability, Ref, RefType, Result, Store, Table, TableType, Val, ValType,
+    Module, Mutability, Ref, RefType, Result, Store, Table, TableType, Val, ValType, V128,
 };
 
-use wast::core::{NanPattern, WastArgCore, WastRetCore};
+use wast::core::{NanPattern, V128Pattern, WastArgCore, WastRetCore};
 use wast::parser::{self, ParseBuffer};
 use wast::token::{Id, F32, F64};
 use wast::{QuoteWat, Wast, WastArg, WastDirective, WastExecute, WastInvoke, WastRet};
@@ -58,9 +58,11 @@ enum Class {
 /// short-circuit whole files that are wholly out of scope (faster, cleaner summary).
 fn classify(path: &Path, _text: &str) -> Class {
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    #[cfg(not(feature = "simd"))]
     if name.starts_with("simd") {
         return Class::Skip("simd (out of scope)");
     }
+    let _ = name;
     Class::Run
 }
 
@@ -737,6 +739,7 @@ fn arg_to_val(store: &mut Store<()>, arg: &WastArg<'_>) -> Result<Val> {
         WastArgCore::I64(x) => Val::I64(*x),
         WastArgCore::F32(f) => Val::F32(f.bits),
         WastArgCore::F64(f) => Val::F64(f.bits),
+        WastArgCore::V128(c) => Val::V128(V128::from(u128::from_le_bytes(c.to_le_bytes()))),
         // The host wraps `(ref.extern N)` / `(ref.host N)` as an externref carrying `N`.
         WastArgCore::RefExtern(n) | WastArgCore::RefHost(n) => {
             Val::ExternRef(Some(ExternRef::new(store, *n)?))
@@ -782,6 +785,7 @@ fn ret_core_matches(store: &Store<()>, actual: &Val, expected: &WastRetCore<'_>)
         WastRetCore::I64(x) => actual.i64() == Some(*x),
         WastRetCore::F32(p) => matches!(actual, Val::F32(bits) if f32_matches(*bits, p)),
         WastRetCore::F64(p) => matches!(actual, Val::F64(bits) if f64_matches(*bits, p)),
+        WastRetCore::V128(p) => v128_matches(actual, p),
         WastRetCore::RefNull(_) => matches!(
             actual,
             Val::FuncRef(None) | Val::ExternRef(None) | Val::AnyRef(None) | Val::ExnRef(None)
@@ -814,6 +818,40 @@ fn ret_core_matches(store: &Store<()>, actual: &Val, expected: &WastRetCore<'_>)
         | WastRetCore::RefAny => matches!(actual, Val::AnyRef(Some(_))),
         WastRetCore::Either(opts) => opts.iter().any(|o| ret_core_matches(store, actual, o)),
         _ => false,
+    }
+}
+
+/// Compares an actual `v128` against an expected lane pattern: integer lanes exactly, float lanes
+/// via the per-lane NaN pattern (reusing `f32_matches`/`f64_matches`).
+fn v128_matches(actual: &Val, pat: &V128Pattern) -> bool {
+    let Val::V128(v) = actual else {
+        return false;
+    };
+    let b = v.as_u128().to_le_bytes();
+    let i16l = |i: usize| i16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
+    let i32l = |i: usize| i32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    let u32l = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+    let i64l = |i: usize| {
+        let o = 8 * i;
+        i64::from_le_bytes([
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
+        ])
+    };
+    let u64l = |i: usize| i64l(i) as u64;
+    match pat {
+        V128Pattern::I8x16(l) => (0..16).all(|i| b[i] as i8 == l[i]),
+        V128Pattern::I16x8(l) => (0..8).all(|i| i16l(i) == l[i]),
+        V128Pattern::I32x4(l) => (0..4).all(|i| i32l(i) == l[i]),
+        V128Pattern::I64x2(l) => (0..2).all(|i| i64l(i) == l[i]),
+        V128Pattern::F32x4(p) => (0..4).all(|i| f32_matches(u32l(i), &p[i])),
+        V128Pattern::F64x2(p) => (0..2).all(|i| f64_matches(u64l(i), &p[i])),
     }
 }
 

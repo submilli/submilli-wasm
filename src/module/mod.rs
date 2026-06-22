@@ -5,6 +5,8 @@ pub(crate) mod debug;
 pub(crate) mod handler;
 pub(crate) mod inner;
 pub(crate) mod op;
+#[cfg(feature = "simd")]
+pub(crate) mod op_simd;
 pub(crate) mod parse;
 mod serialize;
 mod typesec;
@@ -50,6 +52,18 @@ pub(crate) fn enabled_features() -> WasmFeatures {
         | WasmFeatures::MULTI_MEMORY
         // 64-bit memories and tables (`i64` index type); one flag covers both (#42).
         | WasmFeatures::MEMORY64
+        // Fixed-width SIMD (`v128`), gated behind the `simd` Cargo feature (#37).
+        | simd_features()
+}
+
+#[cfg(feature = "simd")]
+fn simd_features() -> WasmFeatures {
+    WasmFeatures::SIMD
+}
+
+#[cfg(not(feature = "simd"))]
+fn simd_features() -> WasmFeatures {
+    WasmFeatures::empty()
 }
 
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same

@@ -249,7 +249,6 @@ pub(crate) enum Op {
     F64Min,
     F64Max,
     F64Copysign,
-
     // --- conversions ---
     I32WrapI64,
     I32TruncF32S,
@@ -276,14 +275,12 @@ pub(crate) enum Op {
     I64ReinterpretF64,
     F32ReinterpretI32,
     F64ReinterpretI64,
-
     // --- sign-extension ops ---
     I32Extend8S,
     I32Extend16S,
     I64Extend8S,
     I64Extend16S,
     I64Extend32S,
-
     // --- saturating float-to-int ---
     I32TruncSatF32S,
     I32TruncSatF32U,
@@ -376,6 +373,9 @@ pub(crate) enum Op {
         nullable: bool,
         target: BranchTarget,
     },
+    /// Fixed-width SIMD (`v128`, #37); the ~236 vector ops live in [`SimdOp`](super::op_simd::SimdOp).
+    #[cfg(feature = "simd")]
+    Simd(super::op_simd::SimdOp),
 }
 
 /// A function compiled to internal bytecode.

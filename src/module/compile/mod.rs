@@ -11,6 +11,8 @@ mod gc;
 mod memory;
 mod numeric;
 mod ref_;
+#[cfg(feature = "simd")]
+mod simd;
 mod table;
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -163,6 +165,14 @@ impl<'a> Translator<'a> {
         self.emit(op);
     }
 
+    /// pop 3, push 1 (`v128.bitselect`).
+    #[cfg(feature = "simd")]
+    fn ternary(&mut self, op: Op) {
+        self.pop(3);
+        self.push(1);
+        self.emit(op);
+    }
+
     /// Translates a straight-line (non-control) operator: core stack ops (constants,
     /// parametric, variable) inline; memory, table/ref, and numeric by category module.
     #[allow(clippy::too_many_lines)] // mostly the flat memory/table routing groups
@@ -278,6 +288,10 @@ impl<'a> Translator<'a> {
             | W::RefEq
             | W::AnyConvertExtern
             | W::ExternConvertAny => self.translate_gc(op)?,
+
+            // --- SIMD (v128) → simd module (feature-gated, #37) ---
+            #[cfg(feature = "simd")]
+            _ if self.translate_simd(op) => {}
 
             // --- numeric / comparison / conversion / sign-ext / saturating / nop ---
             _ => self.translate_numeric(op)?,

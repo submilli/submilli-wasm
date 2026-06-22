@@ -30,8 +30,7 @@ fn wp_err(e: BinaryReaderError) -> Error {
 }
 
 /// Decodes and compiles a (pre-validated) wasm binary into a [`ModuleInner`]. Debug retention is
-/// driven by the engine's config (#29c): `wasm_backtrace` keeps the per-`Op` offset table + `name`
-/// section; `retain_dwarf` (from `debug_info`/`wasm_backtrace_details`) keeps the `.debug_*` bytes.
+/// driven by the engine's config (#29c): the per-`Op` offsets + `name` section, and `.debug_*` bytes.
 pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner> {
     let keep_offsets = engine.wasm_backtrace_enabled();
     let keep_dwarf = engine.retain_dwarf();
@@ -296,14 +295,15 @@ fn parse_const_expr(kinds: &[AggKind], expr: &wasmparser::ConstExpr<'_>) -> Resu
     Ok(ConstExpr(ops.into_boxed_slice()))
 }
 
-/// Maps one operator of a constant expression to a [`ConstOp`]; `None` marks the terminating `end`.
-/// An unrecognized operator becomes a readable `unsupported constant expression` skip.
+/// Maps one const-expression operator to a [`ConstOp`]; `None` marks the terminating `end`.
 fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>> {
     Ok(Some(match *op {
         Operator::I32Const { value } => ConstOp::I32(value),
         Operator::I64Const { value } => ConstOp::I64(value),
         Operator::F32Const { value } => ConstOp::F32(value.bits()),
         Operator::F64Const { value } => ConstOp::F64(value.bits()),
+        #[cfg(feature = "simd")]
+        Operator::V128Const { value } => ConstOp::V128(u128::from_le_bytes(*value.bytes())),
         Operator::RefNull { hty } => ConstOp::RefNull(conv_reftype_heap(kinds, hty)?),
         Operator::RefFunc { function_index } => ConstOp::RefFunc(function_index),
         Operator::GlobalGet { global_index } => ConstOp::GlobalGet(global_index),

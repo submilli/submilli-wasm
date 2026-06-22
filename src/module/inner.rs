@@ -209,6 +209,9 @@ pub(crate) enum ConstOp {
     I64(i64),
     F32(u32),
     F64(u64),
+    /// `v128.const` literal bits (#37).
+    #[cfg(feature = "simd")]
+    V128(u128),
     RefNull(IrHeap),
     RefFunc(u32),
     /// `global.get` of an imported or prior-defined immutable global (guaranteed by validation).

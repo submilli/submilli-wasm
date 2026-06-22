@@ -218,7 +218,7 @@ impl Execution {
         Ok((memory, ea as usize))
     }
 
-    fn load_n<const N: usize>(
+    pub(super) fn load_n<const N: usize>(
         &mut self,
         inner: &StoreInner,
         instance: Instance,
@@ -230,7 +230,7 @@ impl Execution {
         Ok(buf)
     }
 
-    fn store_n<const N: usize>(
+    pub(super) fn store_n<const N: usize>(
         &mut self,
         inner: &mut StoreInner,
         instance: Instance,

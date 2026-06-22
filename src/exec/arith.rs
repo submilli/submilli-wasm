@@ -12,7 +12,7 @@ use crate::Result;
 const CANON_F32: u32 = 0x7fc0_0000;
 const CANON_F64: u64 = 0x7ff8_0000_0000_0000;
 
-fn canon_f32(r: f32, had_nan: bool) -> f32 {
+pub(super) fn canon_f32(r: f32, had_nan: bool) -> f32 {
     if r.is_nan() && !had_nan {
         f32::from_bits(CANON_F32)
     } else {
@@ -20,7 +20,7 @@ fn canon_f32(r: f32, had_nan: bool) -> f32 {
     }
 }
 
-fn canon_f64(r: f64, had_nan: bool) -> f64 {
+pub(super) fn canon_f64(r: f64, had_nan: bool) -> f64 {
     if r.is_nan() && !had_nan {
         f64::from_bits(CANON_F64)
     } else {
