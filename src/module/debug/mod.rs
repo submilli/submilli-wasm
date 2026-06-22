@@ -11,6 +11,7 @@
 //! `FrameInfo`/`FrameSymbol` surface that consumes this lands in #29b; throw-time capture that
 //! supplies the offsets is #29d.
 
+mod func;
 mod line;
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -21,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 
 use wasmparser::{BinaryReader, Name, NameSectionReader};
 
+use self::func::FuncTable;
 use self::line::LineTable;
 
 /// A resolved source location for a wasm code offset.
@@ -46,6 +48,9 @@ pub(crate) struct DebugSections {
     /// after deserialize, so it is not part of the artifact.
     #[serde(skip)]
     index: OnceLock<Option<LineTable>>,
+    /// Lazily-built subprogram-name table (DWARF); rebuilt from `dwarf` like `index`.
+    #[serde(skip)]
+    funcs: OnceLock<Option<FuncTable>>,
 }
 
 impl DebugSections {
@@ -79,6 +84,15 @@ impl DebugSections {
     /// The name of the function at `func_index`, from the `name` section, if present.
     pub(crate) fn func_name(&self, func_index: u32) -> Option<&str> {
         self.func_names.get(&func_index).map(|s| &**s)
+    }
+
+    /// The name of the subprogram covering an absolute (module-relative) `code_offset`, from DWARF.
+    /// The fallback when there is no wasm `name` section (matches wasmtime's DWARF-backed frame
+    /// names); builds the subprogram index on first call, like [`lookup`](Self::lookup).
+    pub(crate) fn dwarf_func_name(&self, code_offset: u32) -> Option<Arc<str>> {
+        let table = self.funcs.get_or_init(|| func::build(&self.dwarf));
+        let addr = code_offset.checked_sub(self.code_base)?;
+        table.as_ref()?.lookup(addr)
     }
 
     /// Resolves an absolute (module-relative) wasm code offset to a source location, building the

@@ -124,7 +124,9 @@ impl Execution {
             if fuel_enabled {
                 match inner.consume_fuel_step() {
                     FuelStep::Ran => {}
-                    FuelStep::Exhausted => return Err(Trap::OutOfFuel.into()),
+                    FuelStep::Exhausted => {
+                        return Err(self.attach_trap_backtrace(inner, Trap::OutOfFuel.into(), ip))
+                    }
                     FuelStep::NeedYield => {
                         #[cfg(feature = "async")]
                         {
@@ -133,7 +135,7 @@ impl Execution {
                         }
                         // Unreachable without async (an interval needs an async store); stays total.
                         #[cfg(not(feature = "async"))]
-                        return Err(Trap::OutOfFuel.into());
+                        return Err(self.attach_trap_backtrace(inner, Trap::OutOfFuel.into(), ip));
                     }
                 }
             }
@@ -149,7 +151,11 @@ impl Execution {
                 Ok(StepOutcome::Advance(next)) => ip = next,
                 Ok(StepOutcome::DoCall(req)) => {
                     if self.stack_bytes() >= stack_limit {
-                        return Err(Trap::StackOverflow.into());
+                        return Err(self.attach_trap_backtrace(
+                            inner,
+                            Trap::StackOverflow.into(),
+                            ip,
+                        ));
                     }
                     self.frames.last_mut().expect("caller frame").ip = req.return_ip;
                     self.push_call(req.instance, req.func_index, req.code.clone());

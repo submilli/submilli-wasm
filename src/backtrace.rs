@@ -136,14 +136,20 @@ impl FrameInfo {
 
     fn build_symbols(&self) -> Box<[FrameSymbol]> {
         let debug = &self.module.inner().debug;
-        let name = debug.func_name(self.func_index);
+        // Prefer the `name` section (func-index-keyed, exact); fall back to the DWARF subprogram
+        // name at this offset, so modules shipping only DWARF (no `name` section) still get names —
+        // matching wasmtime's `wasm_backtrace_details`.
+        let name = debug
+            .func_name(self.func_index)
+            .map(Arc::from)
+            .or_else(|| self.code_offset.and_then(|o| debug.dwarf_func_name(o)));
         let loc = self.code_offset.and_then(|o| debug.lookup(o));
         if name.is_none() && loc.is_none() {
             return Box::new([]);
         }
         let nonzero = |v: u32| (v != 0).then_some(v);
         Box::new([FrameSymbol {
-            name: name.map(Arc::from),
+            name,
             file: loc.as_ref().map(|l| Arc::clone(&l.file)),
             line: loc.as_ref().and_then(|l| nonzero(l.line)),
             column: loc.as_ref().and_then(|l| nonzero(l.column)),
