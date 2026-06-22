@@ -6,6 +6,7 @@
 mod arith;
 mod call;
 mod cast;
+mod cell;
 mod convert;
 mod exn;
 mod frame;
@@ -40,7 +41,7 @@ use outcome::{CallReq, ResolvedCall, StepOutcome};
 /// suspend, so it can be *parked* between resumptions — the basis for async,
 /// where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
 struct Execution {
-    values: Vec<Val>,
+    values: Vec<cell::Cell>,
     frames: Vec<Frame>,
 }
 
@@ -52,49 +53,18 @@ const _: fn() = || {
 };
 
 impl Execution {
-    fn push(&mut self, v: Val) {
-        self.values.push(v);
-    }
-
-    fn pop(&mut self) -> Val {
-        self.values.pop().expect("operand stack underflow")
-    }
-
-    fn pop_i32(&mut self) -> i32 {
-        self.pop().unwrap_i32()
-    }
-
-    /// Pops an index/length/address operand that is i32 (32-bit memory/table) or i64 (memory64/
-    /// table64, #42), widening to u64. Validation fixes the variant, so reading whichever int is
-    /// present is correct — the executor needn't know the entity's index width here.
-    fn pop_index(&mut self) -> u64 {
-        match self.pop() {
-            Val::I32(v) => u64::from(v as u32),
-            Val::I64(v) => v as u64,
-            _ => unreachable!("validated index operand is i32/i64"),
-        }
-    }
-
-    /// Pushes a size/grow result as i64 for a 64-bit memory/table, else i32 (#42).
-    fn push_index(&mut self, is_64: bool, v: u64) {
-        self.push(if is_64 {
-            Val::I64(v as i64)
-        } else {
-            Val::I32(v as u32 as i32)
-        });
-    }
-
     /// Estimated byte footprint of the wasm execution stacks, checked against
-    /// `Config::max_wasm_stack` at each call to bound runaway recursion.
+    /// `Config::max_wasm_stack` at each call to bound runaway recursion. An operand slot is now a
+    /// fixed-width untyped [`cell::Cell`] (8 or 16 bytes; see `cell`), not the ~32-byte `Val`.
     fn stack_bytes(&self) -> usize {
-        self.values.len() * std::mem::size_of::<Val>()
+        self.values.len() * std::mem::size_of::<cell::Cell>()
             + self.frames.len() * std::mem::size_of::<Frame>()
     }
 
     fn push_call(&mut self, instance: Instance, func_index: u32, code: Arc<CompiledFunc>) {
         let locals_base = self.values.len() as u32 - code.n_params;
         for ty in &code.local_types {
-            self.values.push(Val::default_for(ty));
+            self.push(Val::default_for(ty));
         }
         self.frames.push(Frame {
             code,

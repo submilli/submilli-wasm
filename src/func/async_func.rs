@@ -62,6 +62,7 @@ impl Func {
 
     /// Async sibling of [`call`](Func::call): drives the call as a `Future`. Requires an
     /// async store; awaits async host callees.
+    #[allow(clippy::too_many_lines)] // three-arm callee dispatch; arms are short
     pub async fn call_async(
         &self,
         mut store: impl AsContextMut,
@@ -87,12 +88,19 @@ impl Func {
                     .module
                     .inner()
                     .compiled(func_index);
+                let result_tys: Vec<crate::value::ValType> = ty.results().collect();
+                let args = crate::extern_::coerce_args(
+                    &mut store.as_context_mut().store_mut().inner,
+                    params,
+                    &ty,
+                )?;
                 crate::exec::host::execute_async(
                     store.as_context_mut().store_mut(),
                     instance,
                     func_index,
                     code,
-                    params.to_vec(),
+                    args,
+                    &result_tys,
                 )
                 .await?
             }

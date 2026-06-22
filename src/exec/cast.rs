@@ -3,8 +3,8 @@
 //! belongs to a target heap type — abstract hierarchies by kind, concrete types by canonical-id
 //! subtyping against the engine registry.
 
-use super::Execution;
-use crate::canon::{AggKind, CanonicalTypeId, IrHeap};
+use super::{cell, Execution};
+use crate::canon::{AggKind, CanonicalTypeId, IrHeap, RefKind};
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::{decode_anyref_handle, AnyRefHandle, FuncEntity, ObjKind, StoreInner};
@@ -23,13 +23,13 @@ impl Execution {
     ) -> Result<()> {
         match op {
             Op::RefTest { ty, nullable } => {
-                let r = self.pop();
+                let r = self.pop_ref(cell::refkind_of_irheap(ty));
                 let hit = matches_heaptype(inner, instance, &r, ty, *nullable);
                 self.push(Val::I32(i32::from(hit)));
                 Ok(())
             }
             Op::RefCast { ty, nullable } => {
-                let r = self.pop();
+                let r = self.pop_ref(cell::refkind_of_irheap(ty));
                 if matches_heaptype(inner, instance, &r, ty, *nullable) {
                     self.push(r);
                     Ok(())
@@ -38,19 +38,19 @@ impl Execution {
                 }
             }
             Op::RefEq => {
-                let b = self.pop();
-                let a = self.pop();
+                let b = self.pop_anyref();
+                let a = self.pop_anyref();
                 self.push(Val::I32(i32::from(ref_eq(&a, &b))));
                 Ok(())
             }
             Op::AnyConvertExtern => {
-                let e = self.pop();
+                let e = self.pop_ref(RefKind::Extern);
                 let a = inner.any_convert_extern(e)?;
                 self.push(a);
                 Ok(())
             }
             Op::ExternConvertAny => {
-                let a = self.pop();
+                let a = self.pop_anyref();
                 self.push(inner.extern_convert_any(a));
                 Ok(())
             }
@@ -82,7 +82,7 @@ impl Execution {
             } => (ty, *nullable, target),
             _ => unreachable!("not a br_on_cast op"),
         };
-        let r = self.pop();
+        let r = self.pop_ref(cell::refkind_of_irheap(ty));
         let matched = matches_heaptype(inner, instance, &r, ty, nullable);
         self.push(r);
         if matched ^ on_fail {

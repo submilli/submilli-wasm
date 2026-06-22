@@ -141,6 +141,8 @@ is why the collector subtask (#27g) is sequenced after the feature set.
 - **Final (after the mark-sweep upgrade):** collection reclaims garbage including cycles; a stale `GcHandle` reused after sweep faults via the generation check; the suite still passes under `Collector::Auto`.
 - ⚠️ Audit: no relative/canonical type-index confusion (the CVE-2024-12053 class).
 
+**Open design decision (operand-slot root location).** The operand stack is now a fixed-width *untyped* `Cell` byte slot (`cfg`-sized **8 B SIMD-off / 16 B SIMD-on**), ~4× smaller than `Vec<Val>` — landed under **#27j** (ARCHITECTURE §7). It dropped the on-stack `Val` tag that makes GC root enumeration *free*, so the mark-sweep collector (**#27g**) must recover operand-stack roots via **either** a runtime per-slot byte-shadow **or** compile-time `(func, ip)` stack maps. **Decide before #27g implements root enumeration** so the collector isn't built against the old tagged-stack assumption and reworked. (The 8-byte-cell soundness prerequisite — no `v128` value type without `simd` — needed no code change; wasmparser validation already rejects it.)
+
 **Risks:** canonicalization is the hard part; the relative-vs-canonical index hazard is a security-critical correctness bug. Get root enumeration exhaustive — a missed root frees a live object; when in doubt, scan conservatively (the safe direction).
 
 ---

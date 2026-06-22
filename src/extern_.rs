@@ -5,10 +5,12 @@
 
 use crate::func::Func;
 use crate::store::{
-    AsContext, AsContextMut, GlobalEntity, MemoryEntity, StoreContext, StoreContextMut,
+    AsContext, AsContextMut, GlobalEntity, MemoryEntity, StoreContext, StoreContextMut, StoreInner,
     TableEntity, TagEntity,
 };
-use crate::value::{GlobalType, MemoryType, Mutability, Ref, TableType, TagType, Val, ValType};
+use crate::value::{
+    FuncType, GlobalType, HeapType, MemoryType, Mutability, Ref, TableType, TagType, Val, ValType,
+};
 use crate::{Error, Result};
 
 /// An external value importable into / exportable from a module.
@@ -340,6 +342,47 @@ pub(crate) fn val_matches(val: &Val, ty: &ValType) -> bool {
                 Val::FuncRef(_) | Val::ExternRef(_) | Val::AnyRef(_) | Val::ExnRef(_),
                 ValType::Ref(_),
             )
+    )
+}
+
+/// Reconciles host-provided reference arguments with their parameter's hierarchy before a wasm
+/// call. The lenient [`val_matches`] admits any reference into any reference slot — in particular a
+/// host externref (e.g. a `ref.host`) into an `anyref` parameter. The untyped operand stack stores
+/// only a bare handle, so such a *cross-hierarchy* host ref must be internalized up front (it would
+/// otherwise be misread against the anyref/GC arena instead of the externref one). Same-hierarchy
+/// arguments pass through untouched. See ARCHITECTURE §6.
+pub(crate) fn coerce_args(
+    inner: &mut StoreInner,
+    params: &[Val],
+    ty: &FuncType,
+) -> Result<Vec<Val>> {
+    params
+        .iter()
+        .zip(ty.params())
+        .map(|(&v, pty)| coerce_arg(inner, v, &pty))
+        .collect()
+}
+
+fn coerce_arg(inner: &mut StoreInner, v: Val, ty: &ValType) -> Result<Val> {
+    match (v, ty) {
+        (Val::ExternRef(Some(_)), ValType::Ref(rt)) if is_any_hierarchy(rt.heap_type()) => {
+            inner.any_convert_extern(v)
+        }
+        _ => Ok(v),
+    }
+}
+
+/// Whether a heap type belongs to the `any` hierarchy (i.e. not `func`/`extern`/`exn`).
+fn is_any_hierarchy(h: &HeapType) -> bool {
+    !matches!(
+        h,
+        HeapType::Func
+            | HeapType::NoFunc
+            | HeapType::ConcreteFunc(_)
+            | HeapType::Extern
+            | HeapType::NoExtern
+            | HeapType::Exn
+            | HeapType::NoExn
     )
 }
 

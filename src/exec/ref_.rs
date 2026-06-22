@@ -28,15 +28,15 @@ impl Execution {
             }
             Op::RefIsNull => {
                 let r = self.pop();
-                self.push(Val::I32(i32::from(r.is_null_ref())));
+                self.push(Val::I32(i32::from(r.is_null())));
                 Ok(())
             }
             Op::RefAsNonNull => {
                 let r = self.pop();
-                if r.is_null_ref() {
+                if r.is_null() {
                     return Err(Trap::NullReference.into());
                 }
-                self.push(r);
+                self.push_cell(r);
                 Ok(())
             }
             _ => Err(Error::msg(format!("not a ref op: {op:?}"))),

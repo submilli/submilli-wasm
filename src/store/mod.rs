@@ -19,7 +19,7 @@ pub(crate) use gc::{
     GcObject, ObjKind,
 };
 pub(crate) use gc_codec::{
-    default_for_slot, read_slot, read_slot_packed, slot_accepts, write_slot,
+    default_for_slot, read_slot, read_slot_packed, slot_accepts, write_slot, NULL_REF,
 };
 pub(crate) use inner::{FuelStep, StoreInner};
 #[cfg(feature = "async")]

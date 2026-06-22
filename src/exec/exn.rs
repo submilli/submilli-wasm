@@ -3,6 +3,7 @@
 //! loop intercepts it for handler search, and at the embedder boundary it becomes the public
 //! [`ThrownException`] with the `exnref` parked on the store's pending slot.
 
+use crate::canon::RefKind;
 use crate::exception::ThrownException;
 use crate::extern_::Tag;
 use crate::instance::Instance;
@@ -10,11 +11,11 @@ use crate::module::handler::HandlerRec;
 use crate::module::op::CompiledFunc;
 use crate::store::{ExnEntity, StoreInner};
 use crate::trap::Trap;
-use crate::value::{ExnRef, Rooted, Val};
+use crate::value::{ExnRef, Rooted, Val, ValType};
 use crate::{Error, Result};
 
 use super::outcome::StepOutcome;
-use super::Execution;
+use super::{cell, Execution};
 
 /// An exception in flight: a handle to the store's exception instance, carried inside `crate::Error`
 /// as it unwinds. Internal — at the embedder boundary it becomes [`ThrownException`].
@@ -62,9 +63,14 @@ impl Execution {
         ip: u32,
     ) -> Result<StepOutcome> {
         let tag = inner.instance(instance).tags[tag_idx as usize];
-        let n = inner.tag(tag).ty.ty().params().len();
-        let mut args: Vec<Val> = (0..n).map(|_| self.pop()).collect();
-        args.reverse(); // popped top-first; restore declaration order
+        let params: Vec<ValType> = inner.tag(tag).ty.ty().params().collect();
+        // Pop top-first (so the last param first), decoding by its type, then restore order.
+        let mut args: Vec<Val> = params
+            .iter()
+            .rev()
+            .map(|ty| cell::decode(self.pop(), ty))
+            .collect();
+        args.reverse();
         let backtrace = inner
             .engine()
             .wasm_backtrace_enabled()
@@ -79,7 +85,7 @@ impl Execution {
 
     /// `throw_ref`: re-raise a caught `exnref` (null traps).
     pub(super) fn throw_ref(&mut self) -> Result<StepOutcome> {
-        match self.pop() {
+        match self.pop_ref(RefKind::Exn) {
             Val::ExnRef(Some(exn)) => Err(PendingException { exn }.into()),
             Val::ExnRef(None) => Err(Trap::NullReference.into()),
             _ => unreachable!("throw_ref operand is an exnref (validated)"),

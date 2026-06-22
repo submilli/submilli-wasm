@@ -110,12 +110,15 @@ impl Func {
                     .module
                     .inner()
                     .compiled(func_index);
+                let result_tys: Vec<crate::value::ValType> = ty.results().collect();
+                let args = crate::extern_::coerce_args(&mut ctx.store_mut().inner, params, &ty)?;
                 crate::exec::host::execute(
                     ctx.store_mut(),
                     instance,
                     func_index,
                     code,
-                    params.to_vec(),
+                    args,
+                    &result_tys,
                 )?
             }
             Callee::Host(host_index) => {

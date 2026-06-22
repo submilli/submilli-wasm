@@ -63,6 +63,7 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         0,
         Arc::new(code.unwrap()),
         args,
+        results,
     )
 }
 

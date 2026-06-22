@@ -66,7 +66,7 @@ impl Execution {
         let fill = if default {
             default_for_slot(module.inner().layout(ty).elem_at(0))
         } else {
-            self.pop()
+            self.pop_val_for(module.inner().layout(ty).elem_at(0))
         };
         write_each(module.inner().layout(ty), &mut data, count, fill);
         self.alloc_array(inner, type_id, count, data)
@@ -85,7 +85,7 @@ impl Execution {
         let count = n as usize;
         let mut data = vec![0u8; layout.body_size(count)];
         for i in (0..count).rev() {
-            let v = self.pop();
+            let v = self.pop_val_for(layout.elem_at(i));
             write_slot(layout.elem_at(i), &mut data, v);
         }
         self.alloc_array(inner, type_id, count, data)
@@ -146,7 +146,7 @@ impl Execution {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().layout(ty);
         let idx = self.pop_i32() as u32 as usize;
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         let slot = self.elem_slot(inner, obj, layout, idx)?;
         let data = &inner.gc_object(obj).expect("live gc slot").data;
@@ -160,9 +160,9 @@ impl Execution {
     fn array_set(&mut self, inner: &mut StoreInner, instance: Instance, ty: u32) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().layout(ty);
-        let v = self.pop();
+        let v = self.pop_val_for(layout.elem_at(0));
         let idx = self.pop_i32() as u32 as usize;
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         let slot = self.elem_slot(inner, obj, layout, idx)?;
         write_slot(
@@ -174,7 +174,7 @@ impl Execution {
     }
 
     fn array_len(&mut self, inner: &StoreInner) -> Result<()> {
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         self.push(Val::I32(arr_len(inner, obj) as i32));
         Ok(())
@@ -184,9 +184,9 @@ impl Execution {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().layout(ty);
         let len = self.pop_i32() as u32 as usize;
-        let v = self.pop();
+        let v = self.pop_val_for(layout.elem_at(0));
         let idx = self.pop_i32() as u32 as usize;
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         range(idx, len, arr_len(inner, obj), Trap::ArrayOutOfBounds)?;
         let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
@@ -206,9 +206,9 @@ impl Execution {
         let stride = module.inner().layout(dst_ty).stride();
         let len = self.pop_i32() as u32 as usize;
         let src_idx = self.pop_i32() as u32 as usize;
-        let src_r = self.pop();
+        let src_r = self.pop_anyref();
         let dst_idx = self.pop_i32() as u32 as usize;
-        let dst_r = self.pop();
+        let dst_r = self.pop_anyref();
         let src = anyref_slot(&src_r, Trap::NullArrayReference)?;
         let dst = anyref_slot(&dst_r, Trap::NullArrayReference)?;
         range(src_idx, len, arr_len(inner, src), Trap::ArrayOutOfBounds)?;
@@ -235,7 +235,7 @@ impl Execution {
         let len = self.pop_i32() as u32 as usize;
         let src = self.pop_i32() as u32 as usize;
         let dst = self.pop_i32() as u32 as usize;
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // Array (dst) range before the data (src) range — a `len` overrunning both reports
         // "out of bounds array access" (matches the spec ordering).
@@ -264,7 +264,7 @@ impl Execution {
         let len = self.pop_i32() as u32 as usize;
         let src = self.pop_i32() as u32 as usize;
         let dst = self.pop_i32() as u32 as usize;
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // Array (dst) range before the elem-segment (src) range, as in `array.init_data`.
         range(dst, len, arr_len(inner, obj), Trap::ArrayOutOfBounds)?;

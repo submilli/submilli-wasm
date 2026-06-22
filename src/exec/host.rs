@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::exn::surface_exception;
-use super::{Execution, Outcome};
+use super::{cell, Execution, Outcome};
 use crate::exception::ThrownException;
 use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
@@ -14,8 +14,18 @@ use crate::instance::Instance;
 use crate::module::op::CompiledFunc;
 use crate::store::{FuncEntity, Store, UpdateDeadline};
 use crate::trap::Trap;
-use crate::value::{Ref, Val};
+use crate::value::{Ref, Val, ValType};
 use crate::Result;
+
+/// Decodes the final operand cells back to public `Val`s using the entry function's result types
+/// (the stack is untyped; the caller's signature supplies the types — see `cell`).
+fn decode_results(result_tys: &[ValType], cells: Vec<cell::Cell>) -> Vec<Val> {
+    result_tys
+        .iter()
+        .zip(cells)
+        .map(|(t, c)| cell::decode(c, t))
+        .collect()
+}
 
 /// Runs `code` (of `instance`) with `args`, servicing host calls, and returns the
 /// results. The wasm core runs on `&mut store.inner`; only host calls touch `T`.
@@ -25,9 +35,10 @@ pub(crate) fn execute<T>(
     func_index: u32,
     code: Arc<CompiledFunc>,
     args: Vec<Val>,
+    result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     let mut exec = Execution {
-        values: args,
+        values: args.into_iter().map(cell::encode).collect(),
         frames: Vec::new(),
     };
     exec.push_call(instance, func_index, code);
@@ -37,7 +48,7 @@ pub(crate) fn execute<T>(
             Err(e) => return Err(surface_exception(&mut store.inner, e)),
         };
         match outcome {
-            Outcome::Finished => return Ok(exec.values),
+            Outcome::Finished => return Ok(decode_results(result_tys, exec.values)),
             Outcome::HostCall { func, instance } => {
                 if let Err(e) = exec.invoke_host(store, func, instance) {
                     return Err(surface_exception(&mut store.inner, e));
@@ -72,9 +83,10 @@ pub(crate) async fn execute_async<T>(
     func_index: u32,
     code: Arc<CompiledFunc>,
     args: Vec<Val>,
+    result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     let mut exec = Execution {
-        values: args,
+        values: args.into_iter().map(cell::encode).collect(),
         frames: Vec::new(),
     };
     exec.push_call(instance, func_index, code);
@@ -84,7 +96,7 @@ pub(crate) async fn execute_async<T>(
             Err(e) => return Err(surface_exception(&mut store.inner, e)),
         };
         match outcome {
-            Outcome::Finished => return Ok(exec.values),
+            Outcome::Finished => return Ok(decode_results(result_tys, exec.values)),
             Outcome::HostCall { func, instance } => {
                 if let Err(e) = exec.invoke_host(store, func, instance) {
                     return Err(surface_exception(&mut store.inner, e));
@@ -192,9 +204,9 @@ impl Execution {
         func: Func,
         instance: Instance,
     ) -> Result<()> {
-        let (n_params, mut results, host_index) = match store.inner.func(func) {
+        let (param_tys, mut results, host_index) = match store.inner.func(func) {
             FuncEntity::Host { ty, host_index } => (
-                ty.params().len(),
+                ty.params().collect::<Vec<ValType>>(),
                 ty.results()
                     .map(|t| Val::default_for_valtype(&t))
                     .collect::<Vec<_>>(),
@@ -206,7 +218,7 @@ impl Execution {
                 unreachable!("HostCall only suspends on sync host funcs")
             }
         };
-        let params = self.values.split_off(self.values.len() - n_params);
+        let params = self.pop_params(&param_tys);
         let cb = store.host_funcs[host_index as usize].clone();
         // Expose the live wasm frames to `WasmBacktrace::capture(caller)` for the host call's
         // duration; restore the previous snapshot after (so re-entrant calls don't clobber it).
@@ -224,7 +236,7 @@ impl Execution {
         // `Store::throw` but swallowed instead of propagating (host misuse) — the pending slot is
         // scoped to a single host call and must be empty once one completes without throwing.
         store.inner.take_pending_exception();
-        self.values.extend(results);
+        self.push_results(results);
         Ok(())
     }
 
@@ -257,9 +269,9 @@ impl Execution {
         func: Func,
         instance: Instance,
     ) -> Result<()> {
-        let (n_params, mut results, host_index) = match store.inner.func(func) {
+        let (param_tys, mut results, host_index) = match store.inner.func(func) {
             FuncEntity::HostAsync { ty, host_index } => (
-                ty.params().len(),
+                ty.params().collect::<Vec<ValType>>(),
                 ty.results()
                     .map(|t| Val::default_for_valtype(&t))
                     .collect::<Vec<_>>(),
@@ -267,7 +279,7 @@ impl Execution {
             ),
             _ => unreachable!("HostAsync only suspends on async host funcs"),
         };
-        let params = self.values.split_off(self.values.len() - n_params);
+        let params = self.pop_params(&param_tys);
         let cb = store.async_host_funcs[host_index as usize].clone();
         let prev = store.inner.swap_host_frames(self.host_frame_snapshot());
         let outcome = {
@@ -281,7 +293,7 @@ impl Execution {
         }
         // See `invoke_host`: a host that returned normally leaves no pending exception.
         store.inner.take_pending_exception();
-        self.values.extend(results);
+        self.push_results(results);
         Ok(())
     }
 

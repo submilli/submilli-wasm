@@ -2,7 +2,7 @@
 //! See ARCHITECTURE §7. The big `match` is the interpreter's single sanctioned long function.
 
 use super::call::{self, CallKind};
-use super::{Execution, StepOutcome};
+use super::{cell, Execution, StepOutcome};
 use crate::instance::Instance;
 use crate::module::op::{CompiledFunc, Op};
 use crate::store::StoreInner;
@@ -35,11 +35,11 @@ impl Execution {
                 let cond = self.pop_i32();
                 let b = self.pop();
                 let a = self.pop();
-                self.push(if cond != 0 { a } else { b });
+                self.push_cell(if cond != 0 { a } else { b });
             }
             Op::LocalGet(i) => {
                 let v = self.values[(base + i) as usize];
-                self.push(v);
+                self.push_cell(v);
             }
             Op::LocalSet(i) => {
                 let v = self.pop();
@@ -55,8 +55,8 @@ impl Execution {
                 self.push(v);
             }
             Op::GlobalSet(g) => {
-                let v = self.pop();
                 let handle = inner.instance(instance).globals[*g as usize];
+                let v = cell::decode(self.pop(), inner.global(handle).ty.content());
                 inner.global_mut(handle).value = v;
             }
             Op::Br(t) => {
@@ -107,16 +107,16 @@ impl Execution {
             Op::ReturnCallRef(_) => return self.do_call_ref(inner, instance, CallKind::Tail),
             Op::BrOnNull(t) => {
                 let r = self.pop();
-                if r.is_null_ref() {
+                if r.is_null() {
                     self.take_branch(t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
-                self.push(r); // non-null: keep it, fall through
+                self.push_cell(r); // non-null: keep it, fall through
             }
             Op::BrOnNonNull(t) => {
                 let r = self.pop();
-                if !r.is_null_ref() {
-                    self.push(r); // non-null: keep it on the branch target
+                if !r.is_null() {
+                    self.push_cell(r); // non-null: keep it on the branch target
                     self.take_branch(t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
@@ -125,7 +125,7 @@ impl Execution {
             Op::MemoryGrow(i) => {
                 // Routed through the driver so the (T-generic) limiter is consulted.
                 let memory = inner.instance(instance).memories[*i as usize];
-                let delta = self.pop_index();
+                let delta = self.pop_index(inner.memory(memory).ty.is_64());
                 return Ok(StepOutcome::DoGrow {
                     memory,
                     delta,
@@ -135,8 +135,10 @@ impl Execution {
             Op::TableGrow(t) => {
                 // Routed through the driver (limiter-consulted), like `memory.grow`.
                 let table = inner.instance(instance).tables[*t as usize];
-                let delta = self.pop_index();
-                let init = self.pop().to_ref();
+                let tt = &inner.table(table).ty;
+                let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
+                let delta = self.pop_index(is_64);
+                let init = self.pop_ref(kind).to_ref();
                 return Ok(StepOutcome::DoTableGrow {
                     table,
                     delta,

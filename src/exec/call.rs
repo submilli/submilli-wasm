@@ -1,7 +1,7 @@
 //! `call_indirect`: table-element lookup, signature check, then a (wasm or host) call.
 
 use super::{CallReq, Execution, ResolvedCall, StepOutcome};
-use crate::canon::CanonicalTypeId;
+use crate::canon::{CanonicalTypeId, RefKind};
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::store::{FuncEntity, StoreInner};
@@ -47,8 +47,8 @@ impl Execution {
         table: u32,
         kind: CallKind,
     ) -> Result<StepOutcome> {
-        let idx = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
+        let idx = self.pop_index(inner.table(handle).ty.is_64());
         let f = match inner.table(handle).get(idx) {
             Some(Ref::Func(Some(f))) => f,
             Some(Ref::Func(None)) => return Err(Trap::IndirectCallToNull.into()),
@@ -88,7 +88,7 @@ impl Execution {
         instance: Instance,
         kind: CallKind,
     ) -> Result<StepOutcome> {
-        let f = match self.pop().to_ref() {
+        let f = match self.pop_ref(RefKind::Func).to_ref() {
             Ref::Func(Some(f)) => f,
             Ref::Func(None) => return Err(Trap::NullReference.into()),
             _ => return Err(Trap::BadSignature.into()),

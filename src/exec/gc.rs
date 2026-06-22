@@ -69,7 +69,7 @@ impl Execution {
         } else {
             // Operands sit on the stack in field order; fill from the last field back.
             for &slot in fields.iter().rev() {
-                let v = self.pop();
+                let v = self.pop_val_for(slot);
                 write_slot(slot, &mut data, v);
             }
         }
@@ -88,7 +88,7 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let slot = module.inner().layout(ty).field(field as usize);
-        let r = self.pop();
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullStructReference)?;
         let data = &inner.gc_object(obj).expect("live gc slot").data;
         let v = match ext {
@@ -108,8 +108,8 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let slot = module.inner().layout(ty).field(field as usize);
-        let v = self.pop();
-        let r = self.pop();
+        let v = self.pop_val_for(slot);
+        let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullStructReference)?;
         let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
         write_slot(slot, data, v);
@@ -117,7 +117,7 @@ impl Execution {
     }
 
     fn i31_get(&mut self, signed: bool) -> Result<()> {
-        let handle = match self.pop() {
+        let handle = match self.pop_anyref() {
             Val::AnyRef(Some(r)) => r.raw(),
             Val::AnyRef(None) => return Err(Trap::NullI31Reference.into()),
             _ => unreachable!("i31.get on non-anyref"),

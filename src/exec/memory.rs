@@ -135,9 +135,10 @@ impl Execution {
                 self.push_index(inner.memory(memory).ty.is_64(), pages);
             }
             Op::MemoryFill(i) => {
-                let len = self.pop_index();
+                let is_64 = inner.memory(mem(inner, instance, *i)).ty.is_64();
+                let len = self.pop_index(is_64);
                 let val = self.pop().unwrap_i32() as u8;
-                let dst = self.pop_index();
+                let dst = self.pop_index(is_64);
                 let bytes = &mut inner.memory_mut(mem(inner, instance, *i)).bytes;
                 let end = checked_range(dst, len, bytes.len() as u64)?;
                 bytes[dst as usize..end as usize].fill(val);
@@ -158,10 +159,15 @@ impl Execution {
         dst_i: u32,
         src_i: u32,
     ) -> Result<()> {
-        let len = self.pop_index();
-        let src = self.pop_index();
-        let dst = self.pop_index();
         let (dst_mem, src_mem) = (mem(inner, instance, dst_i), mem(inner, instance, src_i));
+        let (dst_64, src_64) = (
+            inner.memory(dst_mem).ty.is_64(),
+            inner.memory(src_mem).ty.is_64(),
+        );
+        // The length is typed as the narrower of the two memories (#42).
+        let len = self.pop_index(dst_64 && src_64);
+        let src = self.pop_index(src_64);
+        let dst = self.pop_index(dst_64);
         checked_range(src, len, inner.memory(src_mem).bytes.len() as u64)?;
         checked_range(dst, len, inner.memory(dst_mem).bytes.len() as u64)?;
         let (src, dst, len) = (src as usize, dst as usize, len as usize);
@@ -185,9 +191,10 @@ impl Execution {
         seg: u32,
         mem_i: u32,
     ) -> Result<()> {
+        let is_64 = inner.memory(mem(inner, instance, mem_i)).ty.is_64();
         let len = u64::from(self.pop_i32() as u32);
         let src = u64::from(self.pop_i32() as u32);
-        let dst = self.pop_index();
+        let dst = self.pop_index(is_64);
         let entity = inner.instance(instance);
         let module = entity.module.clone();
         let dropped = entity.dropped_data[seg as usize];
@@ -209,7 +216,7 @@ impl Execution {
         m: &MemArg,
     ) -> Result<(Memory, usize)> {
         let memory = mem(inner, instance, m.memory);
-        let addr = self.pop_index();
+        let addr = self.pop_index(inner.memory(memory).ty.is_64());
         let ea = addr.checked_add(m.offset).ok_or_else(oob)?;
         let end = ea.checked_add(N as u64).ok_or_else(oob)?;
         if end > inner.memory(memory).bytes.len() as u64 {

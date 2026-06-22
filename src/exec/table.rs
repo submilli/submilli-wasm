@@ -2,7 +2,7 @@
 //! parts mirror the `memory.init`/`data.drop` handling in [`super::memory`]; the reference
 //! *value* ops (`ref.null` etc.) live in [`super::ref_`].
 
-use super::Execution;
+use super::{cell, Execution};
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::StoreInner;
@@ -45,17 +45,19 @@ impl Execution {
     }
 
     fn table_get(&mut self, inner: &StoreInner, instance: Instance, table: u32) -> Result<()> {
-        let idx = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
+        let idx = self.pop_index(inner.table(handle).ty.is_64());
         let r = inner.table(handle).get(idx).ok_or_else(oob)?;
         self.push(Val::from_ref(r));
         Ok(())
     }
 
     fn table_set(&mut self, inner: &mut StoreInner, instance: Instance, table: u32) -> Result<()> {
-        let val = self.pop().to_ref();
-        let idx = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
+        let tt = &inner.table(handle).ty;
+        let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
+        let val = self.pop_ref(kind).to_ref();
+        let idx = self.pop_index(is_64);
         if inner.table_mut(handle).set(idx, val) {
             Ok(())
         } else {
@@ -64,10 +66,12 @@ impl Execution {
     }
 
     fn table_fill(&mut self, inner: &mut StoreInner, instance: Instance, table: u32) -> Result<()> {
-        let len = self.pop_index();
-        let val = self.pop().to_ref();
-        let dst = self.pop_index();
         let handle = inner.instance(instance).tables[table as usize];
+        let tt = &inner.table(handle).ty;
+        let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
+        let len = self.pop_index(is_64);
+        let val = self.pop_ref(kind).to_ref();
+        let dst = self.pop_index(is_64);
         if inner.table_mut(handle).fill(dst, val, len) {
             Ok(())
         } else {
@@ -83,12 +87,12 @@ impl Execution {
         table: u32,
     ) -> Result<()> {
         // The element segment is 32-bit (src/len are i32); only the table dst is index-typed (#42).
+        let handle = inner.instance(instance).tables[table as usize];
         let len = u64::from(self.pop_i32() as u32);
         let src = u64::from(self.pop_i32() as u32);
-        let dst = self.pop_index();
+        let dst = self.pop_index(inner.table(handle).ty.is_64());
 
         let entity = inner.instance(instance);
-        let handle = entity.tables[table as usize];
         // The element instance was evaluated once at instantiation (`elem.drop` empties it).
         let refs = entity.elems[elem as usize].clone();
 
@@ -108,13 +112,17 @@ impl Execution {
         dst_table: u32,
         src_table: u32,
     ) -> Result<()> {
-        let len = self.pop_index();
-        let src = self.pop_index();
-        let dst = self.pop_index();
-
         let entity = inner.instance(instance);
         let dst_handle = entity.tables[dst_table as usize];
         let src_handle = entity.tables[src_table as usize];
+        let (dst_64, src_64) = (
+            inner.table(dst_handle).ty.is_64(),
+            inner.table(src_handle).ty.is_64(),
+        );
+        // The length is typed as the narrower of the two tables (#42).
+        let len = self.pop_index(dst_64 && src_64);
+        let src = self.pop_index(src_64);
+        let dst = self.pop_index(dst_64);
 
         let src_end = checked_range(src, len, inner.table(src_handle).size())?;
         checked_range(dst, len, inner.table(dst_handle).size())?;
