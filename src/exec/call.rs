@@ -9,6 +9,14 @@ use crate::trap::Trap;
 use crate::value::{FuncType, Ref};
 use crate::Result;
 
+/// Disposition of a call site: a normal nested call (carrying the caller's resume ip) or a tail
+/// call (#39) that replaces the current frame.
+#[derive(Clone, Copy)]
+pub(super) enum CallKind {
+    Nested(u32),
+    Tail,
+}
+
 /// Resolves a function handle to a wasm body (defining instance + compiled code) or a
 /// host func. Imported functions resolve transparently — the handle already points at
 /// the defining instance's `FuncEntity`.
@@ -29,13 +37,15 @@ pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
 }
 
 impl Execution {
+    /// `call_indirect` / `return_call_indirect` (`tail`, #39): table lookup, signature check, then
+    /// the (wasm or host) call outcome.
     pub(super) fn do_call_indirect(
         &mut self,
         inner: &StoreInner,
         instance: Instance,
         type_idx: u32,
         table: u32,
-        return_ip: u32,
+        kind: CallKind,
     ) -> Result<StepOutcome> {
         let idx = u64::from(self.pop_i32() as u32);
         let handle = inner.instance(instance).tables[table as usize];
@@ -49,77 +59,91 @@ impl Execution {
         let expected_module = inner.instance(instance).module.clone();
         // Engine-canonical id of the expected type (cross-module, recursion-safe identity).
         let expected_id = expected_module.inner().canonical_type_id(type_idx);
-        match resolve(inner, f) {
-            ResolvedCall::Wasm(def_inst, func_index, code) => {
+        let resolved = resolve(inner, f);
+        match &resolved {
+            // The callee's type must be a subtype of the expected one (funcref subtyping).
+            ResolvedCall::Wasm(def_inst, _, code) => {
                 let actual_id = inner
-                    .instance(def_inst)
+                    .instance(*def_inst)
                     .module
                     .inner()
                     .canonical_type_id(code.type_idx);
-                // The callee's type must be a subtype of the expected one (funcref subtyping).
                 if !inner.engine().is_subtype(actual_id, expected_id) {
                     return Err(Trap::BadSignature.into());
                 }
-                Ok(StepOutcome::DoCall(CallReq {
-                    return_ip,
-                    instance: def_inst,
-                    func_index,
-                    code,
-                }))
             }
             // Host func types are interned too — compare canonical ids uniformly.
-            ResolvedCall::Host(func) => {
-                host_sig_ok(inner, func, expected_id)?;
-                Ok(StepOutcome::DoHostCall {
-                    func,
-                    instance,
-                    return_ip,
-                })
-            }
+            ResolvedCall::Host(func) => host_sig_ok(inner, *func, expected_id)?,
             #[cfg(feature = "async")]
-            ResolvedCall::HostAsync(func) => {
-                host_sig_ok(inner, func, expected_id)?;
-                Ok(StepOutcome::DoHostAsyncCall {
-                    func,
-                    instance,
-                    return_ip,
-                })
-            }
+            ResolvedCall::HostAsync(func) => host_sig_ok(inner, *func, expected_id)?,
         }
+        Ok(call_outcome(inner, resolved, instance, kind))
     }
 
-    /// `call_ref`: pop a funcref operand and dispatch to it. Null traps; the signature
-    /// is statically guaranteed (validation), so there is no runtime type check.
+    /// `call_ref` / `return_call_ref` (`tail`, #39): pop a funcref operand and dispatch. Null traps;
+    /// the signature is statically guaranteed (validation), so there is no runtime type check.
     pub(super) fn do_call_ref(
         &mut self,
         inner: &StoreInner,
         instance: Instance,
-        return_ip: u32,
+        kind: CallKind,
     ) -> Result<StepOutcome> {
         let f = match self.pop().to_ref() {
             Ref::Func(Some(f)) => f,
             Ref::Func(None) => return Err(Trap::NullReference.into()),
             _ => return Err(Trap::BadSignature.into()),
         };
-        Ok(match resolve(inner, f) {
-            ResolvedCall::Wasm(def_inst, func_index, code) => StepOutcome::DoCall(CallReq {
+        Ok(call_outcome(inner, resolve(inner, f), instance, kind))
+    }
+}
+
+/// Builds the step outcome from a resolved callee. `tail` (#39) replaces the current frame instead
+/// of nesting; for a tail host call it carries `n_params` so the run loop can reposition the args.
+pub(super) fn call_outcome(
+    inner: &StoreInner,
+    resolved: ResolvedCall,
+    instance: Instance,
+    kind: CallKind,
+) -> StepOutcome {
+    let n_params = |func| host_ty(inner, func).params().len() as u32;
+    match resolved {
+        ResolvedCall::Wasm(def_inst, func_index, code) => {
+            let req = |return_ip| CallReq {
                 return_ip,
                 instance: def_inst,
                 func_index,
-                code,
-            }),
-            ResolvedCall::Host(func) => StepOutcome::DoHostCall {
+                code: code.clone(),
+            };
+            match kind {
+                CallKind::Tail => StepOutcome::DoTailCall(req(0)),
+                CallKind::Nested(return_ip) => StepOutcome::DoCall(req(return_ip)),
+            }
+        }
+        ResolvedCall::Host(func) => match kind {
+            CallKind::Tail => StepOutcome::DoTailHostCall {
+                func,
+                instance,
+                n_params: n_params(func),
+            },
+            CallKind::Nested(return_ip) => StepOutcome::DoHostCall {
                 func,
                 instance,
                 return_ip,
             },
-            #[cfg(feature = "async")]
-            ResolvedCall::HostAsync(func) => StepOutcome::DoHostAsyncCall {
+        },
+        #[cfg(feature = "async")]
+        ResolvedCall::HostAsync(func) => match kind {
+            CallKind::Tail => StepOutcome::DoTailHostAsyncCall {
+                func,
+                instance,
+                n_params: n_params(func),
+            },
+            CallKind::Nested(return_ip) => StepOutcome::DoHostAsyncCall {
                 func,
                 instance,
                 return_ip,
             },
-        })
+        },
     }
 }
 

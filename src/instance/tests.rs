@@ -67,6 +67,28 @@ fn imported_global_and_const_init() {
     assert_eq!(r[0].unwrap_i32(), 100);
 }
 
+/// Extended-const (#40): const-expr arithmetic and `global.get` of a prior *defined* global.
+#[test]
+fn extended_const_global_init() {
+    let engine = Engine::default();
+    let m = module(
+        &engine,
+        "(module
+            (global $a i32 (i32.add (i32.const 40) (i32.const 2)))
+            (global $b i32 (i32.mul (global.get $a) (i32.const 2)))
+            (global $c i64 (i64.sub (i64.mul (i64.const 20) (i64.const 2)) (i64.const 2)))
+            (func (export \"a\") (result i32) global.get $a)
+            (func (export \"b\") (result i32) global.get $b)
+            (func (export \"c\") (result i64) global.get $c))",
+    );
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let a = call(&mut store, inst, "a", vec![]).unwrap()[0].unwrap_i32();
+    let b = call(&mut store, inst, "b", vec![]).unwrap()[0].unwrap_i32();
+    let c = call(&mut store, inst, "c", vec![]).unwrap()[0].unwrap_i64();
+    assert_eq!((a, b, c), (42, 84, 38)); // 40+2 ; (42)*2 ; 20*2-2
+}
+
 #[test]
 fn active_data_segment_loads() {
     let engine = Engine::default();

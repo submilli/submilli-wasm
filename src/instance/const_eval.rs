@@ -40,6 +40,12 @@ pub(crate) fn eval_const(inner: &mut StoreInner, ctx: &ConstCtx<'_>, e: &ConstEx
             ConstOp::RefNull(heap) => Val::null_for_heap(heap),
             ConstOp::RefFunc(i) => Val::FuncRef(Some(ctx.funcs[*i as usize])),
             ConstOp::GlobalGet(g) => inner.global(ctx.globals[*g as usize]).value,
+            ConstOp::I32Add => i32_bin(&mut stack, i32::wrapping_add),
+            ConstOp::I32Sub => i32_bin(&mut stack, i32::wrapping_sub),
+            ConstOp::I32Mul => i32_bin(&mut stack, i32::wrapping_mul),
+            ConstOp::I64Add => i64_bin(&mut stack, i64::wrapping_add),
+            ConstOp::I64Sub => i64_bin(&mut stack, i64::wrapping_sub),
+            ConstOp::I64Mul => i64_bin(&mut stack, i64::wrapping_mul),
             ConstOp::RefI31 => anyref_value(anyref_handle_i31(pop(&mut stack).unwrap_i32())),
             ConstOp::StructNew(ty) => const_struct(inner, ctx, &mut stack, *ty, false)?,
             ConstOp::StructNewDefault(ty) => const_struct(inner, ctx, &mut stack, *ty, true)?,
@@ -91,6 +97,19 @@ pub(crate) fn elem_refs(
 
 fn pop(stack: &mut Vec<Val>) -> Val {
     stack.pop().expect("const-expr operand stack underflow")
+}
+
+/// Extended-const binop: `(op a b)` pushed `a` then `b`, so pop yields `b` then `a` (#40).
+fn i32_bin(stack: &mut Vec<Val>, f: fn(i32, i32) -> i32) -> Val {
+    let b = pop(stack).unwrap_i32();
+    let a = pop(stack).unwrap_i32();
+    Val::I32(f(a, b))
+}
+
+fn i64_bin(stack: &mut Vec<Val>, f: fn(i64, i64) -> i64) -> Val {
+    let b = pop(stack).unwrap_i64();
+    let a = pop(stack).unwrap_i64();
+    Val::I64(f(a, b))
 }
 
 fn const_struct(

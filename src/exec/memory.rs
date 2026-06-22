@@ -1,10 +1,11 @@
-//! Memory instructions: bounds-checked loads/stores plus size/grow/copy/fill.
-//! `memory.init`/`data.drop` operate on passive data segments.
+//! Memory instructions: bounds-checked loads/stores plus size/grow/copy/fill, each on an explicit
+//! memory index (#41). `memory.init`/`data.drop` operate on passive data segments.
 
 // `&MemArg` arrives naturally from matching `&Op`; passing it by ref is fine.
 #![allow(clippy::trivially_copy_pass_by_ref)]
 
 use super::Execution;
+use crate::extern_::Memory;
 use crate::instance::Instance;
 use crate::module::op::{MemArg, Op};
 use crate::store::StoreInner;
@@ -16,9 +17,15 @@ fn oob() -> Error {
     Trap::MemoryOutOfBounds.into()
 }
 
+/// The instance's memory at index `idx` (imported memories first, then defined — the wasm index
+/// space). `memory.grow` is serviced separately in the run loop (for the limiter).
+fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Memory {
+    inner.instance(instance).memories[idx as usize]
+}
+
 impl Execution {
     /// Executes a memory op (loads/stores/size/copy/fill/init/data.drop). `step` routes
-    /// only these ops here.
+    /// only these ops here (`memory.grow` excepted — see the run loop).
     #[allow(clippy::too_many_lines)] // flat per-width load/store dispatch
     pub(super) fn exec_memory(
         &mut self,
@@ -26,189 +33,209 @@ impl Execution {
         op: &Op,
         instance: Instance,
     ) -> Result<()> {
-        // `data.drop` needs no memory (a module may carry passive data segments without one —
-        // common in GC modules using `array.new_data`); handle it before touching `memories[0]`.
-        if let Op::DataDrop(seg) = op {
-            inner.instance_mut(instance).dropped_data[*seg as usize] = true;
-            return Ok(());
-        }
-        let mem = inner.instance(instance).memories[0];
         match op {
+            // `data.drop` needs no memory (a module may carry passive data segments without one —
+            // common in GC modules using `array.new_data`).
+            Op::DataDrop(seg) => inner.instance_mut(instance).dropped_data[*seg as usize] = true,
             Op::I32Load(m) => {
-                let b = self.load_n::<4>(inner, mem, m)?;
+                let b = self.load_n::<4>(inner, instance, m)?;
                 self.push(Val::I32(i32::from_le_bytes(b)));
             }
             Op::I64Load(m) => {
-                let b = self.load_n::<8>(inner, mem, m)?;
+                let b = self.load_n::<8>(inner, instance, m)?;
                 self.push(Val::I64(i64::from_le_bytes(b)));
             }
             Op::F32Load(m) => {
-                let b = self.load_n::<4>(inner, mem, m)?;
+                let b = self.load_n::<4>(inner, instance, m)?;
                 self.push(Val::F32(u32::from_le_bytes(b)));
             }
             Op::F64Load(m) => {
-                let b = self.load_n::<8>(inner, mem, m)?;
+                let b = self.load_n::<8>(inner, instance, m)?;
                 self.push(Val::F64(u64::from_le_bytes(b)));
             }
             Op::I32Load8S(m) => {
-                let b = self.load_n::<1>(inner, mem, m)?;
+                let b = self.load_n::<1>(inner, instance, m)?;
                 self.push(Val::I32(i32::from(b[0] as i8)));
             }
             Op::I32Load8U(m) => {
-                let b = self.load_n::<1>(inner, mem, m)?;
+                let b = self.load_n::<1>(inner, instance, m)?;
                 self.push(Val::I32(i32::from(b[0])));
             }
             Op::I32Load16S(m) => {
-                let b = self.load_n::<2>(inner, mem, m)?;
+                let b = self.load_n::<2>(inner, instance, m)?;
                 self.push(Val::I32(i32::from(i16::from_le_bytes(b))));
             }
             Op::I32Load16U(m) => {
-                let b = self.load_n::<2>(inner, mem, m)?;
+                let b = self.load_n::<2>(inner, instance, m)?;
                 self.push(Val::I32(i32::from(u16::from_le_bytes(b))));
             }
             Op::I64Load8S(m) => {
-                let b = self.load_n::<1>(inner, mem, m)?;
+                let b = self.load_n::<1>(inner, instance, m)?;
                 self.push(Val::I64(i64::from(b[0] as i8)));
             }
             Op::I64Load8U(m) => {
-                let b = self.load_n::<1>(inner, mem, m)?;
+                let b = self.load_n::<1>(inner, instance, m)?;
                 self.push(Val::I64(i64::from(b[0])));
             }
             Op::I64Load16S(m) => {
-                let b = self.load_n::<2>(inner, mem, m)?;
+                let b = self.load_n::<2>(inner, instance, m)?;
                 self.push(Val::I64(i64::from(i16::from_le_bytes(b))));
             }
             Op::I64Load16U(m) => {
-                let b = self.load_n::<2>(inner, mem, m)?;
+                let b = self.load_n::<2>(inner, instance, m)?;
                 self.push(Val::I64(i64::from(u16::from_le_bytes(b))));
             }
             Op::I64Load32S(m) => {
-                let b = self.load_n::<4>(inner, mem, m)?;
+                let b = self.load_n::<4>(inner, instance, m)?;
                 self.push(Val::I64(i64::from(i32::from_le_bytes(b))));
             }
             Op::I64Load32U(m) => {
-                let b = self.load_n::<4>(inner, mem, m)?;
+                let b = self.load_n::<4>(inner, instance, m)?;
                 self.push(Val::I64(i64::from(u32::from_le_bytes(b))));
             }
             Op::I32Store(m) => {
                 let v = self.pop().unwrap_i32();
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store(m) => {
                 let v = self.pop().unwrap_i64();
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::F32Store(m) => {
                 let v = self.pop().unwrap_f32().to_bits();
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::F64Store(m) => {
                 let v = self.pop().unwrap_f64().to_bits();
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::I32Store8(m) => {
                 let v = self.pop().unwrap_i32() as u8;
-                self.store_n(inner, mem, m, [v])?;
+                self.store_n(inner, instance, m, [v])?;
             }
             Op::I32Store16(m) => {
                 let v = self.pop().unwrap_i32() as u16;
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store8(m) => {
                 let v = self.pop().unwrap_i64() as u8;
-                self.store_n(inner, mem, m, [v])?;
+                self.store_n(inner, instance, m, [v])?;
             }
             Op::I64Store16(m) => {
                 let v = self.pop().unwrap_i64() as u16;
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store32(m) => {
                 let v = self.pop().unwrap_i64() as u32;
-                self.store_n(inner, mem, m, v.to_le_bytes())?;
+                self.store_n(inner, instance, m, v.to_le_bytes())?;
             }
-            Op::MemorySize => {
-                let pages = inner.memory(mem).size_pages();
+            Op::MemorySize(i) => {
+                let pages = inner.memory(mem(inner, instance, *i)).size_pages();
                 self.push(Val::I32(pages as i32));
             }
-            Op::MemoryGrow => {
-                let delta = u64::from(self.pop().unwrap_i32() as u32);
-                let old = inner.memory_mut(mem).grow(delta);
-                self.push(Val::I32(old.map_or(-1, |o| o as i32)));
-            }
-            Op::MemoryFill => {
+            Op::MemoryFill(i) => {
                 let len = self.pop().unwrap_i32() as u32 as usize;
                 let val = self.pop().unwrap_i32() as u8;
                 let dst = self.pop().unwrap_i32() as u32 as usize;
-                let bytes = &mut inner.memory_mut(mem).bytes;
+                let bytes = &mut inner.memory_mut(mem(inner, instance, *i)).bytes;
                 let end = checked_range(dst, len, bytes.len())?;
                 bytes[dst..end].fill(val);
             }
-            Op::MemoryCopy => {
-                let len = self.pop().unwrap_i32() as u32 as usize;
-                let src = self.pop().unwrap_i32() as u32 as usize;
-                let dst = self.pop().unwrap_i32() as u32 as usize;
-                let bytes = &mut inner.memory_mut(mem).bytes;
-                let src_end = checked_range(src, len, bytes.len())?;
-                let dst_end = checked_range(dst, len, bytes.len())?;
-                let _ = (src_end, dst_end);
-                bytes.copy_within(src..src + len, dst);
-            }
-            Op::MemoryInit(seg) => {
-                let len = self.pop().unwrap_i32() as u32 as usize;
-                let src = self.pop().unwrap_i32() as u32 as usize;
-                let dst = self.pop().unwrap_i32() as u32 as usize;
-                let entity = inner.instance(instance);
-                let module = entity.module.clone();
-                let dropped = entity.dropped_data[*seg as usize];
-                let data = &module.inner().datas[*seg as usize].bytes;
-                let data_len = if dropped { 0 } else { data.len() };
-                let src_end = checked_range(src, len, data_len)?;
-                let mem_len = inner.memory(mem).bytes.len();
-                checked_range(dst, len, mem_len)?;
-                inner.memory_mut(mem).bytes[dst..dst + len].copy_from_slice(&data[src..src_end]);
-            }
+            Op::MemoryCopy(dst_i, src_i) => self.memory_copy(inner, instance, *dst_i, *src_i)?,
+            Op::MemoryInit(seg, i) => self.memory_init(inner, instance, *seg, *i)?,
             _ => return Err(Error::msg(format!("not a memory op: {op:?}"))),
         }
         Ok(())
     }
 
-    /// Pops the address operand and bounds-checks `[ea, ea+N)` against `mem`.
+    /// `memory.copy dst_mem src_mem`: the two memories may differ. Same index uses overlap-safe
+    /// `copy_within`; different indices copy via a temporary (no aliasing concern).
+    fn memory_copy(
+        &mut self,
+        inner: &mut StoreInner,
+        instance: Instance,
+        dst_i: u32,
+        src_i: u32,
+    ) -> Result<()> {
+        let len = self.pop().unwrap_i32() as u32 as usize;
+        let src = self.pop().unwrap_i32() as u32 as usize;
+        let dst = self.pop().unwrap_i32() as u32 as usize;
+        let (dst_mem, src_mem) = (mem(inner, instance, dst_i), mem(inner, instance, src_i));
+        checked_range(src, len, inner.memory(src_mem).bytes.len())?;
+        checked_range(dst, len, inner.memory(dst_mem).bytes.len())?;
+        if dst_i == src_i {
+            inner
+                .memory_mut(dst_mem)
+                .bytes
+                .copy_within(src..src + len, dst);
+        } else {
+            let chunk = inner.memory(src_mem).bytes[src..src + len].to_vec();
+            inner.memory_mut(dst_mem).bytes[dst..dst + len].copy_from_slice(&chunk);
+        }
+        Ok(())
+    }
+
+    /// `memory.init seg mem`: copy from passive data segment `seg` into memory `mem_i`.
+    fn memory_init(
+        &mut self,
+        inner: &mut StoreInner,
+        instance: Instance,
+        seg: u32,
+        mem_i: u32,
+    ) -> Result<()> {
+        let len = self.pop().unwrap_i32() as u32 as usize;
+        let src = self.pop().unwrap_i32() as u32 as usize;
+        let dst = self.pop().unwrap_i32() as u32 as usize;
+        let entity = inner.instance(instance);
+        let module = entity.module.clone();
+        let dropped = entity.dropped_data[seg as usize];
+        let data = &module.inner().datas[seg as usize].bytes;
+        let data_len = if dropped { 0 } else { data.len() };
+        let src_end = checked_range(src, len, data_len)?;
+        let mem = mem(inner, instance, mem_i);
+        checked_range(dst, len, inner.memory(mem).bytes.len())?;
+        inner.memory_mut(mem).bytes[dst..dst + len].copy_from_slice(&data[src..src_end]);
+        Ok(())
+    }
+
+    /// Pops the address operand, resolves `m`'s memory, and bounds-checks `[ea, ea+N)`.
     fn mem_ea<const N: usize>(
         &mut self,
         inner: &StoreInner,
-        mem: crate::extern_::Memory,
+        instance: Instance,
         m: &MemArg,
-    ) -> Result<usize> {
+    ) -> Result<(Memory, usize)> {
+        let memory = mem(inner, instance, m.memory);
         let addr = u64::from(self.pop().unwrap_i32() as u32);
         let ea = addr.checked_add(u64::from(m.offset)).ok_or_else(oob)?;
         let end = ea.checked_add(N as u64).ok_or_else(oob)?;
-        if end > inner.memory(mem).bytes.len() as u64 {
+        if end > inner.memory(memory).bytes.len() as u64 {
             return Err(oob());
         }
-        Ok(ea as usize)
+        Ok((memory, ea as usize))
     }
 
     fn load_n<const N: usize>(
         &mut self,
         inner: &StoreInner,
-        mem: crate::extern_::Memory,
+        instance: Instance,
         m: &MemArg,
     ) -> Result<[u8; N]> {
-        let ea = self.mem_ea::<N>(inner, mem, m)?;
+        let (memory, ea) = self.mem_ea::<N>(inner, instance, m)?;
         let mut buf = [0u8; N];
-        buf.copy_from_slice(&inner.memory(mem).bytes[ea..ea + N]);
+        buf.copy_from_slice(&inner.memory(memory).bytes[ea..ea + N]);
         Ok(buf)
     }
 
     fn store_n<const N: usize>(
         &mut self,
         inner: &mut StoreInner,
-        mem: crate::extern_::Memory,
+        instance: Instance,
         m: &MemArg,
         data: [u8; N],
     ) -> Result<()> {
-        let ea = self.mem_ea::<N>(inner, mem, m)?;
-        inner.memory_mut(mem).bytes[ea..ea + N].copy_from_slice(&data);
+        let (memory, ea) = self.mem_ea::<N>(inner, instance, m)?;
+        inner.memory_mut(memory).bytes[ea..ea + N].copy_from_slice(&data);
         Ok(())
     }
 }

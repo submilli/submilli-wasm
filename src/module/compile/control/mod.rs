@@ -8,6 +8,7 @@ use crate::canon::IrHeap;
 use crate::module::op::{BranchTarget, Op};
 use crate::Result;
 
+mod calls;
 mod try_table;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -261,30 +262,6 @@ impl Translator<'_> {
     pub(super) fn throw_ref(&mut self) {
         self.emit(Op::ThrowRef);
         self.reachable = false;
-    }
-
-    pub(super) fn call(&mut self, func: u32) {
-        let (params, results) = self.signature(self.ctx.func_types[func as usize]);
-        self.pop(params);
-        self.push(results);
-        self.emit(Op::Call(func));
-    }
-
-    pub(super) fn call_indirect(&mut self, type_index: u32, table: u32) {
-        let (params, results) = self.signature(type_index);
-        self.pop(1 + params); // table index + params
-        self.push(results);
-        self.emit(Op::CallIndirect {
-            type_idx: type_index,
-            table,
-        });
-    }
-
-    pub(super) fn call_ref(&mut self, type_index: u32) {
-        let (params, results) = self.signature(type_index);
-        self.pop(1 + params); // callee funcref + params
-        self.push(results);
-        self.emit(Op::CallRef(type_index));
     }
 
     /// `br_on_null`: on the (null) branch the reference is consumed and the target

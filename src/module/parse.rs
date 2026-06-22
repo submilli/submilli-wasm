@@ -99,8 +99,7 @@ fn parse_tables(m: &mut ModuleInner, reader: wasmparser::TableSectionReader<'_>)
     Ok(())
 }
 
-/// Retains the `name` (func names, gated by `keep_offsets`) and `.debug_*` (DWARF, gated by
-/// `keep_dwarf`) custom sections for symbolicated backtraces (#29a/#29c).
+/// Retains the `name`/`.debug_*` custom sections for backtraces, per the keep flags (#29a/#29c).
 fn retain_debug_section(
     m: &mut ModuleInner,
     reader: &wasmparser::CustomSectionReader<'_>,
@@ -297,9 +296,8 @@ fn parse_const_expr(kinds: &[AggKind], expr: &wasmparser::ConstExpr<'_>) -> Resu
     Ok(ConstExpr(ops.into_boxed_slice()))
 }
 
-/// Maps one operator of a constant expression to a [`ConstOp`]; `None` marks the terminating
-/// `end`. Naming the operator on the error path lets still-deferred const forms (extern
-/// conversions, #27f stage 3) register as a deferred-op skip rather than a bug.
+/// Maps one operator of a constant expression to a [`ConstOp`]; `None` marks the terminating `end`.
+/// An unrecognized operator becomes a readable `unsupported constant expression` skip.
 fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>> {
     Ok(Some(match *op {
         Operator::I32Const { value } => ConstOp::I32(value),
@@ -309,6 +307,20 @@ fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>
         Operator::RefNull { hty } => ConstOp::RefNull(conv_reftype_heap(kinds, hty)?),
         Operator::RefFunc { function_index } => ConstOp::RefFunc(function_index),
         Operator::GlobalGet { global_index } => ConstOp::GlobalGet(global_index),
+        Operator::I32Add => ConstOp::I32Add,
+        Operator::I32Sub => ConstOp::I32Sub,
+        Operator::I32Mul => ConstOp::I32Mul,
+        Operator::I64Add => ConstOp::I64Add,
+        Operator::I64Sub => ConstOp::I64Sub,
+        Operator::I64Mul => ConstOp::I64Mul,
+        Operator::End => return Ok(None),
+        _ => return conv_const_gc_op(op),
+    }))
+}
+
+/// GC-aggregate const operators (`struct.new*`/`array.new*`/`ref.i31`/`*.convert_*`).
+fn conv_const_gc_op(op: &Operator<'_>) -> Result<Option<ConstOp>> {
+    Ok(Some(match *op {
         Operator::RefI31 => ConstOp::RefI31,
         Operator::StructNew { struct_type_index } => ConstOp::StructNew(struct_type_index),
         Operator::StructNewDefault { struct_type_index } => {
@@ -341,7 +353,6 @@ fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>
         },
         Operator::AnyConvertExtern => ConstOp::AnyConvertExtern,
         Operator::ExternConvertAny => ConstOp::ExternConvertAny,
-        Operator::End => return Ok(None),
         ref other => {
             return Err(Error::msg(format!(
                 "unsupported constant expression: {other:?}"

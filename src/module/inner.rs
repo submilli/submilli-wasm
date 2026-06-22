@@ -211,8 +211,15 @@ pub(crate) enum ConstOp {
     F64(u64),
     RefNull(IrHeap),
     RefFunc(u32),
-    /// `global.get` of an imported, immutable global (guaranteed by validation).
+    /// `global.get` of an imported or prior-defined immutable global (guaranteed by validation).
     GlobalGet(u32),
+    /// Extended-const arithmetic (#40); each pops two operands off the const-eval stack.
+    I32Add,
+    I32Sub,
+    I32Mul,
+    I64Add,
+    I64Sub,
+    I64Mul,
     RefI31,
     StructNew(u32),
     StructNewDefault(u32),

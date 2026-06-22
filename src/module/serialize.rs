@@ -15,7 +15,10 @@ use crate::{Error, Result};
 const MAGIC: &[u8; 8] = b"submwc01";
 /// Artifact format version — bump on any `Op`/`ModuleInner`/value-type layout change.
 /// v5: retain DWARF/`name` debug info + per-`Op` offsets (#29a) so backtraces survive round-trip.
-const ARTIFACT_VERSION: u32 = 5;
+/// v6: extended-const arithmetic `ConstOp`s (#40).
+/// v7: per-op memory index (`MemArg.memory` + management-op indices) for multi-memory (#41).
+/// v8: tail-call `Op`s (`ReturnCall`/`ReturnCallIndirect`/`ReturnCallRef`, #39).
+const ARTIFACT_VERSION: u32 = 8;
 
 /// Encodes a compiled module into the binary artifact format.
 pub(crate) fn encode(inner: &ModuleInner) -> Result<Vec<u8>> {

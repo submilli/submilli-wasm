@@ -46,10 +46,26 @@ pub(crate) enum Outcome {
 pub(super) enum StepOutcome {
     Advance(u32),
     DoCall(CallReq),
+    /// Tail call to a wasm callee (#39): replace the current frame. `CallReq::return_ip` is unused.
+    DoTailCall(CallReq),
+    /// Tail call to a host fn (#39): pop the current frame, then run the host (its results return
+    /// to the caller). `n_params` is needed to reposition the args before popping.
+    DoTailHostCall {
+        func: Func,
+        instance: Instance,
+        n_params: u32,
+    },
     DoHostCall {
         func: Func,
         instance: Instance,
         return_ip: u32,
+    },
+    /// Tail call to an async host fn (#39, async only).
+    #[cfg(feature = "async")]
+    DoTailHostAsyncCall {
+        func: Func,
+        instance: Instance,
+        n_params: u32,
     },
     #[cfg(feature = "async")]
     DoHostAsyncCall {

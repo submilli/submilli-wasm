@@ -39,20 +39,20 @@ impl Translator<'_> {
             W::I64Store32 { memarg: m } => self.store(Op::I64Store32(memarg(m))),
 
             // management
-            W::MemorySize { .. } => self.constop(Op::MemorySize),
-            W::MemoryGrow { .. } => self.unop(Op::MemoryGrow),
-            W::MemoryInit { data_index, .. } => {
+            W::MemorySize { mem } => self.constop(Op::MemorySize(mem)),
+            W::MemoryGrow { mem } => self.unop(Op::MemoryGrow(mem)),
+            W::MemoryInit { data_index, mem } => {
                 self.pop(3);
-                self.emit(Op::MemoryInit(data_index));
+                self.emit(Op::MemoryInit(data_index, mem));
             }
             W::DataDrop { data_index } => self.emit(Op::DataDrop(data_index)),
-            W::MemoryCopy { .. } => {
+            W::MemoryCopy { dst_mem, src_mem } => {
                 self.pop(3);
-                self.emit(Op::MemoryCopy);
+                self.emit(Op::MemoryCopy(dst_mem, src_mem));
             }
-            W::MemoryFill { .. } => {
+            W::MemoryFill { mem } => {
                 self.pop(3);
-                self.emit(Op::MemoryFill);
+                self.emit(Op::MemoryFill(mem));
             }
             ref other => return Err(Error::msg(format!("not a memory op: {other:?}"))),
         }

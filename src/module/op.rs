@@ -1,10 +1,9 @@
 //! The internal instruction set (`Op`) and `CompiledFunc` layout.
 //!
 //! A flat, one-variant-per-opcode enum so the interpreter hot loop is a single
-//! `match`. Structured control flow is lowered away by the compile pass: there
-//! are no `block`/`loop`/`if`/`else`/`end` variants — branches carry their
-//! resolved target plus the operand-stack fixup inline (the folded sidetable,
-//! see ARCHITECTURE §5). Core wasm only; ref/table/GC/EH ops arrive in their phases.
+//! `match`. Structured control flow is lowered away by the compile pass — branches
+//! carry their resolved target plus the operand-stack fixup inline (the folded
+//! sidetable, see ARCHITECTURE §5).
 
 use crate::canon::{IrHeap, IrVal};
 
@@ -16,16 +15,15 @@ pub(crate) type LocalIdx = u32;
 pub(crate) type DataIdx = u32;
 pub(crate) type ElemIdx = u32;
 
-/// A static memory-access immediate. Single memory; `align` is validation-only
-/// (handled by `wasmparser`) and not retained.
+/// A memory-access immediate: target memory index (#41) + static offset (`align` is validation-only).
 #[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MemArg {
+    pub memory: u32,
     pub offset: u32,
 }
 
-/// A resolved branch edge: the target instruction plus the operand-stack fixup.
-/// On a taken branch the top `keep` operands are moved down over `pop` discarded
-/// operands, then execution jumps to `ip`.
+/// A resolved branch edge: on a taken branch the top `keep` operands are moved down over
+/// `pop` discarded ones, then execution jumps to `ip`.
 #[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BranchTarget {
     pub ip: u32,
@@ -52,17 +50,20 @@ pub(crate) enum Op {
         type_idx: TypeIdx,
         table: TableIdx,
     },
-    /// `call_ref`: pop a funcref operand and call it (null traps). The type index is
-    /// validation-only — static typing guarantees the signature, so no runtime check.
+    /// `call_ref`: pop a funcref operand and call it (null traps); type index is validation-only.
     CallRef(TypeIdx),
-    /// Branch when the popped reference is null, dropping it (the branch target does
-    /// not receive it); on fall-through the (now non-null) reference stays.
+    /// Tail calls (#39): replace the current frame with the callee, which returns to the caller's caller.
+    ReturnCall(FuncIdx),
+    ReturnCallIndirect {
+        type_idx: TypeIdx,
+        table: TableIdx,
+    },
+    ReturnCallRef(TypeIdx),
+    /// Branch when the popped reference is null, dropping it; on fall-through it stays (non-null).
     BrOnNull(BranchTarget),
-    /// Branch when the popped reference is non-null, keeping it on the branch target;
-    /// on fall-through (null) the reference is dropped.
+    /// Branch when the popped reference is non-null, keeping it on the target; on null it is dropped.
     BrOnNonNull(BranchTarget),
-    /// `throw $tag`: pop the tag's args, build an exception instance, and unwind
-    /// (stack-polymorphic, like `unreachable`). Carries the module-relative tag index.
+    /// `throw $tag`: pop the tag's args, build an exception, and unwind (module-relative tag index).
     Throw(u32),
     /// `throw_ref`: pop an `exnref` and re-throw it (null traps; stack-polymorphic).
     ThrowRef,
@@ -105,13 +106,14 @@ pub(crate) enum Op {
     I64Store16(MemArg),
     I64Store32(MemArg),
 
-    // --- memory management ---
-    MemorySize,
-    MemoryGrow,
-    MemoryInit(DataIdx),
+    // --- memory management (carry an explicit memory index, #41) ---
+    MemorySize(u32),
+    MemoryGrow(u32),
+    MemoryInit(DataIdx, u32),
     DataDrop(DataIdx),
-    MemoryCopy,
-    MemoryFill,
+    /// `memory.copy dst_mem src_mem` — the two indices may differ.
+    MemoryCopy(u32, u32),
+    MemoryFill(u32),
 
     // --- table management (bulk-memory subset) ---
     TableInit {
@@ -361,9 +363,8 @@ pub(crate) enum Op {
         nullable: bool,
     },
     RefEq,
-    /// `any.convert_extern`: externref → anyref.
+    /// `any.convert_extern` / `extern.convert_any`: externref ↔ anyref.
     AnyConvertExtern,
-    /// `extern.convert_any`: anyref → externref.
     ExternConvertAny,
     BrOnCast {
         ty: IrHeap,

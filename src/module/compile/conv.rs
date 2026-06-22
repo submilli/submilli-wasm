@@ -68,6 +68,7 @@ pub(crate) fn conv_heaptype(kinds: &[AggKind], hty: wasmparser::HeapType) -> Res
 
 pub(super) fn memarg(m: wasmparser::MemArg) -> MemArg {
     MemArg {
+        memory: m.memory,
         offset: m.offset as u32,
     }
 }

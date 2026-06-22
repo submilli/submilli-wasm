@@ -33,8 +33,9 @@ pub(crate) fn enabled_features() -> WasmFeatures {
         // even though it's a reference-types value.
         | WasmFeatures::GC_TYPES
         // Typed/non-nullable refs, `call_ref`, `ref.as_non_null`, `br_on_null`/`br_on_non_null`.
-        // `return_call_ref` additionally needs tail-calls, still off.
         | WasmFeatures::FUNCTION_REFERENCES
+        // Tail calls: `return_call`/`return_call_indirect`/`return_call_ref` (#39).
+        | WasmFeatures::TAIL_CALL
         // Full GC: struct/array type definitions, rec groups, sub/final. The aggregate
         // instructions + casts are deferred — validated modules using them skip in the harness.
         | WasmFeatures::GC
@@ -43,6 +44,10 @@ pub(crate) fn enabled_features() -> WasmFeatures {
         // modules using them skip in the harness until #28c–#28e. Legacy `try/catch/delegate`
         // (`LEGACY_EXCEPTIONS`) stays off.
         | WasmFeatures::EXCEPTIONS
+        // Const-expr `i32`/`i64` `add`/`sub`/`mul` + `global.get` of prior immutable globals (#40).
+        | WasmFeatures::EXTENDED_CONST
+        // More than one memory per module; every memory op carries an explicit index (#41).
+        | WasmFeatures::MULTI_MEMORY
 }
 
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same

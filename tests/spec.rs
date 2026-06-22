@@ -64,12 +64,6 @@ fn classify(path: &Path, text: &str) -> Class {
     if text.contains("(memory i64") || text.contains("(table i64") {
         return Class::Skip("memory64 (out of scope)");
     }
-    // Multi-memory test files: a skipped multi-memory module's side effects on a
-    // shared imported memory/table are observed by later asserts, so the whole
-    // file can't pass without multi-memory (out of scope).
-    if matches!(name, "load1" | "load2" | "linking0") {
-        return Class::Skip("multi-memory (out of scope)");
-    }
     Class::Run
 }
 
@@ -206,18 +200,12 @@ fn is_unsupported_module(ctx: &SpecContext, bytes: &[u8]) -> bool {
     unsupported_reason(ctx, bytes).is_some()
 }
 
-/// True if a module validates but uses an operator we deliberately defer to a later phase,
-/// so its compile failure is an expected skip rather than a bug. Currently the tail-call
-/// instructions (`return_call`/`return_call_indirect`/`return_call_ref`) — #39. The
-/// function-references flag makes `return_call_ref` *validate*, so it reaches compilation.
-fn is_deferred_op(err: &Error) -> bool {
-    let msg = err.to_string();
-    // Tail calls (#39) and the GC aggregate/cast instructions (their own subtasks) validate
-    // under our feature set but aren't compiled yet; their modules skip rather than fail.
-    // EH (`throw`/`throw_ref`/`try_table`) is implemented (#28c/#28d/#28e). Only tail calls (#39)
-    // remain deferred: `return_call*` validates under our feature set but isn't compiled yet.
-    const DEFERRED: &[&str] = &["ReturnCall"];
-    DEFERRED.iter().any(|op| msg.contains(op))
+/// True if a module validates but uses an operator we deliberately defer to a later phase, so its
+/// compile failure is an expected skip rather than a bug. Nothing is deferred any more — tail calls
+/// (#39), GC aggregates, and EH all compile; SIMD/memory64 fail *validation* (file-skipped) since
+/// their features are off. Kept as a hook for future phases.
+fn is_deferred_op(_err: &Error) -> bool {
+    false
 }
 
 /// True if every import of `module` is satisfiable by the linker (else a provider

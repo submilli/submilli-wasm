@@ -307,6 +307,12 @@ impl<'a> Translator<'a> {
                 table_index,
             } if self.reachable => self.call_indirect(type_index, table_index),
             W::CallRef { type_index } if self.reachable => self.call_ref(type_index),
+            W::ReturnCall { function_index } if self.reachable => self.return_call(function_index),
+            W::ReturnCallIndirect {
+                type_index,
+                table_index,
+            } if self.reachable => self.return_call_indirect(type_index, table_index),
+            W::ReturnCallRef { type_index } if self.reachable => self.return_call_ref(type_index),
             W::BrOnNull { relative_depth } if self.reachable => self.br_on_null(relative_depth),
             W::BrOnNonNull { relative_depth } if self.reachable => {
                 self.br_on_non_null(relative_depth);
@@ -341,6 +347,9 @@ impl<'a> Translator<'a> {
             | W::Call { .. }
             | W::CallIndirect { .. }
             | W::CallRef { .. }
+            | W::ReturnCall { .. }
+            | W::ReturnCallIndirect { .. }
+            | W::ReturnCallRef { .. }
             | W::BrOnNull { .. }
             | W::BrOnNonNull { .. }
             | W::BrOnCast { .. }
