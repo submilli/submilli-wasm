@@ -20,7 +20,8 @@ const MAGIC: &[u8; 8] = b"submwc01";
 /// v8: tail-call `Op`s (`ReturnCall`/`ReturnCallIndirect`/`ReturnCallRef`, #39).
 /// v9: memory64/table64 — `MemArg.offset` widened to u64, `IrTableType` gains `table64` + u64 limits (#42).
 /// v10: fixed-width SIMD — `Op::Simd(SimdOp)` + `ConstOp::V128` (#37, `simd` feature).
-const ARTIFACT_VERSION: u32 = 10;
+/// v11: relaxed SIMD — 20 `SimdOp::*Relaxed*` variants (#38).
+const ARTIFACT_VERSION: u32 = 11;
 
 /// Encodes a compiled module into the binary artifact format.
 pub(crate) fn encode(inner: &ModuleInner) -> Result<Vec<u8>> {

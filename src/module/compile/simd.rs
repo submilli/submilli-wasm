@@ -308,6 +308,36 @@ impl Translator<'_> {
             W::F64x2ConvertLowI32x4U => self.unop(Op::Simd(SimdOp::F64x2ConvertLowI32x4U)),
             W::F32x4DemoteF64x2Zero => self.unop(Op::Simd(SimdOp::F32x4DemoteF64x2Zero)),
             W::F64x2PromoteLowF32x4 => self.unop(Op::Simd(SimdOp::F64x2PromoteLowF32x4)),
+
+            // relaxed SIMD (#38)
+            W::I8x16RelaxedSwizzle => self.binop(Op::Simd(SimdOp::I8x16RelaxedSwizzle)),
+            W::I32x4RelaxedTruncF32x4S => self.unop(Op::Simd(SimdOp::I32x4RelaxedTruncF32x4S)),
+            W::I32x4RelaxedTruncF32x4U => self.unop(Op::Simd(SimdOp::I32x4RelaxedTruncF32x4U)),
+            W::I32x4RelaxedTruncF64x2SZero => {
+                self.unop(Op::Simd(SimdOp::I32x4RelaxedTruncF64x2SZero))
+            }
+            W::I32x4RelaxedTruncF64x2UZero => {
+                self.unop(Op::Simd(SimdOp::I32x4RelaxedTruncF64x2UZero))
+            }
+            W::F32x4RelaxedMadd => self.ternary(Op::Simd(SimdOp::F32x4RelaxedMadd)),
+            W::F32x4RelaxedNmadd => self.ternary(Op::Simd(SimdOp::F32x4RelaxedNmadd)),
+            W::F64x2RelaxedMadd => self.ternary(Op::Simd(SimdOp::F64x2RelaxedMadd)),
+            W::F64x2RelaxedNmadd => self.ternary(Op::Simd(SimdOp::F64x2RelaxedNmadd)),
+            W::I8x16RelaxedLaneselect => self.ternary(Op::Simd(SimdOp::I8x16RelaxedLaneselect)),
+            W::I16x8RelaxedLaneselect => self.ternary(Op::Simd(SimdOp::I16x8RelaxedLaneselect)),
+            W::I32x4RelaxedLaneselect => self.ternary(Op::Simd(SimdOp::I32x4RelaxedLaneselect)),
+            W::I64x2RelaxedLaneselect => self.ternary(Op::Simd(SimdOp::I64x2RelaxedLaneselect)),
+            W::F32x4RelaxedMin => self.binop(Op::Simd(SimdOp::F32x4RelaxedMin)),
+            W::F32x4RelaxedMax => self.binop(Op::Simd(SimdOp::F32x4RelaxedMax)),
+            W::F64x2RelaxedMin => self.binop(Op::Simd(SimdOp::F64x2RelaxedMin)),
+            W::F64x2RelaxedMax => self.binop(Op::Simd(SimdOp::F64x2RelaxedMax)),
+            W::I16x8RelaxedQ15mulrS => self.binop(Op::Simd(SimdOp::I16x8RelaxedQ15mulrS)),
+            W::I16x8RelaxedDotI8x16I7x16S => {
+                self.binop(Op::Simd(SimdOp::I16x8RelaxedDotI8x16I7x16S))
+            }
+            W::I32x4RelaxedDotI8x16I7x16AddS => {
+                self.ternary(Op::Simd(SimdOp::I32x4RelaxedDotI8x16I7x16AddS));
+            }
             _ => return false,
         }
         true

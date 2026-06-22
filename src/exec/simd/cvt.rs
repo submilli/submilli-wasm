@@ -8,7 +8,7 @@ use crate::exec::convert::{
     i32_trunc_sat_f32_s, i32_trunc_sat_f32_u, i32_trunc_sat_f64_s, i32_trunc_sat_f64_u,
 };
 use crate::module::op_simd::SimdOp;
-use crate::{Error, Result};
+use crate::Result;
 
 impl Execution {
     pub(super) fn exec_simd_cvt(&mut self, s: &SimdOp) -> Result<()> {
@@ -56,7 +56,7 @@ impl Execution {
                 self.push_v128(from_f64x2([p(l[0]), p(l[1])]));
             }
 
-            _ => return Err(Error::msg(format!("unimplemented simd op: {s:?}"))),
+            _ => return self.exec_simd_relaxed(s),
         }
         Ok(())
     }

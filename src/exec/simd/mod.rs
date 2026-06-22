@@ -13,6 +13,7 @@ mod icmp;
 mod lane;
 mod lanes;
 mod mem;
+mod relaxed;
 
 use super::Execution;
 use crate::instance::Instance;

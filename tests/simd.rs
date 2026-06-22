@@ -17,7 +17,9 @@ fn i32x4(a: i32, b: i32, c: i32, d: i32) -> V128 {
 
 fn lanes(v: V128) -> [i32; 4] {
     let b = v.as_u128().to_le_bytes();
-    std::array::from_fn(|i| i32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+    std::array::from_fn(|i| {
+        i32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    })
 }
 
 #[test]
@@ -50,4 +52,37 @@ fn v128_param_and_result_roundtrip() {
     let b = i32x4(10, 20, 30, 40);
     assert_eq!(lanes(call(&mut store, "add", a, b)), [11, 22, 33, 44]);
     assert_eq!(lanes(call(&mut store, "mul", a, b)), [10, 40, 90, 160]);
+}
+
+/// Relaxed SIMD (#38): a `relaxed_laneselect` with all-ones/all-zero mask lanes is unambiguous
+/// (bitwise blend), so the deterministic lowering is exercised end-to-end.
+#[test]
+fn relaxed_laneselect_roundtrip() {
+    let engine = Engine::default();
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"(module
+                (func (export "sel") (param v128 v128 v128) (result v128)
+                    (i32x4.relaxed_laneselect (local.get 0) (local.get 1) (local.get 2))))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &module, &[]).unwrap();
+    let f = inst.get_func(&mut store, "sel").unwrap();
+    let mut out = [Val::I32(0)];
+    let mask = i32x4(-1, 0, -1, 0); // pick a, b, a, b
+    f.call(
+        &mut store,
+        &[
+            Val::V128(i32x4(1, 2, 3, 4)),
+            Val::V128(i32x4(10, 20, 30, 40)),
+            Val::V128(mask),
+        ],
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(lanes(out[0].unwrap_v128()), [1, 20, 3, 40]);
 }

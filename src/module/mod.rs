@@ -58,7 +58,8 @@ pub(crate) fn enabled_features() -> WasmFeatures {
 
 #[cfg(feature = "simd")]
 fn simd_features() -> WasmFeatures {
-    WasmFeatures::SIMD
+    // Relaxed SIMD (#38) builds on v128, so it rides the same `simd` feature.
+    WasmFeatures::SIMD | WasmFeatures::RELAXED_SIMD
 }
 
 #[cfg(not(feature = "simd"))]
