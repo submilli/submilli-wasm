@@ -139,9 +139,10 @@ fn fuel_async_yield_interval_guards() {
     let mut store = Store::new(&no_fuel, ());
     assert!(store.fuel_async_yield_interval(Some(10)).is_err());
 
-    // On a sync store (fuel but no async).
+    // On a sync store (fuel but async explicitly disabled — it is on by default now).
     let mut cfg = Config::new();
     cfg.consume_fuel(true);
+    cfg.async_support(false);
     let sync = Engine::new(&cfg).unwrap();
     let mut store = Store::new(&sync, ());
     assert!(store.fuel_async_yield_interval(Some(10)).is_err());

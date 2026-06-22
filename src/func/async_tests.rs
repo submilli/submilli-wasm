@@ -47,6 +47,13 @@ fn async_engine() -> Engine {
     Engine::new(&config).unwrap()
 }
 
+/// An engine with async support explicitly disabled (it is on by default now).
+fn sync_engine() -> Engine {
+    let mut config = Config::new();
+    config.async_support(false);
+    Engine::new(&config).unwrap()
+}
+
 fn module(engine: &Engine, wat: &str) -> Module {
     Module::new(engine, wat::parse_str(wat).unwrap()).unwrap()
 }
@@ -125,28 +132,28 @@ fn instantiate_async_links_modules() {
 }
 
 #[test]
-fn sync_call_rejected_on_async_store() {
-    // A host func needs no instantiation — exercises the sync `Func::call` guard.
+fn sync_call_works_on_async_store() {
+    // Fiber-less: a plain sync `Func::call` is allowed on an async-enabled store.
     let engine = async_engine();
     assert!(engine.is_async());
     let mut store = Store::new(&engine, ());
     let f = Func::wrap(&mut store, || 7i32);
-    let err = f.call(&mut store, &[], &mut [Val::I32(0)]).unwrap_err();
-    assert!(err.to_string().contains("async store"));
+    let mut out = [Val::I32(0)];
+    f.call(&mut store, &[], &mut out).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 7);
 }
 
 #[test]
-fn sync_instance_new_rejected_on_async_store() {
+fn sync_instance_new_works_on_async_store() {
     let engine = async_engine();
     let m = module(&engine, "(module)");
     let mut store = Store::new(&engine, ());
-    let err = Instance::new(&mut store, &m, &[]).unwrap_err();
-    assert!(err.to_string().contains("async store"));
+    Instance::new(&mut store, &m, &[]).unwrap();
 }
 
 #[test]
 fn call_async_rejected_on_sync_store() {
-    let engine = Engine::default(); // async not enabled
+    let engine = sync_engine(); // async explicitly disabled
     let mut store = Store::new(&engine, ());
     let f = Func::wrap(&mut store, || 7i32);
     let err = block_on(f.call_async(&mut store, &[], &mut [Val::I32(0)])).unwrap_err();

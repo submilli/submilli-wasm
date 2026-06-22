@@ -4,7 +4,7 @@
 
 use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
-use crate::value::{FuncType, Mutability, TagType, ValType};
+use crate::value::{FuncType, HeapType, Mutability, TagType, ValType};
 use crate::Result;
 
 /// Whether a GC type may be subtyped further (`final` vs `non-final`).
@@ -191,6 +191,24 @@ macro_rules! handle_id_traits {
 
 handle_id_traits!(StructType);
 handle_id_traits!(ArrayType);
+
+impl From<StructType> for HeapType {
+    fn from(t: StructType) -> Self {
+        HeapType::ConcreteStruct(t)
+    }
+}
+
+impl From<ArrayType> for HeapType {
+    fn from(t: ArrayType) -> Self {
+        HeapType::ConcreteArray(t)
+    }
+}
+
+impl From<FuncType> for HeapType {
+    fn from(t: FuncType) -> Self {
+        HeapType::ConcreteFunc(t)
+    }
+}
 
 /// An exception type — the value types an exception carries. Internally the tag's function type
 /// (`[fields] → []`), so it shares `FuncType`'s engine-canonical identity + refcounting (#27i).

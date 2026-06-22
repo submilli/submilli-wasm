@@ -134,10 +134,16 @@ impl StoreInner {
         }
     }
 
-    /// `extern.convert_any`: an internal `anyref` becomes an `externref`. A wrapper of a host
-    /// extern unwraps to that extern; any other ref is wrapped in a fresh `Internal` entry. A
-    /// host-provided externref used in an `any` position (e.g. a `ref.host` argument) is already
-    /// external — passed through unchanged.
+    /// Mutable sibling of [`externref`](Self::externref).
+    pub(crate) fn externref_mut(&mut self, index: u32) -> Option<&mut (dyn Any + Send + Sync)> {
+        match self.externrefs.0.get_mut(index as usize)? {
+            ExternEntry::Host(v) => Some(v.as_mut()),
+            ExternEntry::Internal(_) => None,
+        }
+    }
+
+    /// `extern.convert_any`: internal `anyref` → `externref` (host wrappers unwrap to their extern;
+    /// any other ref is wrapped in a fresh `Internal` entry; a host externref passes through).
     pub(crate) fn extern_convert_any(&mut self, v: Val) -> Val {
         let handle = match v {
             Val::AnyRef(None) => return Val::ExternRef(None),
@@ -154,9 +160,8 @@ impl StoreInner {
         Val::ExternRef(Some(Rooted::from_raw(idx)))
     }
 
-    /// `any.convert_extern`: an `externref` becomes an `anyref`. An internalized entry recovers
-    /// its original ref; a host extern is wrapped in a fresh `Extern` GC object. A value already
-    /// in the `any` representation (a host ref handed in as `any`) is passed through.
+    /// `any.convert_extern`: `externref` → `anyref` (an internalized entry recovers its original
+    /// ref; a host extern is wrapped in a fresh `Extern` GC object; an `any`-rep value passes through).
     pub(crate) fn any_convert_extern(&mut self, v: Val) -> crate::Result<Val> {
         let idx = match v {
             Val::ExternRef(None) => return Ok(Val::AnyRef(None)),
@@ -176,17 +181,15 @@ impl StoreInner {
         self.gc.alloc(object)
     }
 
-    /// Pins a host-allocated GC object's type for the store's lifetime (one registration per
-    /// distinct type), so the object's bare `type_id` stays valid even if the embedder drops its
-    /// `StructType`/`ArrayType`. Idempotent per type.
+    /// Pins a host-allocated GC object's type for the store's lifetime (idempotent per type), so its
+    /// bare `type_id` stays valid even if the embedder drops its `StructType`/`ArrayType`.
     pub(crate) fn pin_gc_type(&mut self, id: CanonicalTypeId) {
         if self.gc_host_alloc_types.insert(id) {
             self.engine.incref_type(id);
         }
     }
 
-    /// Traps unless an aggregate of `extra_bytes` would still fit under the GC-heap ceiling
-    /// (a pre-check for large `array.new*` before its backing `Vec` is built).
+    /// Traps unless `extra_bytes` fits under the GC-heap ceiling (pre-check for big `array.new*`).
     pub(crate) fn gc_check_capacity(&self, extra_bytes: usize) -> crate::Result<()> {
         self.gc.check_capacity(extra_bytes)
     }
@@ -203,8 +206,7 @@ impl StoreInner {
         self.fuel + self.fuel_reserve
     }
 
-    /// Sets total fuel, splitting it into the active slice + reserve per the yield
-    /// interval (no interval ⇒ all active, reserve 0 — identical to plain metering).
+    /// Sets total fuel, split into active + reserve per the yield interval (none ⇒ all active).
     pub(crate) fn set_fuel(&mut self, total: u64) {
         let active = self
             .fuel_yield_interval
@@ -219,8 +221,7 @@ impl StoreInner {
         self.set_fuel(self.fuel());
     }
 
-    /// Charges one unit from the active slice. `NeedYield` when the slice is empty
-    /// but reserve remains (async yield point); `Exhausted` when no fuel is left.
+    /// Charges one unit; `NeedYield` if only reserve remains (yield point), `Exhausted` if none.
     pub(crate) fn consume_fuel_step(&mut self) -> FuelStep {
         if self.fuel > 0 {
             self.fuel -= 1;
@@ -232,8 +233,7 @@ impl StoreInner {
         }
     }
 
-    /// Moves up to one interval's worth of fuel from reserve into the active slice
-    /// (after an async yield). No-op without an interval.
+    /// Moves one interval's fuel from reserve into the active slice (after a yield); no-op if unset.
     pub(crate) fn refuel_from_reserve(&mut self) {
         let take = self
             .fuel_yield_interval

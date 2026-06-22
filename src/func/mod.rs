@@ -88,11 +88,9 @@ impl Func {
         params: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
-        if store.as_context().engine().is_async() {
-            return Err(crate::Error::msg(
-                "cannot use `call` on an async store; use `call_async`",
-            ));
-        }
+        // Sync `call` is permitted even on an async-enabled store: this interpreter has no
+        // fibers, so the sync driver runs fine. (If the call reaches an async host fn, the sync
+        // driver still errors with "synchronous context" — the real constraint.)
         let ty = self.ty(&store);
         check_args(params, &ty)?;
         if results.len() != ty.results().len() {

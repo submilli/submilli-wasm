@@ -96,21 +96,28 @@ impl RecGroupBuilder {
         id: PendingStructId,
         fields: impl IntoIterator<Item = FieldTemplate>,
     ) -> &mut Self {
-        self.define_struct_with_finality_and_supertype(id, Finality::Final, None, fields)
+        self.define_struct_with_finality_and_supertype(
+            id,
+            Finality::Final,
+            None::<StructSuperType>,
+            fields,
+        )
     }
 
     /// Defines a previously-declared struct with explicit finality + optional supertype.
+    /// The supertype accepts anything convertible into a [`StructSuperType`] — a sibling
+    /// [`PendingStructId`] or an already-registered [`StructType`] (matching wasmtime).
     pub fn define_struct_with_finality_and_supertype(
         &mut self,
         id: PendingStructId,
         finality: Finality,
-        supertype: Option<StructSuperType>,
+        supertype: Option<impl Into<StructSuperType>>,
         fields: impl IntoIterator<Item = FieldTemplate>,
     ) -> &mut Self {
         assert_eq!(id.builder_id, self.builder_id, "label from another builder");
         self.members[id.index as usize] = Some(MemberDef::Struct {
             finality,
-            supertype,
+            supertype: supertype.map(Into::into),
             fields: fields.into_iter().collect(),
         });
         self
@@ -128,21 +135,27 @@ impl RecGroupBuilder {
 
     /// Defines a previously-declared array (final, no supertype).
     pub fn define_array(&mut self, id: PendingArrayId, field: FieldTemplate) -> &mut Self {
-        self.define_array_with_finality_and_supertype(id, Finality::Final, None, field)
+        self.define_array_with_finality_and_supertype(
+            id,
+            Finality::Final,
+            None::<ArraySuperType>,
+            field,
+        )
     }
 
     /// Defines a previously-declared array with explicit finality + optional supertype.
+    /// The supertype accepts anything convertible into an [`ArraySuperType`].
     pub fn define_array_with_finality_and_supertype(
         &mut self,
         id: PendingArrayId,
         finality: Finality,
-        supertype: Option<ArraySuperType>,
+        supertype: Option<impl Into<ArraySuperType>>,
         field: FieldTemplate,
     ) -> &mut Self {
         assert_eq!(id.builder_id, self.builder_id, "label from another builder");
         self.members[id.index as usize] = Some(MemberDef::Array {
             finality,
-            supertype,
+            supertype: supertype.map(Into::into),
             field,
         });
         self
@@ -155,41 +168,59 @@ impl RecGroupBuilder {
         id
     }
 
-    /// Defines a previously-declared function type (final, no supertype).
-    pub fn define_func(
-        &mut self,
-        id: PendingFuncId,
-        params: impl IntoIterator<Item = ValTypeTemplate>,
-        results: impl IntoIterator<Item = ValTypeTemplate>,
-    ) -> &mut Self {
-        self.define_func_with_finality_and_supertype(id, Finality::Final, None, params, results)
+    /// Defines a previously-declared function type (final, no supertype). Params/results accept
+    /// anything convertible into [`ValTypeTemplate`] — e.g. a plain [`ValType`](crate::ValType).
+    pub fn define_func<P, R>(&mut self, id: PendingFuncId, params: P, results: R) -> &mut Self
+    where
+        P: IntoIterator,
+        P::Item: Into<ValTypeTemplate>,
+        R: IntoIterator,
+        R::Item: Into<ValTypeTemplate>,
+    {
+        self.define_func_with_finality_and_supertype(
+            id,
+            Finality::Final,
+            None::<FuncSuperType>,
+            params,
+            results,
+        )
     }
 
     /// Defines a previously-declared function type with explicit finality + optional supertype.
-    pub fn define_func_with_finality_and_supertype(
+    /// The supertype accepts anything convertible into a [`FuncSuperType`]; params/results accept
+    /// anything convertible into [`ValTypeTemplate`].
+    pub fn define_func_with_finality_and_supertype<P, R>(
         &mut self,
         id: PendingFuncId,
         finality: Finality,
-        supertype: Option<FuncSuperType>,
-        params: impl IntoIterator<Item = ValTypeTemplate>,
-        results: impl IntoIterator<Item = ValTypeTemplate>,
-    ) -> &mut Self {
+        supertype: Option<impl Into<FuncSuperType>>,
+        params: P,
+        results: R,
+    ) -> &mut Self
+    where
+        P: IntoIterator,
+        P::Item: Into<ValTypeTemplate>,
+        R: IntoIterator,
+        R::Item: Into<ValTypeTemplate>,
+    {
         assert_eq!(id.builder_id, self.builder_id, "label from another builder");
         self.members[id.index as usize] = Some(MemberDef::Func {
             finality,
-            supertype,
-            params: params.into_iter().collect(),
-            results: results.into_iter().collect(),
+            supertype: supertype.map(Into::into),
+            params: params.into_iter().map(Into::into).collect(),
+            results: results.into_iter().map(Into::into).collect(),
         });
         self
     }
 
     /// Declares + defines a function type in one step.
-    pub fn add_func(
-        &mut self,
-        params: impl IntoIterator<Item = ValTypeTemplate>,
-        results: impl IntoIterator<Item = ValTypeTemplate>,
-    ) -> PendingFuncId {
+    pub fn add_func<P, R>(&mut self, params: P, results: R) -> PendingFuncId
+    where
+        P: IntoIterator,
+        P::Item: Into<ValTypeTemplate>,
+        R: IntoIterator,
+        R::Item: Into<ValTypeTemplate>,
+    {
         let id = self.declare_func();
         self.define_func(id, params, results);
         id

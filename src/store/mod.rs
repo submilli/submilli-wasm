@@ -46,8 +46,9 @@ pub(crate) enum ResourceLimiterInner<T> {
 pub(crate) type HostFunc<T> =
     Arc<dyn Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync>;
 
-/// An async host-function closure: returns a boxed future the async driver awaits.
-/// Well-formed for any `T` (the `Send` bounds sit on the `dyn Fn`/future, not `T`).
+/// An async host-function closure: returns a boxed future the async driver awaits. The future is
+/// `Send` (matching wasmtime), which keeps the driver's `call_async`/`execute_async` futures `Send`
+/// so embedders can hold them across their own `Send`-bounded `.await` points.
 #[cfg(feature = "async")]
 pub(crate) type AsyncHostFunc<T> = Arc<
     dyn for<'a> Fn(

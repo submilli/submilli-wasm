@@ -45,6 +45,26 @@ pub enum Val {
 }
 
 impl Val {
+    /// A null `funcref` (`(ref null func)`).
+    pub fn null_func_ref() -> Val {
+        Val::FuncRef(None)
+    }
+
+    /// A null `externref` (`(ref null extern)`).
+    pub fn null_extern_ref() -> Val {
+        Val::ExternRef(None)
+    }
+
+    /// A null `anyref` (`(ref null any)`).
+    pub fn null_any_ref() -> Val {
+        Val::AnyRef(None)
+    }
+
+    /// A null `exnref` (`(ref null exn)`).
+    pub fn null_exn_ref() -> Val {
+        Val::ExnRef(None)
+    }
+
     /// Returns the `i32` if this is one, else `None`.
     pub fn i32(&self) -> Option<i32> {
         match self {

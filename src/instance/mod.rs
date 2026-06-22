@@ -69,11 +69,8 @@ impl Instance {
         module: &Module,
         imports: &[Extern],
     ) -> Result<Instance> {
-        if store.as_context().engine().is_async() {
-            return Err(Error::msg(
-                "cannot use `new` on an async store; use `new_async`",
-            ));
-        }
+        // Sync instantiation is permitted on an async-enabled store (no fibers here). A `start`
+        // that calls an async host fn still errors via the sync driver's "synchronous context".
         let (instance, start) = instantiate_resolve_start(&mut store, module, imports)?;
         // The start function runs before any export is callable; a trap aborts
         // instantiation. Routed through `Func::call` so it handles wasm/host starts.

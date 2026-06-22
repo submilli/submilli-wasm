@@ -73,6 +73,19 @@ impl<T: 'static> core::fmt::Debug for Linker<T> {
     }
 }
 
+// Manual `Clone` (mirrors wasmtime's `Linker: Clone`) so we don't require `T: Clone` — the host
+// definitions in `map` are `Arc`-backed and clone cheaply (see `Def`'s manual `Clone`).
+impl<T: 'static> Clone for Linker<T> {
+    fn clone(&self) -> Self {
+        Linker {
+            engine: self.engine.clone(),
+            allow_shadowing: self.allow_shadowing,
+            allow_unknown_exports: self.allow_unknown_exports,
+            map: self.map.clone(),
+        }
+    }
+}
+
 impl<T: 'static> Linker<T> {
     pub fn new(engine: &Engine) -> Linker<T> {
         Linker {
@@ -81,6 +94,11 @@ impl<T: 'static> Linker<T> {
             allow_unknown_exports: false,
             map: HashMap::new(),
         }
+    }
+
+    /// The engine this linker is bound to.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub fn define(

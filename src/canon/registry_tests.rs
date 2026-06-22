@@ -126,7 +126,7 @@ mod reclaim {
         bb.define_struct_with_finality_and_supertype(
             base_id,
             Finality::NonFinal,
-            None,
+            None::<StructSuperType>,
             [FieldTemplate::from(i32_field(Mutability::Const))],
         );
         let base_group = bb.build().unwrap();

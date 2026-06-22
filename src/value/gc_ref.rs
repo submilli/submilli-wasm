@@ -4,14 +4,13 @@
 use core::any::Any;
 use core::marker::PhantomData;
 
-use crate::canon::Layout;
 use crate::store::{
-    anyref_handle_slot, decode_anyref_handle, read_slot, slot_accepts, write_slot, AnyRefHandle,
-    AsContext, AsContextMut, GcObject, ObjKind, StoreContext, StoreContextMut,
+    decode_anyref_handle, AnyRefHandle, AsContext, AsContextMut, GcObject, ObjKind, StoreContext,
+    StoreContextMut,
 };
-use crate::value::gc_type::{ArrayType, StructType};
-use crate::value::Val;
 use crate::{Error, Result};
+
+use super::gc_aggregate::{ArrayRef, StructRef};
 
 /// A rooted handle to a GC value, keeping it alive within a [`RootScope`].
 /// `Copy`, regardless of the referent type (mirrors `wasmtime::Rooted`).
@@ -41,6 +40,13 @@ impl<T> Rooted<T> {
     /// The raw handle/index behind this rooted reference.
     pub(crate) fn raw(self) -> u32 {
         self.index
+    }
+
+    /// Whether `a` and `b` refer to the same GC object (reference identity). Under the grow-only
+    /// arena each live object has a unique handle, so this is handle equality. An associated
+    /// function (not a method), matching `wasmtime::Rooted::ref_eq`'s `(store, a, b)` shape.
+    pub fn ref_eq<U>(_store: impl AsContext, a: &Rooted<T>, b: &Rooted<U>) -> Result<bool> {
+        Ok(a.index == b.index)
     }
 }
 
@@ -119,6 +125,18 @@ impl Rooted<ExternRef> {
     {
         Ok(store.into().inner().externref(self.index))
     }
+
+    /// Mutably borrows the host payload behind this `externref`. Mirrors
+    /// `wasmtime::ExternRef::data_mut`.
+    pub fn data_mut<'a, T>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> Result<Option<&'a mut (dyn Any + Send + Sync)>>
+    where
+        T: 'static,
+    {
+        Ok(store.into().into_inner_mut().externref_mut(self.index))
+    }
 }
 
 /// A managed GC reference under the `any` hierarchy (`anyref`). The handle lives in the wrapping
@@ -171,207 +189,8 @@ pub struct ExnRef {
     _private: (),
 }
 
-/// A GC struct instance (`structref`).
-#[derive(Debug)]
-pub struct StructRef {
-    _private: (),
-}
-
-/// Pre-allocation handle for [`StructRef::new`]: holds the `StructType` (a registration, so the
-/// type stays alive until allocation) plus its cached packed layout (amortizing the lookup —
-/// wasmtime's `*Pre` purpose).
-#[derive(Debug)]
-pub struct StructRefPre {
-    ty: StructType,
-    layout: Layout,
-}
-
-impl StructRefPre {
-    pub fn new(store: impl AsContextMut, ty: StructType) -> Self {
-        let _ = store; // no rooting/registration needed under the null collector
-        let fields: Vec<_> = ty.fields().collect();
-        StructRefPre {
-            ty,
-            layout: Layout::for_struct(&fields),
-        }
-    }
-}
-
-impl StructRef {
-    /// Allocates a struct from `allocator` with the given field values (which must match the
-    /// type's fields in count and kind).
-    pub fn new(
-        mut store: impl AsContextMut,
-        allocator: &StructRefPre,
-        fields: &[Val],
-    ) -> Result<Rooted<StructRef>> {
-        let Layout::Struct {
-            fields: slots,
-            size,
-        } = &allocator.layout
-        else {
-            unreachable!("struct pre carries a struct layout");
-        };
-        if fields.len() != slots.len() {
-            return Err(Error::msg("wrong number of struct fields"));
-        }
-        for (slot, v) in slots.iter().zip(fields) {
-            if !slot_accepts(*slot, v) {
-                return Err(Error::msg("struct field value has the wrong type"));
-            }
-        }
-        let mut data = vec![0u8; *size];
-        for (slot, v) in slots.iter().zip(fields) {
-            write_slot(*slot, &mut data, *v);
-        }
-        let type_id = allocator.ty.canonical_id();
-        let mut ctx = store.as_context_mut();
-        let inner = ctx.inner_mut();
-        inner.gc_check_capacity(*size)?;
-        inner.pin_gc_type(type_id); // keep the type alive for the object's (store) lifetime
-        let idx = inner.alloc_gc(GcObject::new_struct(type_id, data.into_boxed_slice()))?;
-        Ok(Rooted::from_raw(anyref_handle_slot(idx)))
-    }
-}
-
-impl Rooted<StructRef> {
-    /// Reads field `index`.
-    pub fn field(&self, store: impl AsContext, index: usize) -> Result<Val> {
-        let ctx = store.as_context();
-        let inner = ctx.inner();
-        let slot = gc_slot(inner, self.raw())?;
-        let obj = gc_object(inner, slot)?;
-        let layout = Layout::for_struct(&inner.engine().struct_fields(obj.header.type_id));
-        let field = layout
-            .get_field(index)
-            .ok_or_else(|| Error::msg("struct field index out of bounds"))?;
-        Ok(read_slot(field, &obj.data))
-    }
-
-    /// Upcasts this `structref` to an `anyref`.
-    pub fn to_anyref(self) -> Rooted<AnyRef> {
-        Rooted::from_raw(self.raw())
-    }
-}
-
-impl From<Rooted<StructRef>> for Rooted<AnyRef> {
-    fn from(r: Rooted<StructRef>) -> Self {
-        Rooted::from_raw(r.raw())
-    }
-}
-
-/// A GC array instance (`arrayref`).
-#[derive(Debug)]
-pub struct ArrayRef {
-    _private: (),
-}
-
-/// Pre-allocation handle for [`ArrayRef::new`]: holds the `ArrayType` (a registration) + cached
-/// element layout (like [`StructRefPre`]).
-#[derive(Debug)]
-pub struct ArrayRefPre {
-    ty: ArrayType,
-    layout: Layout,
-}
-
-impl ArrayRefPre {
-    pub fn new(store: impl AsContextMut, ty: ArrayType) -> Self {
-        let _ = store;
-        let layout = Layout::for_array(&ty.field_type());
-        ArrayRefPre { ty, layout }
-    }
-}
-
-impl ArrayRef {
-    /// Allocates an array of `len` copies of `elem`.
-    pub fn new(
-        store: impl AsContextMut,
-        allocator: &ArrayRefPre,
-        elem: &Val,
-        len: u32,
-    ) -> Result<Rooted<ArrayRef>> {
-        let count = len as usize;
-        Self::alloc(store, allocator, count, |_| elem)
-    }
-
-    /// Allocates a fixed array from the given elements.
-    pub fn new_fixed(
-        store: impl AsContextMut,
-        allocator: &ArrayRefPre,
-        elems: &[Val],
-    ) -> Result<Rooted<ArrayRef>> {
-        Self::alloc(store, allocator, elems.len(), |i| &elems[i])
-    }
-
-    /// Shared array constructor: validates each element, packs the body, allocates.
-    fn alloc<'a>(
-        mut store: impl AsContextMut,
-        allocator: &ArrayRefPre,
-        count: usize,
-        elem_at: impl Fn(usize) -> &'a Val,
-    ) -> Result<Rooted<ArrayRef>> {
-        let stride = allocator.layout.stride();
-        let byte_len = count
-            .checked_mul(stride)
-            .ok_or_else(|| Error::msg("array too large"))?;
-        for i in 0..count {
-            if !slot_accepts(allocator.layout.elem_at(0), elem_at(i)) {
-                return Err(Error::msg("array element value has the wrong type"));
-            }
-        }
-        let mut data = vec![0u8; byte_len];
-        for i in 0..count {
-            write_slot(allocator.layout.elem_at(i), &mut data, *elem_at(i));
-        }
-        let type_id = allocator.ty.canonical_id();
-        let mut ctx = store.as_context_mut();
-        let inner = ctx.inner_mut();
-        inner.gc_check_capacity(byte_len)?;
-        inner.pin_gc_type(type_id);
-        let idx = inner.alloc_gc(GcObject::new_array(
-            type_id,
-            count as u32,
-            data.into_boxed_slice(),
-        ))?;
-        Ok(Rooted::from_raw(anyref_handle_slot(idx)))
-    }
-}
-
-impl Rooted<ArrayRef> {
-    /// The number of elements.
-    pub fn len(&self, store: impl AsContext) -> Result<u32> {
-        let ctx = store.as_context();
-        let slot = gc_slot(ctx.inner(), self.raw())?;
-        Ok(gc_object(ctx.inner(), slot)?.header.len)
-    }
-
-    /// Reads element `index`.
-    pub fn get(&self, store: impl AsContext, index: u32) -> Result<Val> {
-        let ctx = store.as_context();
-        let inner = ctx.inner();
-        let slot = gc_slot(inner, self.raw())?;
-        let obj = gc_object(inner, slot)?;
-        if index >= obj.header.len {
-            return Err(Error::msg("array index out of bounds"));
-        }
-        let layout = Layout::for_array(&inner.engine().array_field(obj.header.type_id));
-        Ok(read_slot(layout.elem_at(index as usize), &obj.data))
-    }
-
-    /// Upcasts this `arrayref` to an `anyref`.
-    pub fn to_anyref(self) -> Rooted<AnyRef> {
-        Rooted::from_raw(self.raw())
-    }
-}
-
-impl From<Rooted<ArrayRef>> for Rooted<AnyRef> {
-    fn from(r: Rooted<ArrayRef>) -> Self {
-        Rooted::from_raw(r.raw())
-    }
-}
-
 /// Decodes an `anyref` handle to a heap slot, erroring on an `i31` (which isn't a heap object).
-fn gc_slot(inner: &crate::store::StoreInner, handle: u32) -> Result<u32> {
+pub(super) fn gc_slot(inner: &crate::store::StoreInner, handle: u32) -> Result<u32> {
     match decode_anyref_handle(handle) {
         AnyRefHandle::Slot(i) => Ok(i),
         AnyRefHandle::I31(_) => Err(Error::msg("reference is an i31, not a heap object")),
@@ -383,7 +202,7 @@ fn gc_slot(inner: &crate::store::StoreInner, handle: u32) -> Result<u32> {
 }
 
 /// The object at a heap slot, erroring if the handle dangles.
-fn gc_object(inner: &crate::store::StoreInner, slot: u32) -> Result<&GcObject> {
+pub(super) fn gc_object(inner: &crate::store::StoreInner, slot: u32) -> Result<&GcObject> {
     inner
         .gc_object(slot)
         .ok_or_else(|| Error::msg("dangling gc reference"))

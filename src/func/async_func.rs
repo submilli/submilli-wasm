@@ -79,7 +79,13 @@ impl Func {
         if results.len() != ty.results().len() {
             return Err(crate::Error::msg("wrong number of results"));
         }
-        let out = match self.resolve_callee(store.as_context().inner()) {
+        // Bind the callee to a local first: if the `store.as_context()` borrow were taken in the
+        // `match` scrutinee it would live through the whole match body — including the `.await`s
+        // below — making this future hold a shared `&Store` across a suspension point. That would
+        // (spuriously) require `T: Sync`. Dropping the borrow here keeps the future `Send` for any
+        // `T: Send`, matching wasmtime.
+        let callee = self.resolve_callee(store.as_context().inner());
+        let out = match callee {
             Callee::Wasm(instance, func_index) => {
                 let code = store
                     .as_context()

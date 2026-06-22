@@ -38,6 +38,15 @@ impl RefType {
         }
     }
 
+    /// A *nullable* reference to `heap` — the shape of the wasmtime `*REF` constants (see
+    /// [`ref_const`](super::ref_const)).
+    pub(crate) const fn new_nullable(heap: HeapType) -> RefType {
+        RefType {
+            nullable: true,
+            heap,
+        }
+    }
+
     pub fn is_nullable(&self) -> bool {
         self.nullable
     }

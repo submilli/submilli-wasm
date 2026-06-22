@@ -23,7 +23,11 @@ impl Default for Config {
             max_wasm_stack: None,
             collector: Collector::default(),
             gc_memory_threshold: None,
-            async_support: false,
+            // Enabled by default (unlike wasmtime, where it's opt-in): this interpreter is
+            // fiber-less, so an async-enabled store runs sync calls just as well, and defaulting
+            // on lets embedders use `call_async`/`fuel_async_yield_interval` without an explicit
+            // `async_support(true)`. Call `async_support(false)` to disable the async-only APIs.
+            async_support: true,
             // wasmtime defaults: backtraces on, DWARF detail from the environment, no debug info.
             wasm_backtrace: true,
             wasm_backtrace_details: WasmBacktraceDetails::default(),

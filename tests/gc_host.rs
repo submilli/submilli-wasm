@@ -138,7 +138,7 @@ fn self_referential_struct_round_trip() {
     builder.define_struct_with_finality_and_supertype(
         node,
         Finality::Final,
-        None,
+        None::<StructSuperType>,
         [
             FieldTemplate::new(Mutability::Var, ValType::I32),
             FieldTemplate::ref_(Mutability::Var, true, node),
@@ -206,7 +206,7 @@ fn rec_group_errors_on_undefined_member() {
     nf.define_struct_with_finality_and_supertype(
         nf_id,
         Finality::NonFinal,
-        None,
+        None::<StructSuperType>,
         [FieldTemplate::new(Mutability::Const, ValType::I32)],
     );
     let base_group = nf.build().unwrap();
