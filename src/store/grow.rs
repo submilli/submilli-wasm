@@ -315,4 +315,49 @@ impl<T: 'static> Store<T> {
         }
         Ok(None)
     }
+
+    /// Async sibling of [`gc_reserve_host`](Self::gc_reserve_host): awaits an async limiter when
+    /// host code allocates GC objects from an async context.
+    pub(crate) async fn gc_reserve_host_async(&mut self, charge: usize) -> Result<()> {
+        if self.inner.gc.fits(charge) {
+            return Ok(());
+        }
+        if !self
+            .inner
+            .gc
+            .is_free_grant(self.inner.gc.desired_reservation(charge))
+            && self.inner.gc.is_collecting()
+        {
+            let roots = self.inner.exec_roots();
+            self.inner.gc_collect(&roots);
+            if self.inner.gc.fits(charge) {
+                return Ok(());
+            }
+        }
+        let target = self.inner.gc.desired_reservation(charge);
+        if self.inner.gc.is_free_grant(target) {
+            let granted = self.inner.gc.grant(target);
+            self.inner.engine().add_gc_committed(granted);
+            return Ok(());
+        }
+
+        let current = self.inner.gc.reserved();
+        let allowed = match &mut self.limiter {
+            None => target <= super::gc::ABORT_SAFETY_CAP,
+            Some(ResourceLimiterInner::Sync(l)) => {
+                l(&mut self.data).memory_growing(current, target, None)?
+            }
+            Some(ResourceLimiterInner::Async(l)) => {
+                l(&mut self.data)
+                    .memory_growing(current, target, None)
+                    .await?
+            }
+        };
+        if !allowed {
+            return Err(crate::gc::GcHeapOutOfMemory::new((), charge as u64).into());
+        }
+        let granted = self.inner.gc.grant(target);
+        self.inner.engine().add_gc_committed(granted);
+        Ok(())
+    }
 }

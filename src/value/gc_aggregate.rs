@@ -7,7 +7,7 @@ use crate::store::{
     anyref_handle_slot, read_slot, slot_accepts, write_slot, AsContext, AsContextMut, GcObject,
     StoreInner,
 };
-use crate::value::gc_type::{ArrayType, StructType};
+use crate::value::gc_type::{ArrayType, StorageType, StructType};
 use crate::value::{Mutability, Val};
 use crate::{Error, Result};
 
@@ -201,6 +201,67 @@ impl ArrayRef {
         Self::alloc(store, allocator, elems.len(), |i| &elems[i])
     }
 
+    /// Allocates an `i8` array initialized from the given byte slice.
+    ///
+    /// This bypasses the transient `Val` slice used by [`ArrayRef::new_fixed`]
+    /// and copies the packed element body directly.
+    pub fn new_from_i8_slice(
+        mut store: impl AsContextMut,
+        allocator: &ArrayRefPre,
+        elems: &[u8],
+    ) -> Result<Rooted<ArrayRef>> {
+        Self::validate_i8_allocator(allocator)?;
+        let byte_len = Self::i8_slice_len(elems)?;
+        let type_id = allocator.ty.canonical_id();
+        let mut ctx = store.as_context_mut();
+        let charge = ctx.inner().gc_object_charge(byte_len);
+        ctx.0.gc_reserve_host(charge)?;
+        let inner = ctx.inner_mut();
+        inner.pin_gc_type(type_id);
+        let idx = inner.alloc_gc(GcObject::new_array(
+            type_id,
+            elems.to_vec().into_boxed_slice(),
+        ))?;
+        Ok(root_new_gc(inner, idx))
+    }
+
+    /// Async sibling of [`ArrayRef::new_from_i8_slice`].
+    #[cfg(feature = "async")]
+    pub async fn new_from_i8_slice_async<T: 'static>(
+        mut store: impl AsContextMut<Data = T>,
+        allocator: &ArrayRefPre,
+        elems: &[u8],
+    ) -> Result<Rooted<ArrayRef>> {
+        Self::validate_i8_allocator(allocator)?;
+        let byte_len = Self::i8_slice_len(elems)?;
+        let type_id = allocator.ty.canonical_id();
+        let mut ctx = store.as_context_mut();
+        let charge = ctx.inner().gc_object_charge(byte_len);
+        ctx.store_mut().gc_reserve_host_async(charge).await?;
+        let inner = ctx.inner_mut();
+        inner.pin_gc_type(type_id);
+        let idx = inner.alloc_gc(GcObject::new_array(
+            type_id,
+            elems.to_vec().into_boxed_slice(),
+        ))?;
+        Ok(root_new_gc(inner, idx))
+    }
+
+    fn validate_i8_allocator(allocator: &ArrayRefPre) -> Result<()> {
+        if allocator.ty.element_type() != StorageType::I8 {
+            return Err(Error::msg(
+                "element type mismatch: cannot initialize a non-i8 array from a byte slice",
+            ));
+        }
+        debug_assert_eq!(allocator.layout.stride(), 1);
+        Ok(())
+    }
+
+    fn i8_slice_len(elems: &[u8]) -> Result<usize> {
+        let len = u32::try_from(elems.len()).map_err(|_| Error::msg("array too large"))?;
+        Ok(len as usize)
+    }
+
     /// Shared array constructor: validates each element, packs the body, allocates.
     fn alloc<'a>(
         mut store: impl AsContextMut,
@@ -258,6 +319,31 @@ impl Rooted<ArrayRef> {
             return Err(Error::msg("array index out of bounds"));
         }
         Ok(read_slot(layout.elem_at(index as usize), &obj.data))
+    }
+
+    /// Copies this `i8` array's raw element bytes into `dst`.
+    ///
+    /// The destination length must exactly match this array's length.
+    pub fn copy_to_i8_slice(&self, store: impl AsContext, dst: &mut [u8]) -> Result<()> {
+        let ctx = store.as_context();
+        let inner = ctx.inner();
+        let slot = self.gc_slot_checked(inner)?;
+        let obj = gc_object(inner, slot)?;
+        let field_ty = inner.engine().array_field(obj.header.type_id);
+        if *field_ty.element_type() != StorageType::I8 {
+            return Err(Error::msg(
+                "element type mismatch: cannot copy a non-i8 array into a byte slice",
+            ));
+        }
+        let len = obj.array_len(Layout::for_array(&field_ty).stride());
+        let dst_len = u32::try_from(dst.len()).map_err(|_| Error::msg("destination too large"))?;
+        if dst_len != len {
+            return Err(Error::msg(format!(
+                "destination slice length is {dst_len} but the array length is {len}"
+            )));
+        }
+        dst.copy_from_slice(&obj.data);
+        Ok(())
     }
 
     /// Writes `value` to element `index`. Errors if the index is out of bounds, the element type

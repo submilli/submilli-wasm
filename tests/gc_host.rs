@@ -66,6 +66,77 @@ fn host_builds_and_reads_struct_and_array() {
 }
 
 #[test]
+fn array_i8_slice_roundtrip() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+
+    let array_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+
+    let src = [0x80, 0xFF, 0x00, 0x01, 0x7F];
+    let array = ArrayRef::new_from_i8_slice(&mut store, &pre, &src).unwrap();
+    assert_eq!(array.len(&store).unwrap(), 5);
+
+    let mut dst = [0u8; 5];
+    array.copy_to_i8_slice(&store, &mut dst).unwrap();
+    assert_eq!(dst, src);
+
+    // Normal `get` reads packed i8 elements with the zero-extended `array.get_u`
+    // interpretation.
+    assert_eq!(array.get(&store, 0).unwrap().unwrap_i32(), 128);
+    assert_eq!(array.get(&store, 1).unwrap().unwrap_i32(), 255);
+
+    let fixed = ArrayRef::new_fixed(
+        &mut store,
+        &pre,
+        &src.iter().map(|&b| Val::I32(b.into())).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for i in 0..src.len() as u32 {
+        assert_eq!(
+            array.get(&store, i).unwrap().unwrap_i32(),
+            fixed.get(&store, i).unwrap().unwrap_i32(),
+        );
+    }
+
+    let empty = ArrayRef::new_from_i8_slice(&mut store, &pre, &[]).unwrap();
+    assert_eq!(empty.len(&store).unwrap(), 0);
+    empty.copy_to_i8_slice(&store, &mut []).unwrap();
+
+    assert!(array.copy_to_i8_slice(&store, &mut [0u8; 3]).is_err());
+
+    let i32_ty = ArrayType::new(
+        &engine,
+        FieldType::new(Mutability::Var, StorageType::ValType(ValType::I32)),
+    );
+    let i32_pre = ArrayRefPre::new(&mut store, i32_ty);
+    assert!(ArrayRef::new_from_i8_slice(&mut store, &i32_pre, &[1, 2, 3]).is_err());
+    let i32_array = ArrayRef::new(&mut store, &i32_pre, &Val::I32(0), 3).unwrap();
+    assert!(i32_array.copy_to_i8_slice(&store, &mut [0u8; 3]).is_err());
+}
+
+#[test]
+#[cfg(feature = "async")]
+fn array_i8_slice_async() {
+    let mut config = submilli_wasm::Config::new();
+    config.async_support(true);
+    let engine = Engine::new(&config).unwrap();
+    let mut store = Store::new(&engine, ());
+
+    let array_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+
+    let src = [0x80, 0xFF, 0x00, 0x01, 0x7F];
+    let array =
+        pollster::block_on(ArrayRef::new_from_i8_slice_async(&mut store, &pre, &src)).unwrap();
+    assert_eq!(array.len(&store).unwrap(), 5);
+
+    let mut dst = [0u8; 5];
+    array.copy_to_i8_slice(&store, &mut dst).unwrap();
+    assert_eq!(dst, src);
+}
+
+#[test]
 fn host_reads_guest_produced_struct() {
     let engine = Engine::default();
     let mut store = Store::new(&engine, ());
