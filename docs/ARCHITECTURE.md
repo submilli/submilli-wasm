@@ -245,6 +245,20 @@ already rejects it, locked by a regression test.)
 ### Calls (zero-copy args)
 On `Call`, callee args are already the top `n_params` operands; the callee's `locals_base = caller_top − n_params`, so arguments become the callee's first locals with no copy (the long-promised "JVM trick", per Wizard). On `Return`, the top `n_results` operands are moved down to `locals_base`, the frame is popped, and execution continues in the caller. Tail calls (`return_call`) reuse the caller's frame slot.
 
+### Host re-entry on the shared stacks, and `max_wasm_stack` (#30)
+A host function can re-enter wasm (`Func::call` from inside the closure). Rather than spin up a
+fresh `Execution` per re-entry, the single `Execution` is **parked on the store** (`StoreInner.
+exec_slot`) for the host call's duration; the re-entrant call **reuses the same operand/frame
+stacks**, pushing a `Delimiter::HostReentry` boundary frame and running with a `stop_depth` one
+above it (`run`/`do_return`/`unwind` stop there, so the parked outer call stays untouched — and an
+inner trap/exception surfaces to the host's `Func::call`, never leaking into the outer call). One
+unified stack means **`max_wasm_stack` is enforced across the host boundary** by the same
+`stack_bytes()` check (the parked outer frames count). Because each host crossing still nests
+native Rust frames (a sync closure runs on the native stack) that the ~24-byte wasm frame can't
+bound, each `HostReentry` crossing is charged a fixed `HOST_REENTRY_RESERVE` (≈4 KiB) folded into
+`stack_bytes()`, so the budget caps re-entry depth (~128 at the 512 KiB default) below native
+exhaustion — pure host↔wasm ping-pong traps `StackOverflow` instead of aborting the process.
+
 ### The loop
 ```rust
 enum Step { Done, Trap(Trap), Suspend(SuspendReason) }

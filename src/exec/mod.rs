@@ -51,7 +51,21 @@ pub(crate) struct Execution {
     /// (1 B/slot) and far simpler to keep exhaustive than gating per-op.
     shadow: Vec<cell::RefTag>,
     frames: Vec<Frame>,
+    /// Count of live [`Delimiter::HostReentry`] boundaries on `frames` — the host→wasm crossings
+    /// nested on the *native* Rust stack. Each is charged [`HOST_REENTRY_RESERVE`] in `stack_bytes`
+    /// so `max_wasm_stack` bounds re-entry depth below native exhaustion (#30). O(1): bumped in
+    /// `enter_call`, dropped in `take_results`/`discard_to`.
+    host_reentry_depth: usize,
 }
+
+/// Native-stack bytes charged per host→wasm re-entry crossing against `max_wasm_stack` (#30). A
+/// host fn that re-enters wasm (`Func::call`) nests interpreter + closure frames on the native Rust
+/// stack — invisible to the heap-based wasm frame accounting (a wasm frame is ~24 B; the native
+/// frame it begets is ~1 KB). Weighting each crossing with this reserve makes the single
+/// `max_wasm_stack` budget bound crossings well below native exhaustion (~128 at the 512 KiB
+/// default) without a separate knob, so unbounded host↔wasm ping-pong traps `StackOverflow` instead
+/// of aborting the process.
+const HOST_REENTRY_RESERVE: usize = 4096;
 
 // Parkability: keep `Execution` `Send` so async can await with it at rest. Compile-time check —
 // a future non-`Send` field (e.g. an `Rc`) fails here rather than at an `.await`.
@@ -68,6 +82,7 @@ impl Default for Execution {
             values: Vec::new(),
             shadow: Vec::new(),
             frames: Vec::new(),
+            host_reentry_depth: 0,
         }
     }
 }
@@ -84,10 +99,21 @@ impl Execution {
         code: Arc<CompiledFunc>,
         args: Vec<Val>,
     ) {
+        if delim == Delimiter::HostReentry {
+            self.host_reentry_depth += 1;
+        }
         self.push_delimiter(delim, instance, code.clone());
         self.shadow.extend(args.iter().map(cell::RefTag::of_val));
         self.values.extend(args.into_iter().map(cell::encode));
         self.push_call(instance, func_index, code);
+    }
+
+    /// Drops this call's `HostReentry` reserve (if its boundary at `stop_depth` was one) as its
+    /// frames are about to be truncated away. Mirrors the `enter_call` bump.
+    fn release_reentry(&mut self, stop_depth: usize) {
+        if self.frames.get(stop_depth).and_then(|f| f.delimiter) == Some(Delimiter::HostReentry) {
+            self.host_reentry_depth -= 1;
+        }
     }
 
     /// On a finished (sub-)call: splits off its result cells (everything above `value_base`) and
@@ -95,6 +121,7 @@ impl Execution {
     fn take_results(&mut self, value_base: usize, stop_depth: usize) -> Vec<cell::Cell> {
         let results = self.values.split_off(value_base);
         self.shadow.truncate(value_base);
+        self.release_reentry(stop_depth);
         self.frames.truncate(stop_depth);
         results
     }
@@ -104,6 +131,7 @@ impl Execution {
     fn discard_to(&mut self, value_base: usize, stop_depth: usize) {
         self.values.truncate(value_base);
         self.shadow.truncate(value_base);
+        self.release_reentry(stop_depth);
         self.frames.truncate(stop_depth);
     }
 
@@ -114,6 +142,9 @@ impl Execution {
         self.values.len() * std::mem::size_of::<cell::Cell>()
             + self.shadow.len() // 1 byte per operand slot (the GC root shadow)
             + self.frames.len() * std::mem::size_of::<Frame>()
+            // Charge each host→wasm crossing its native-stack cost so re-entrancy is bounded by the
+            // same budget as wasm recursion (#30) — the parked outer frames are already counted above.
+            + self.host_reentry_depth * HOST_REENTRY_RESERVE
     }
 
     fn push_call(&mut self, instance: Instance, func_index: u32, code: Arc<CompiledFunc>) {
@@ -189,12 +220,20 @@ impl Execution {
             return Ok(Outcome::Finished);
         }
         let stack_limit = inner.engine().max_wasm_stack();
+        let (mut code, mut ip, mut base, mut instance) = self.top();
+        // Gate re-entry on the inherited budget: the per-`DoCall` check below only bounds wasm
+        // recursion *within* this segment, so a re-entered call whose body does no wasm call (just
+        // a host call) would never be checked. With the host-crossing reserve folded into
+        // `stack_bytes`, this entry check makes even pure host↔wasm ping-pong trap here rather than
+        // abort the native stack (#30).
+        if self.stack_bytes() >= stack_limit {
+            return Err(self.attach_trap_backtrace(inner, Trap::StackOverflow.into(), ip));
+        }
         let fuel_enabled = inner.engine().consume_fuel();
         let epoch_enabled = inner.engine().epoch_interruption();
         // The engine-wide GC-pressure axis is only live under a tracing collector (else the
         // mailbox is never posted to — no hot-path cost by default).
         let gc_pressure_watch = inner.gc.is_collecting();
-        let (mut code, mut ip, mut base, mut instance) = self.top();
         loop {
             if ip as usize >= code.ops.len() {
                 if self.do_return(code.n_results, stop_depth) {
