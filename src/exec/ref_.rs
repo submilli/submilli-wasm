@@ -32,11 +32,11 @@ impl Execution {
                 Ok(())
             }
             Op::RefAsNonNull => {
-                let r = self.pop();
+                let (r, tag) = self.pop_tagged();
                 if r.is_null() {
                     return Err(Trap::NullReference.into());
                 }
-                self.push_cell(r);
+                self.push_cell(r, tag);
                 Ok(())
             }
             _ => Err(Error::msg(format!("not a ref op: {op:?}"))),

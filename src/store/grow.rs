@@ -6,6 +6,7 @@
 
 use super::{ResourceLimiter, ResourceLimiterInner, Store, PAGE_SIZE};
 use crate::extern_::{Memory, Table};
+use crate::trap::Trap;
 use crate::value::Ref;
 use crate::{Error, Result};
 
@@ -123,6 +124,63 @@ impl<T: 'static> Store<T> {
             Some(ResourceLimiterInner::Async(l)) => l(&mut self.data).table_grow_failed(err)?,
         }
         Ok(None)
+    }
+
+    /// Grows the store's GC reservation to `target` bytes, consulting the limiter. The GC heap is
+    /// accounted like a memory (as in wasmtime) but has **no declared maximum** — that argument is
+    /// `None`; the limiter is the sole growth bound. A denial traps (guest GC allocation has no
+    /// soft-fail path). Updates the engine-wide committed-bytes counter that drives the GC-pressure
+    /// axis. The reservation flow only calls this when `target` exceeds the current reservation.
+    pub(crate) fn grow_gc_reservation(&mut self, target: usize) -> Result<()> {
+        let current = self.inner.gc.reserved();
+        if target <= current {
+            return Ok(());
+        }
+        // A limiter is the sole bound when installed (the GC heap may grow past the abort cap);
+        // with no limiter, the abort-safety cap is the bound (the no-limiter finite ceiling).
+        let allowed = match self.with_sync_limiter(|l| l.memory_growing(current, target, None))? {
+            Some(decision) => decision?,
+            None => target <= super::gc::ABORT_SAFETY_CAP,
+        };
+        if !allowed {
+            return Err(Trap::AllocationTooLarge.into());
+        }
+        let granted = self.inner.gc.grant(target);
+        self.inner.engine().add_gc_committed(granted);
+        Ok(())
+    }
+
+    /// Ensures the GC heap can hold a `charge`-byte **host-built** object (`StructRef`/`ArrayRef::new`):
+    /// collect-then-grow through the limiter, **synchronously**. Unlike the guest path
+    /// (`Execution::gc_reserve`, which suspends to reach the `T`-generic limiter), host code already
+    /// holds the `Store<T>`, so it consults the limiter inline. This is a safe point because
+    /// `invoke_host` parks the live guest operands (and the call's params) in `gc_roots` for the
+    /// call's duration, so a collection here sees them as roots. Mirrors `gc_reserve`: growth within
+    /// the pre-authorized free budget is granted directly (no collection, no limiter); only growth
+    /// beyond it collects first, then grows through the limiter (a denial traps). Kept in lockstep
+    /// with `Execution::gc_reserve`.
+    pub(crate) fn gc_reserve_host(&mut self, charge: usize) -> Result<()> {
+        if self.inner.gc.fits(charge) {
+            return Ok(());
+        }
+        if !self
+            .inner
+            .gc
+            .is_free_grant(self.inner.gc.desired_reservation(charge))
+            && self.inner.gc.is_collecting()
+        {
+            self.inner.gc_collect(&[]); // parked operands/params are rooted via `gc_roots`
+            if self.inner.gc.fits(charge) {
+                return Ok(());
+            }
+        }
+        let target = self.inner.gc.desired_reservation(charge);
+        if self.inner.gc.is_free_grant(target) {
+            let granted = self.inner.gc.grant(target);
+            self.inner.engine().add_gc_committed(granted);
+            return Ok(());
+        }
+        self.grow_gc_reservation(target)
     }
 
     /// Checks the limiter for a brand-new memory of `initial` pages (`Memory::new`).

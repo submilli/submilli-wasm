@@ -163,7 +163,7 @@ fn const_array(
     for i in 0..count {
         write_slot(layout.elem_at(i), &mut data, fill);
     }
-    alloc_array(inner, type_id, count, data)
+    alloc_array(inner, type_id, data)
 }
 
 fn const_array_fixed(
@@ -180,7 +180,7 @@ fn const_array_fixed(
     for i in (0..count).rev() {
         write_slot(layout.elem_at(i), &mut data, pop(stack));
     }
-    alloc_array(inner, type_id, count, data)
+    alloc_array(inner, type_id, data)
 }
 
 fn const_array_data(
@@ -199,7 +199,7 @@ fn const_array_data(
     range(offset, byte_len, seg.len(), Trap::MemoryOutOfBounds)?;
     inner.gc_check_capacity(byte_len)?;
     let body = seg[offset..offset + byte_len].to_vec();
-    alloc_array(inner, type_id, count, body)
+    alloc_array(inner, type_id, body)
 }
 
 fn const_array_elem(
@@ -220,24 +220,18 @@ fn const_array_elem(
     for (i, r) in refs[offset..offset + count].iter().enumerate() {
         write_slot(layout.elem_at(i), &mut data, Val::from_ref(r.clone()));
     }
-    alloc_array(inner, type_id, count, data)
+    alloc_array(inner, type_id, data)
 }
 
 fn alloc(inner: &mut StoreInner, object: GcObject) -> Result<Val> {
-    let slot = inner.alloc_gc(object)?;
+    // Const-eval (global/element initializers) runs at instantiation, outside the run loop's
+    // reservation flow, so it is bounded by the hard ceiling.
+    let slot = inner.alloc_gc_unreserved(object)?;
     Ok(anyref_value(anyref_handle_slot(slot)))
 }
 
-fn alloc_array(
-    inner: &mut StoreInner,
-    type_id: CanonicalTypeId,
-    count: usize,
-    data: Vec<u8>,
-) -> Result<Val> {
-    alloc(
-        inner,
-        GcObject::new_array(type_id, count as u32, data.into_boxed_slice()),
-    )
+fn alloc_array(inner: &mut StoreInner, type_id: CanonicalTypeId, data: Vec<u8>) -> Result<Val> {
+    alloc(inner, GcObject::new_array(type_id, data.into_boxed_slice()))
 }
 
 fn elem_bytes(count: usize, width: usize) -> Result<usize> {

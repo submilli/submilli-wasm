@@ -1,21 +1,20 @@
 //! `StoreInner` — the non-generic entity storage the runtime operates on, plus a
 //! simple index arena. Public handles (`Memory`/`Global`/… ) are indices into these.
 
-use core::any::Any;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::canon::CanonicalTypeId;
 use crate::engine::Engine;
 use crate::extern_::{Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
-use crate::value::{ExnRef, Rooted, Val};
+use crate::value::{ExnRef, Rooted};
 
 use super::arena::Arena;
-use super::entity::{ExternEntry, ExternRefs};
-use super::gc::{
-    anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle, GcHeap, GcObject,
-};
+use super::entity::ExternRefs;
+use super::gc::GcHeap;
 use super::{
     ExnEntity, FuncEntity, GlobalEntity, HostFrame, InstanceEntity, MemoryEntity, TableEntity,
     TagEntity,
@@ -38,22 +37,28 @@ pub(crate) struct StoreInner {
     engine: Engine,
     funcs: Arena<FuncEntity>,
     memories: Arena<MemoryEntity>,
-    tables: Arena<TableEntity>,
-    globals: Arena<GlobalEntity>,
+    pub(super) tables: Arena<TableEntity>,
+    pub(super) globals: Arena<GlobalEntity>,
     tags: Arena<TagEntity>,
     /// Exception instances backing `exnref` values; `Rooted<ExnRef>` indexes here. Grow-only
-    /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) must enumerate.
-    exns: Arena<ExnEntity>,
-    instances: Arena<InstanceEntity>,
-    /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here.
-    externrefs: ExternRefs,
-    /// Managed `struct`/`array` objects; `Rooted<AnyRef>` slot handles index here.
-    /// Allocate-only (null collector); reclamation comes with a tracing collector.
+    /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) enumerates
+    /// transitively (the exn arena itself is not reclaimed yet — see `gc_collect`).
+    pub(super) exns: Arena<ExnEntity>,
+    pub(super) instances: Arena<InstanceEntity>,
+    /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here. Traced for GC
+    /// reachability; box reclamation is a follow-up (see `gc_collect`).
+    pub(super) externrefs: ExternRefs,
+    /// Managed `struct`/`array` objects; `Rooted<AnyRef>` slot handles index here. Reclaimed by the
+    /// tracing collector (`Collector::Auto`/`MarkSweep`); allocate-only under `Collector::Null`.
     pub(crate) gc: GcHeap,
+    /// Live host-held GC roots (`Rooted` handed to the embedder via the GC host API, scoped by
+    /// `RootScope`). Enumerated at collection so a host reference held across a guest collection
+    /// keeps its object alive (#27g). Each is `(handle, hierarchy)`.
+    pub(super) gc_roots: Vec<(u32, crate::canon::RefKind)>,
     /// Canonical type ids of host-allocated GC objects, each pinned with one type-registration
     /// (decref'd on store drop) so a host object outliving its `StructType` handle keeps its type
     /// (#27i; mirrors wasmtime's `gc_host_alloc_types`).
-    gc_host_alloc_types: std::collections::HashSet<CanonicalTypeId>,
+    pub(super) gc_host_alloc_types: std::collections::HashSet<CanonicalTypeId>,
     /// Active fuel — charged per op (meaningful only when `engine.consume_fuel()`).
     /// With an async yield interval this is the current slice; total = `fuel + fuel_reserve`.
     fuel: u64,
@@ -64,14 +69,18 @@ pub(crate) struct StoreInner {
     /// Absolute epoch value at/after which execution interrupts (`u64::MAX` = none).
     epoch_deadline: u64,
     /// Exception surfaced from the last call / a host `throw`; taken via `take_pending_exception`.
-    pending_exception: Option<Rooted<ExnRef>>,
+    pub(super) pending_exception: Option<Rooted<ExnRef>>,
     /// Live wasm frames during a host call, for `WasmBacktrace::capture` (#29d).
     host_frames: Vec<HostFrame>,
+    /// This store's GC-request mailbox (the engine holds a `Weak`). The engine posts to it under
+    /// engine-wide GC pressure; the run loop reads-and-clears it at a back-edge and self-collects.
+    gc_request: Arc<AtomicBool>,
 }
 
 impl StoreInner {
     pub(crate) fn new(engine: Engine) -> Self {
-        let gc = GcHeap::new(engine.gc_memory_threshold());
+        let gc = GcHeap::new(engine.is_collecting(), engine.gc_heap_reservation());
+        let gc_request = engine.register_gc_request();
         StoreInner {
             engine,
             funcs: Arena::default(),
@@ -83,6 +92,7 @@ impl StoreInner {
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
             gc,
+            gc_roots: Vec::new(),
             gc_host_alloc_types: std::collections::HashSet::new(),
             fuel: 0,
             fuel_reserve: 0,
@@ -90,7 +100,15 @@ impl StoreInner {
             epoch_deadline: u64::MAX,
             pending_exception: None,
             host_frames: Vec::new(),
+            gc_request,
         }
+    }
+
+    /// Reads and clears this store's GC-request mailbox: `true` ⇒ the engine asked it to collect
+    /// (under engine-wide pressure) since the last check. Clearing affects only *this* store's
+    /// mailbox, so servicing it doesn't suppress the request for the engine's other stores.
+    pub(crate) fn take_gc_request(&self) -> bool {
+        self.gc_request.swap(false, Ordering::Relaxed)
     }
 
     pub(crate) fn set_pending_exception(&mut self, exn: Rooted<ExnRef>) {
@@ -113,93 +131,6 @@ impl StoreInner {
 
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
-    }
-
-    pub(crate) fn alloc_externref(&mut self, value: Box<dyn Any + Send + Sync>) -> u32 {
-        self.push_extern(ExternEntry::Host(value))
-    }
-
-    fn push_extern(&mut self, entry: ExternEntry) -> u32 {
-        let index = self.externrefs.0.len() as u32;
-        self.externrefs.0.push(entry);
-        index
-    }
-
-    /// The host payload behind an `externref` index, if it is a host ref (not an internalized
-    /// `anyref`).
-    pub(crate) fn externref(&self, index: u32) -> Option<&(dyn Any + Send + Sync)> {
-        match self.externrefs.0.get(index as usize)? {
-            ExternEntry::Host(v) => Some(v.as_ref()),
-            ExternEntry::Internal(_) => None,
-        }
-    }
-
-    /// Mutable sibling of [`externref`](Self::externref).
-    pub(crate) fn externref_mut(&mut self, index: u32) -> Option<&mut (dyn Any + Send + Sync)> {
-        match self.externrefs.0.get_mut(index as usize)? {
-            ExternEntry::Host(v) => Some(v.as_mut()),
-            ExternEntry::Internal(_) => None,
-        }
-    }
-
-    /// `extern.convert_any`: internal `anyref` → `externref` (host wrappers unwrap to their extern;
-    /// any other ref is wrapped in a fresh `Internal` entry; a host externref passes through).
-    pub(crate) fn extern_convert_any(&mut self, v: Val) -> Val {
-        let handle = match v {
-            Val::AnyRef(None) => return Val::ExternRef(None),
-            Val::AnyRef(Some(r)) => r.raw(),
-            Val::ExternRef(_) => return v,
-            _ => unreachable!("extern.convert_any operand is a reference"),
-        };
-        if let AnyRefHandle::Slot(i) = decode_anyref_handle(handle) {
-            if let Some(e) = self.gc.get(i).expect("live gc slot").extern_index() {
-                return Val::ExternRef(Some(Rooted::from_raw(e)));
-            }
-        }
-        let idx = self.push_extern(ExternEntry::Internal(handle));
-        Val::ExternRef(Some(Rooted::from_raw(idx)))
-    }
-
-    /// `any.convert_extern`: `externref` → `anyref` (an internalized entry recovers its original
-    /// ref; a host extern is wrapped in a fresh `Extern` GC object; an `any`-rep value passes through).
-    pub(crate) fn any_convert_extern(&mut self, v: Val) -> crate::Result<Val> {
-        let idx = match v {
-            Val::ExternRef(None) => return Ok(Val::AnyRef(None)),
-            Val::ExternRef(Some(r)) => r.raw(),
-            Val::AnyRef(_) => return Ok(v),
-            _ => unreachable!("any.convert_extern operand is a reference"),
-        };
-        if let Some(ExternEntry::Internal(h)) = self.externrefs.0.get(idx as usize) {
-            return Ok(anyref_value(*h));
-        }
-        let slot = self.gc.alloc(GcObject::extern_wrapper(idx))?;
-        Ok(anyref_value(anyref_handle_slot(slot)))
-    }
-
-    /// Allocates a managed `struct`/`array`, returning its heap slot index; traps on exhaustion.
-    pub(crate) fn alloc_gc(&mut self, object: GcObject) -> crate::Result<u32> {
-        self.gc.alloc(object)
-    }
-
-    /// Pins a host-allocated GC object's type for the store's lifetime (idempotent per type), so its
-    /// bare `type_id` stays valid even if the embedder drops its `StructType`/`ArrayType`.
-    pub(crate) fn pin_gc_type(&mut self, id: CanonicalTypeId) {
-        if self.gc_host_alloc_types.insert(id) {
-            self.engine.incref_type(id);
-        }
-    }
-
-    /// Traps unless `extra_bytes` fits under the GC-heap ceiling (pre-check for big `array.new*`).
-    pub(crate) fn gc_check_capacity(&self, extra_bytes: usize) -> crate::Result<()> {
-        self.gc.check_capacity(extra_bytes)
-    }
-
-    pub(crate) fn gc_object(&self, index: u32) -> Option<&GcObject> {
-        self.gc.get(index)
-    }
-
-    pub(crate) fn gc_object_mut(&mut self, index: u32) -> Option<&mut GcObject> {
-        self.gc.get_mut(index)
     }
 
     pub(crate) fn fuel(&self) -> u64 {
@@ -370,6 +301,8 @@ impl StoreInner {
 
 impl Drop for StoreInner {
     fn drop(&mut self) {
+        // Release this store's GC reservation from the engine-wide committed total.
+        self.engine.sub_gc_committed(self.gc.reserved());
         // Release the type-registrations pinned by host GC allocations.
         for &id in &self.gc_host_alloc_types {
             self.engine.decref_type(id);

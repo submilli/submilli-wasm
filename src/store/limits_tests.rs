@@ -83,3 +83,25 @@ fn in_wasm_memory_grow_traps_with_trap_on_grow_failure() {
     let inst = Instance::new(&mut store, &m, &[]).unwrap();
     assert!(call_grow(&mut store, inst, 1).is_err()); // denied + trap_on_grow_failure -> trap
 }
+
+#[test]
+fn gc_reservation_grows_past_abort_cap_with_limiter() {
+    // With a limiter installed, the limiter is the sole bound — the GC reservation may grow past the
+    // abort-safety cap (which only applies when no limiter is present).
+    let mut store = store_with(StoreLimitsBuilder::new().memory_size(usize::MAX).build());
+    let target = crate::store::gc::ABORT_SAFETY_CAP + (1 << 20);
+    store.grow_gc_reservation(target).unwrap();
+    assert!(
+        store.inner.gc.reserved() >= target,
+        "limiter allowed growth past the abort cap"
+    );
+}
+
+#[test]
+fn gc_reservation_capped_at_abort_cap_without_limiter() {
+    // No limiter: the abort-safety cap is the hard ceiling — growth up to it succeeds, past it traps.
+    let cap = crate::store::gc::ABORT_SAFETY_CAP;
+    let mut store = Store::new(&Engine::default(), ());
+    store.grow_gc_reservation(cap).unwrap();
+    assert!(store.grow_gc_reservation(cap + 1).is_err());
+}

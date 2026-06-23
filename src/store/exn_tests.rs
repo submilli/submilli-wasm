@@ -1,7 +1,7 @@
 //! #28b unit tests: the exception-instance arena round-trip and the `noexn <: exn` subtyping rule.
 
 use super::*;
-use crate::value::{FuncType, HeapType, TagType, ValType};
+use crate::value::{FuncType, HeapType, TagType, Val, ValType};
 
 #[test]
 fn exn_arena_round_trip() {

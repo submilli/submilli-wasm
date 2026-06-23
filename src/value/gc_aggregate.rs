@@ -2,15 +2,26 @@
 //! [`gc_ref`](super::gc_ref) to stay under the file-size cap; the core handle types (`Rooted`,
 //! `AnyRef`) and the shared heap-slot helpers live there.
 
-use crate::canon::Layout;
+use crate::canon::{Layout, RefKind};
 use crate::store::{
     anyref_handle_slot, read_slot, slot_accepts, write_slot, AsContext, AsContextMut, GcObject,
+    StoreInner,
 };
 use crate::value::gc_type::{ArrayType, StructType};
 use crate::value::{Mutability, Val};
 use crate::{Error, Result};
 
-use super::gc_ref::{gc_object, gc_slot, AnyRef, Rooted};
+use super::gc_ref::{gc_object, AnyRef, Rooted};
+
+/// Wraps a freshly-allocated host GC object's slot as a `Rooted`: registers it as a host root (so a
+/// guest collection across this handle keeps it alive) and captures the slot generation (so a
+/// stale handle faults if the slot is later collected and reused — #27g).
+fn root_new_gc<T>(inner: &mut StoreInner, idx: u32) -> Rooted<T> {
+    let handle = anyref_handle_slot(idx);
+    inner.push_gc_root(handle, RefKind::Any);
+    let generation = inner.gc.generation(idx).unwrap_or(0);
+    Rooted::from_raw_gen(handle, generation)
+}
 
 /// A GC struct instance (`structref`).
 #[derive(Debug)]
@@ -61,17 +72,20 @@ impl StructRef {
                 return Err(Error::msg("struct field value has the wrong type"));
             }
         }
+        let type_id = allocator.ty.canonical_id();
+        let mut ctx = store.as_context_mut();
+        // Reserve through the limiter (collect-then-grow) before building the body — the field
+        // values are host-held `Val`s (rooted if they are GC refs), so a collection here is safe.
+        let charge = ctx.inner().gc_object_charge(*size);
+        ctx.0.gc_reserve_host(charge)?;
+        let inner = ctx.inner_mut();
+        inner.pin_gc_type(type_id); // keep the type alive for the object's (store) lifetime
         let mut data = vec![0u8; *size];
         for (slot, v) in slots.iter().zip(fields) {
             write_slot(*slot, &mut data, *v);
         }
-        let type_id = allocator.ty.canonical_id();
-        let mut ctx = store.as_context_mut();
-        let inner = ctx.inner_mut();
-        inner.gc_check_capacity(*size)?;
-        inner.pin_gc_type(type_id); // keep the type alive for the object's (store) lifetime
         let idx = inner.alloc_gc(GcObject::new_struct(type_id, data.into_boxed_slice()))?;
-        Ok(Rooted::from_raw(anyref_handle_slot(idx)))
+        Ok(root_new_gc(inner, idx))
     }
 }
 
@@ -80,7 +94,7 @@ impl Rooted<StructRef> {
     pub fn field(&self, store: impl AsContext, index: usize) -> Result<Val> {
         let ctx = store.as_context();
         let inner = ctx.inner();
-        let slot = gc_slot(inner, self.raw())?;
+        let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
         let layout = Layout::for_struct(&inner.engine().struct_fields(obj.header.type_id));
         let field = layout
@@ -93,7 +107,7 @@ impl Rooted<StructRef> {
     pub fn ty(&self, store: impl AsContext) -> Result<StructType> {
         let ctx = store.as_context();
         let inner = ctx.inner();
-        let slot = gc_slot(inner, self.raw())?;
+        let slot = self.gc_slot_checked(inner)?;
         let type_id = gc_object(inner, slot)?.header.type_id;
         Ok(StructType::from_id(inner.engine(), type_id))
     }
@@ -102,7 +116,7 @@ impl Rooted<StructRef> {
     pub fn matches_ty(&self, store: impl AsContext, ty: &StructType) -> Result<bool> {
         let ctx = store.as_context();
         let inner = ctx.inner();
-        let slot = gc_slot(inner, self.raw())?;
+        let slot = self.gc_slot_checked(inner)?;
         let type_id = gc_object(inner, slot)?.header.type_id;
         Ok(inner.engine().is_subtype(type_id, ty.canonical_id()))
     }
@@ -112,7 +126,7 @@ impl Rooted<StructRef> {
     pub fn set_field(&self, mut store: impl AsContextMut, index: usize, value: Val) -> Result<()> {
         let mut ctx = store.as_context_mut();
         let inner = ctx.inner_mut();
-        let slot = gc_slot(inner, self.raw())?;
+        let slot = self.gc_slot_checked(inner)?;
         let type_id = gc_object(inner, slot)?.header.type_id;
         let fields = inner.engine().struct_fields(type_id);
         let field_ty = fields
@@ -203,42 +217,46 @@ impl ArrayRef {
                 return Err(Error::msg("array element value has the wrong type"));
             }
         }
+        let type_id = allocator.ty.canonical_id();
+        let mut ctx = store.as_context_mut();
+        // Reserve through the limiter (collect-then-grow) before building the (possibly large) body,
+        // so a hostile element count traps here instead of allocating the `Vec` first. The element
+        // values are host-held `Val`s (rooted if GC refs), so a collection here is safe.
+        let charge = ctx.inner().gc_object_charge(byte_len);
+        ctx.0.gc_reserve_host(charge)?;
+        let inner = ctx.inner_mut();
+        inner.pin_gc_type(type_id);
         let mut data = vec![0u8; byte_len];
         for i in 0..count {
             write_slot(allocator.layout.elem_at(i), &mut data, *elem_at(i));
         }
-        let type_id = allocator.ty.canonical_id();
-        let mut ctx = store.as_context_mut();
-        let inner = ctx.inner_mut();
-        inner.gc_check_capacity(byte_len)?;
-        inner.pin_gc_type(type_id);
-        let idx = inner.alloc_gc(GcObject::new_array(
-            type_id,
-            count as u32,
-            data.into_boxed_slice(),
-        ))?;
-        Ok(Rooted::from_raw(anyref_handle_slot(idx)))
+        // The element count is implicit in the body length, not stored.
+        let idx = inner.alloc_gc(GcObject::new_array(type_id, data.into_boxed_slice()))?;
+        Ok(root_new_gc(inner, idx))
     }
 }
 
 impl Rooted<ArrayRef> {
-    /// The number of elements.
+    /// The number of elements (derived from the body length and the element stride).
     pub fn len(&self, store: impl AsContext) -> Result<u32> {
         let ctx = store.as_context();
-        let slot = gc_slot(ctx.inner(), self.raw())?;
-        Ok(gc_object(ctx.inner(), slot)?.header.len)
+        let inner = ctx.inner();
+        let slot = self.gc_slot_checked(inner)?;
+        let obj = gc_object(inner, slot)?;
+        let stride = Layout::for_array(&inner.engine().array_field(obj.header.type_id)).stride();
+        Ok(obj.array_len(stride))
     }
 
     /// Reads element `index`.
     pub fn get(&self, store: impl AsContext, index: u32) -> Result<Val> {
         let ctx = store.as_context();
         let inner = ctx.inner();
-        let slot = gc_slot(inner, self.raw())?;
+        let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
-        if index >= obj.header.len {
+        let layout = Layout::for_array(&inner.engine().array_field(obj.header.type_id));
+        if index >= obj.array_len(layout.stride()) {
             return Err(Error::msg("array index out of bounds"));
         }
-        let layout = Layout::for_array(&inner.engine().array_field(obj.header.type_id));
         Ok(read_slot(layout.elem_at(index as usize), &obj.data))
     }
 
@@ -247,15 +265,13 @@ impl Rooted<ArrayRef> {
     pub fn set(&self, mut store: impl AsContextMut, index: u32, value: Val) -> Result<()> {
         let mut ctx = store.as_context_mut();
         let inner = ctx.inner_mut();
-        let slot = gc_slot(inner, self.raw())?;
-        let (type_id, len) = {
-            let obj = gc_object(inner, slot)?;
-            (obj.header.type_id, obj.header.len)
-        };
+        let slot = self.gc_slot_checked(inner)?;
+        let type_id = gc_object(inner, slot)?.header.type_id;
+        let field_ty = inner.engine().array_field(type_id);
+        let len = gc_object(inner, slot)?.array_len(Layout::for_array(&field_ty).stride());
         if index >= len {
             return Err(Error::msg("array index out of bounds"));
         }
-        let field_ty = inner.engine().array_field(type_id);
         if field_ty.mutability() != Mutability::Var {
             return Err(Error::msg("array element is not mutable"));
         }

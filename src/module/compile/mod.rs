@@ -18,7 +18,7 @@ mod table;
 #[path = "tests.rs"]
 mod tests;
 
-use wasmparser::{BinaryReaderError, FunctionBody, Operator};
+use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, Operator, ValidatorResources};
 
 use crate::canon::{AggKind, IrVal, ModuleType};
 use crate::module::handler::HandlerSpan;
@@ -45,18 +45,25 @@ fn wp_err(e: BinaryReaderError) -> Error {
     Error::msg(e.to_string())
 }
 
-/// Translates a single function body into a [`CompiledFunc`]. Assumes the module
-/// has already been validated (see `Module::validate`).
+/// Validates and translates a single function body into a [`CompiledFunc`] in one pass: each
+/// operator is validated (via `fv`) and lowered to internal bytecode as it is decoded, so the
+/// body's bytes are read exactly once. Module-level validation has already run in `parse_module`.
 pub(crate) fn translate_function(
     ctx: &CompileCtx<'_>,
     type_idx: u32,
     body: &FunctionBody<'_>,
+    fv: &mut FuncValidator<ValidatorResources>,
     retain_offsets: bool,
 ) -> Result<CompiledFunc> {
     let (params, results) = ctx.types[type_idx as usize].func_sig();
     let n_params = params.len() as u32;
     let n_results = results.len() as u32;
 
+    // Validate the locals declarations (count/type limits) with accurate byte offsets, then
+    // re-read them into our own `IrVal` types — the locals header is tiny, so the second read
+    // is negligible (the operator body, which dominates, is still walked exactly once below).
+    fv.read_locals(&mut body.get_binary_reader())
+        .map_err(wp_err)?;
     let mut local_types: Vec<IrVal> = Vec::new();
     for entry in body.get_locals_reader().map_err(wp_err)? {
         let (count, ty) = entry.map_err(wp_err)?;
@@ -68,18 +75,14 @@ pub(crate) fn translate_function(
 
     let mut t = Translator::new(ctx, retain_offsets);
     t.push_func_frame(n_results);
-    for pair in body
-        .get_operators_reader()
-        .map_err(wp_err)?
-        .into_iter_with_offsets()
-    {
-        let (op, offset) = pair.map_err(wp_err)?;
+    let mut reader = body.get_operators_reader().map_err(wp_err)?;
+    while !reader.eof() {
+        let (op, offset) = reader.read_with_offset().map_err(wp_err)?;
+        fv.op(offset, &op).map_err(wp_err)?;
         t.cur_offset = offset as u32;
         t.translate(&op)?;
-        if t.ctrl.is_empty() {
-            break; // function-terminal `end` popped the implicit frame
-        }
     }
+    reader.finish().map_err(wp_err)?;
 
     Ok(CompiledFunc {
         ops: t.ops.into_boxed_slice(),

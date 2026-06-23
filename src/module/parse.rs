@@ -8,80 +8,105 @@
 use std::sync::Arc;
 
 use wasmparser::{
-    BinaryReaderError, DataKind, ElementItems, ElementKind, ExternalKind, FunctionBody,
-    GlobalSectionReader, ImportSectionReader, Operator, Parser, Payload, TypeRef,
+    BinaryReaderError, DataKind, ElementItems, ElementKind, ExternalKind, FuncToValidate,
+    FunctionBody, GlobalSectionReader, ImportSectionReader, Parser, Payload, TypeRef, ValidPayload,
+    Validator, ValidatorResources,
 };
 
 use crate::canon::{AggKind, ModuleType};
 use crate::engine::Engine;
 use crate::module::compile::{
-    conv_globaltype, conv_memtype, conv_reftype_heap, conv_tabletype, translate_function,
-    CompileCtx,
+    conv_globaltype, conv_memtype, conv_tabletype, translate_function, CompileCtx,
 };
+use crate::module::const_expr::parse_const_expr;
 use crate::module::inner::{
-    ConstExpr, ConstOp, DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export,
-    ExportKind, GlobalDef, Import, ImportKind, ModuleInner, TableDef, TagDef,
+    DataMode, DataSegment, ElemItems, ElemMode, ElemSegment, Export, ExportKind, GlobalDef, Import,
+    ImportKind, ModuleInner, TableDef, TagDef,
 };
 use crate::module::op::CompiledFunc;
 use crate::{Error, Result};
 
-fn wp_err(e: BinaryReaderError) -> Error {
+pub(crate) fn wp_err(e: BinaryReaderError) -> Error {
     Error::msg(e.to_string())
 }
 
-/// Decodes and compiles a (pre-validated) wasm binary into a [`ModuleInner`]. Debug retention is
-/// driven by the engine's config (#29c): the per-`Op` offsets + `name` section, and `.debug_*` bytes.
+/// Decodes, validates, and compiles a wasm binary into a [`ModuleInner`] in a single pass:
+/// the `wasmparser` [`Validator`] is driven payload-by-payload alongside our decode (so each
+/// section and function body is walked exactly once — not re-parsed by a separate `validate_all`).
+/// Debug retention is driven by the engine's config (#29c): the per-`Op` offsets + `name` section,
+/// and `.debug_*` bytes.
 pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner> {
     let keep_offsets = engine.wasm_backtrace_enabled();
     let keep_dwarf = engine.retain_dwarf();
     let mut m = empty_inner();
+    let mut validator = Validator::new_with_features(super::enabled_features());
+    // Module-level validation passes here; per-body operator validation is fused into the
+    // translate pass below, so each function's operators are decoded just once.
+    let mut funcs: Vec<FuncToValidate<ValidatorResources>> = Vec::new();
     let mut bodies: Vec<FunctionBody<'_>> = Vec::new();
 
     for payload in Parser::new(0).parse_all(bytes) {
-        match payload.map_err(wp_err)? {
-            Payload::TypeSection(r) => super::typesec::parse_types(&mut m.types, r)?,
-            Payload::ImportSection(r) => parse_imports(&mut m, r)?,
-            Payload::FunctionSection(r) => {
-                for ty in r {
-                    m.func_types.push(ty.map_err(wp_err)?);
-                }
-            }
-            Payload::TableSection(r) => parse_tables(&mut m, r)?,
-            Payload::MemorySection(r) => {
-                for mt in r {
-                    m.memories.push(conv_memtype(mt.map_err(wp_err)?));
-                }
-            }
-            Payload::GlobalSection(r) => {
-                let kinds = m.type_kinds();
-                parse_globals(&kinds, &mut m.globals, r)?;
-            }
-            Payload::TagSection(r) => parse_tags(&mut m.tags, r)?,
-            Payload::ExportSection(r) => parse_exports(&mut m.exports, r)?,
-            Payload::StartSection { func, .. } => m.start = Some(func),
-            Payload::ElementSection(r) => {
-                let kinds = m.type_kinds();
-                parse_elems(&kinds, &mut m.elems, r)?;
-            }
-            Payload::DataSection(r) => {
-                let kinds = m.type_kinds();
-                parse_datas(&kinds, &mut m.datas, r)?;
-            }
-            Payload::CodeSectionStart { range, .. } => {
-                m.debug.set_code_base(range.start as u32);
-            }
-            Payload::CodeSectionEntry(body) => bodies.push(body),
-            Payload::CustomSection(reader) if keep_offsets || keep_dwarf => {
-                retain_debug_section(&mut m, &reader, keep_offsets, keep_dwarf);
-            }
-            _ => {}
+        let payload = payload.map_err(wp_err)?;
+        let valid = validator.payload(&payload).map_err(wp_err)?;
+        decode_payload(&mut m, payload, keep_offsets, keep_dwarf)?;
+        if let ValidPayload::Func(to_validate, body) = valid {
+            funcs.push(to_validate);
+            bodies.push(body);
         }
     }
 
-    m.functions = compile_bodies(&m, &bodies, keep_offsets)?;
+    m.functions = compile_bodies(&m, funcs, &bodies, keep_offsets)?;
     // Register the module's rec groups in the engine, baking canonical type ids.
     m.intern(engine);
     Ok(m)
+}
+
+/// Decodes one validated payload into the in-progress [`ModuleInner`]. Function bodies are not
+/// handled here — they ride the `ValidPayload::Func` channel back in [`parse_module`].
+fn decode_payload(
+    m: &mut ModuleInner,
+    payload: Payload<'_>,
+    keep_offsets: bool,
+    keep_dwarf: bool,
+) -> Result<()> {
+    match payload {
+        Payload::TypeSection(r) => super::typesec::parse_types(&mut m.types, r)?,
+        Payload::ImportSection(r) => parse_imports(m, r)?,
+        Payload::FunctionSection(r) => {
+            for ty in r {
+                m.func_types.push(ty.map_err(wp_err)?);
+            }
+        }
+        Payload::TableSection(r) => parse_tables(m, r)?,
+        Payload::MemorySection(r) => {
+            for mt in r {
+                m.memories.push(conv_memtype(mt.map_err(wp_err)?));
+            }
+        }
+        Payload::GlobalSection(r) => {
+            let kinds = m.type_kinds();
+            parse_globals(&kinds, &mut m.globals, r)?;
+        }
+        Payload::TagSection(r) => parse_tags(&mut m.tags, r)?,
+        Payload::ExportSection(r) => parse_exports(&mut m.exports, r)?,
+        Payload::StartSection { func, .. } => m.start = Some(func),
+        Payload::ElementSection(r) => {
+            let kinds = m.type_kinds();
+            parse_elems(&kinds, &mut m.elems, r)?;
+        }
+        Payload::DataSection(r) => {
+            let kinds = m.type_kinds();
+            parse_datas(&kinds, &mut m.datas, r)?;
+        }
+        Payload::CodeSectionStart { range, .. } => {
+            m.debug.set_code_base(range.start as u32);
+        }
+        Payload::CustomSection(reader) if keep_offsets || keep_dwarf => {
+            retain_debug_section(m, &reader, keep_offsets, keep_dwarf);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_tables(m: &mut ModuleInner, reader: wasmparser::TableSectionReader<'_>) -> Result<()> {
@@ -286,81 +311,6 @@ fn parse_datas(
     Ok(())
 }
 
-fn parse_const_expr(kinds: &[AggKind], expr: &wasmparser::ConstExpr<'_>) -> Result<ConstExpr> {
-    let mut reader = expr.get_operators_reader();
-    let mut ops = Vec::new();
-    while let Some(op) = conv_const_op(kinds, &reader.read().map_err(wp_err)?)? {
-        ops.push(op);
-    }
-    Ok(ConstExpr(ops.into_boxed_slice()))
-}
-
-/// Maps one const-expression operator to a [`ConstOp`]; `None` marks the terminating `end`.
-fn conv_const_op(kinds: &[AggKind], op: &Operator<'_>) -> Result<Option<ConstOp>> {
-    Ok(Some(match *op {
-        Operator::I32Const { value } => ConstOp::I32(value),
-        Operator::I64Const { value } => ConstOp::I64(value),
-        Operator::F32Const { value } => ConstOp::F32(value.bits()),
-        Operator::F64Const { value } => ConstOp::F64(value.bits()),
-        #[cfg(feature = "simd")]
-        Operator::V128Const { value } => ConstOp::V128(u128::from_le_bytes(*value.bytes())),
-        Operator::RefNull { hty } => ConstOp::RefNull(conv_reftype_heap(kinds, hty)?),
-        Operator::RefFunc { function_index } => ConstOp::RefFunc(function_index),
-        Operator::GlobalGet { global_index } => ConstOp::GlobalGet(global_index),
-        Operator::I32Add => ConstOp::I32Add,
-        Operator::I32Sub => ConstOp::I32Sub,
-        Operator::I32Mul => ConstOp::I32Mul,
-        Operator::I64Add => ConstOp::I64Add,
-        Operator::I64Sub => ConstOp::I64Sub,
-        Operator::I64Mul => ConstOp::I64Mul,
-        Operator::End => return Ok(None),
-        _ => return conv_const_gc_op(op),
-    }))
-}
-
-/// GC-aggregate const operators (`struct.new*`/`array.new*`/`ref.i31`/`*.convert_*`).
-fn conv_const_gc_op(op: &Operator<'_>) -> Result<Option<ConstOp>> {
-    Ok(Some(match *op {
-        Operator::RefI31 => ConstOp::RefI31,
-        Operator::StructNew { struct_type_index } => ConstOp::StructNew(struct_type_index),
-        Operator::StructNewDefault { struct_type_index } => {
-            ConstOp::StructNewDefault(struct_type_index)
-        }
-        Operator::ArrayNew { array_type_index } => ConstOp::ArrayNew(array_type_index),
-        Operator::ArrayNewDefault { array_type_index } => {
-            ConstOp::ArrayNewDefault(array_type_index)
-        }
-        Operator::ArrayNewFixed {
-            array_type_index,
-            array_size,
-        } => ConstOp::ArrayNewFixed {
-            ty: array_type_index,
-            n: array_size,
-        },
-        Operator::ArrayNewData {
-            array_type_index,
-            array_data_index,
-        } => ConstOp::ArrayNewData {
-            ty: array_type_index,
-            data: array_data_index,
-        },
-        Operator::ArrayNewElem {
-            array_type_index,
-            array_elem_index,
-        } => ConstOp::ArrayNewElem {
-            ty: array_type_index,
-            elem: array_elem_index,
-        },
-        Operator::AnyConvertExtern => ConstOp::AnyConvertExtern,
-        Operator::ExternConvertAny => ConstOp::ExternConvertAny,
-        ref other => {
-            return Err(Error::msg(format!(
-                "unsupported constant expression: {other:?}"
-            )))
-        }
-    }))
-}
-
 /// Tag-index → type-index (imported tags first, then defined), for `try_table` catch arity.
 fn tag_type_indices(m: &ModuleInner) -> Vec<u32> {
     m.imports
@@ -375,6 +325,7 @@ fn tag_type_indices(m: &ModuleInner) -> Vec<u32> {
 
 fn compile_bodies(
     m: &ModuleInner,
+    funcs: Vec<FuncToValidate<ValidatorResources>>,
     bodies: &[FunctionBody<'_>],
     retain_offsets: bool,
 ) -> Result<Vec<Arc<CompiledFunc>>> {
@@ -386,15 +337,20 @@ fn compile_bodies(
         func_types: &m.func_types,
         tag_types: &tag_types,
     };
+    // Recycled across bodies so per-function validation reuses one scratch arena.
+    let mut allocs = wasmparser::FuncValidatorAllocations::default();
     let mut out = Vec::with_capacity(bodies.len());
-    for (i, body) in bodies.iter().enumerate() {
+    for (i, (to_validate, body)) in funcs.into_iter().zip(bodies).enumerate() {
         let type_idx = m.func_types[m.num_imported_funcs as usize + i];
+        let mut validator = to_validate.into_validator(allocs);
         out.push(Arc::new(translate_function(
             &ctx,
             type_idx,
             body,
+            &mut validator,
             retain_offsets,
         )?));
+        allocs = validator.into_allocations();
     }
     Ok(out)
 }

@@ -5,10 +5,9 @@ use super::{translate_function, wp_err, CompileCtx};
 use crate::canon::{AggKind, CompositeBody, IrVal, ModuleType};
 use crate::engine::Engine;
 use crate::module::op::{BranchTarget, Op};
-use crate::module::Module;
 use crate::value::{Finality, ValType};
 use crate::Result;
-use wasmparser::{Parser, Payload};
+use wasmparser::{FuncValidatorAllocations, Parser, ValidPayload, Validator};
 
 type Sig<'a> = (&'a [ValType], &'a [ValType]);
 
@@ -35,9 +34,8 @@ fn compile_one(
     func_types: &[u32],
     type_idx: u32,
 ) -> Result<Box<[Op]>> {
-    let engine = Engine::default();
+    let _engine = Engine::default();
     let bytes = wat::parse_str(wat).expect("valid wat");
-    Module::validate(&engine, &bytes)?;
     let types: Vec<ModuleType> = sigs
         .iter()
         .enumerate()
@@ -58,9 +56,14 @@ fn compile_one(
         func_types,
         tag_types: &[],
     };
+    let mut validator = Validator::new_with_features(crate::module::enabled_features());
     for payload in Parser::new(0).parse_all(&bytes) {
-        if let Payload::CodeSectionEntry(body) = payload.map_err(wp_err)? {
-            return Ok(translate_function(&ctx, type_idx, &body, false)?.ops);
+        let payload = payload.map_err(wp_err)?;
+        if let ValidPayload::Func(to_validate, body) =
+            validator.payload(&payload).map_err(wp_err)?
+        {
+            let mut fv = to_validate.into_validator(FuncValidatorAllocations::default());
+            return Ok(translate_function(&ctx, type_idx, &body, &mut fv, false)?.ops);
         }
     }
     Err(crate::Error::msg("no function body"))

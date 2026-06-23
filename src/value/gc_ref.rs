@@ -12,10 +12,20 @@ use crate::{Error, Result};
 
 use super::gc_aggregate::{ArrayRef, StructRef};
 
+/// Sentinel `generation` meaning "don't check": carried by internal references (cell decode,
+/// table/global slots) that never dangle by the precise non-moving collection invariant. Only
+/// host-created `Rooted`s captured via the GC API carry a real generation for the stale-handle
+/// check (#27g).
+const UNCHECKED_GENERATION: u32 = u32::MAX;
+
 /// A rooted handle to a GC value, keeping it alive within a [`RootScope`].
 /// `Copy`, regardless of the referent type (mirrors `wasmtime::Rooted`).
 pub struct Rooted<T> {
     index: u32,
+    /// GC-heap slot generation captured at creation (host GC handles), or
+    /// [`UNCHECKED_GENERATION`]. A mismatch against the slot's current generation means the object
+    /// was collected and the slot reused — a stale handle.
+    generation: u32,
     _marker: PhantomData<T>,
 }
 
@@ -29,10 +39,22 @@ impl<T> Copy for Rooted<T> {}
 
 impl<T> Rooted<T> {
     /// Wraps a raw handle/index (an `anyref` handle for `AnyRef`, an arena index for
-    /// `ExternRef`). Internal — the run loop builds reference values from raw handles.
+    /// `ExternRef`). Internal — the run loop builds reference values from raw handles. The handle is
+    /// **unchecked** (no generation): internal references never dangle (precise non-moving GC).
     pub(crate) fn from_raw(index: u32) -> Self {
         Rooted {
             index,
+            generation: UNCHECKED_GENERATION,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Wraps a raw handle with a captured GC-slot `generation` (a host GC handle the embedder may
+    /// hold across a collection — the generation catches use after the object is collected).
+    pub(crate) fn from_raw_gen(index: u32, generation: u32) -> Self {
+        Rooted {
+            index,
+            generation,
             _marker: PhantomData,
         }
     }
@@ -40,6 +62,19 @@ impl<T> Rooted<T> {
     /// The raw handle/index behind this rooted reference.
     pub(crate) fn raw(self) -> u32 {
         self.index
+    }
+
+    /// Resolves this handle to a live GC-heap slot, faulting if a captured generation no longer
+    /// matches the slot's — the object was collected and its slot reused, so this host handle is
+    /// stale (#27g). Internal/`UNCHECKED` handles skip the generation check.
+    pub(crate) fn gc_slot_checked(self, inner: &crate::store::StoreInner) -> Result<u32> {
+        let slot = gc_slot(inner, self.index)?;
+        if self.generation != UNCHECKED_GENERATION
+            && inner.gc.generation(slot) != Some(self.generation)
+        {
+            return Err(Error::msg("stale gc reference (object was collected)"));
+        }
+        Ok(slot)
     }
 
     /// Whether `a` and `b` refer to the same GC object (reference identity). Under the grow-only
@@ -56,20 +91,33 @@ impl<T> core::fmt::Debug for Rooted<T> {
     }
 }
 
-/// A scope bounding the lifetime of [`Rooted`] references. It delegates store access to
-/// the wrapped store, so it's usable anywhere an `AsContext[Mut]` is. Reclamation on
-/// drop is a no-op for now (the arena is grow-only; a tracing collector adds reclamation).
-pub struct RootScope<S> {
+/// A scope bounding the lifetime of [`Rooted`] references. It delegates store access to the wrapped
+/// store, so it's usable anywhere an `AsContext[Mut]` is. On drop it unwinds the host roots
+/// registered within it (back to the high-water mark recorded at `new`), so objects rooted only by
+/// this scope become collectable again (#27g).
+pub struct RootScope<S: AsContextMut> {
     store: S,
+    /// Host-root high-water mark captured at construction; restored on drop.
+    mark: usize,
 }
 
 impl<S: AsContextMut> RootScope<S> {
-    pub fn new(store: S) -> Self {
-        RootScope { store }
+    pub fn new(mut store: S) -> Self {
+        let mark = store.as_context_mut().inner_mut().gc_roots_mark();
+        RootScope { store, mark }
     }
 }
 
-impl<S: AsContext> AsContext for RootScope<S> {
+impl<S: AsContextMut> Drop for RootScope<S> {
+    fn drop(&mut self) {
+        self.store
+            .as_context_mut()
+            .inner_mut()
+            .gc_roots_truncate(self.mark);
+    }
+}
+
+impl<S: AsContextMut> AsContext for RootScope<S> {
     type Data = S::Data;
 
     fn as_context(&self) -> StoreContext<'_, S::Data> {
@@ -83,7 +131,7 @@ impl<S: AsContextMut> AsContextMut for RootScope<S> {
     }
 }
 
-impl<S> core::fmt::Debug for RootScope<S> {
+impl<S: AsContextMut> core::fmt::Debug for RootScope<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RootScope").finish_non_exhaustive()
     }
@@ -101,14 +149,13 @@ impl ExternRef {
     where
         T: Any + Send + Sync + 'static,
     {
-        let index = store
-            .as_context_mut()
-            .inner_mut()
-            .alloc_externref(Box::new(value));
-        Ok(Rooted {
-            index,
-            _marker: PhantomData,
-        })
+        let mut ctx = store.as_context_mut();
+        let inner = ctx.inner_mut();
+        let index = inner.alloc_externref(Box::new(value));
+        // Register as a host root so a guest collection across this handle keeps it alive.
+        inner.push_gc_root(index, crate::canon::RefKind::Extern);
+        // The externref arena is not reclaimed, so there is no generation to check.
+        Ok(Rooted::from_raw(index))
     }
 }
 

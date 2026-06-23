@@ -5,8 +5,10 @@ mod context;
 mod entity;
 mod gc;
 mod gc_codec;
+mod gc_collect;
 mod grow;
 mod inner;
+mod inner_gc;
 mod limits;
 
 pub use context::{AsContext, AsContextMut, StoreContext, StoreContextMut};
@@ -136,6 +138,13 @@ impl<T: 'static> Store<T> {
     /// The number of bytes backing the store's GC heap (mirrors `wasmtime::Store::gc_heap_capacity`).
     pub fn gc_heap_capacity(&self) -> usize {
         self.inner.gc.byte_size()
+    }
+
+    /// Forces a garbage collection now (mirrors `wasmtime::Store::gc`). A no-op under
+    /// `Collector::Null`. Called outside execution, so the roots are the store's entities plus
+    /// host-held `Rooted`s — there is no live operand stack to scan.
+    pub fn gc(&mut self) {
+        self.inner.gc_collect(&[]);
     }
 
     /// Throws `exception` from a host function so the guest's `try_table` can catch it (#28g).

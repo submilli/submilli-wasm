@@ -1,13 +1,10 @@
-//! The managed GC object heap: a store-side handle table for `struct`/`array` objects
-//! under the **null collector** (allocate-only; freed only when the `Store` drops). Mirrors
-//! the `externref` arena in [`super::inner`] but holds typed aggregates instead of opaque
-//! host payloads. `i31` and nulls are never allocated here — `i31` is unboxed directly in the
-//! `anyref` handle (see [`anyref_handle_i31`]).
-//!
-//! The mark bit and slot generation live in the object header but stay **inert** until the
-//! mark-sweep collector. This whole surface is wired into execution by the host GC API
-//! and the aggregate instructions; until those land it is unused — hence the
-//! module-level `dead_code` allowance.
+//! The managed GC object heap: a store-side handle table for `struct`/`array` objects. Mirrors the
+//! `externref` arena in [`super::inner`] but holds typed aggregates instead of opaque host payloads.
+//! `i31` and nulls are never allocated here — `i31` is unboxed directly in the `anyref` handle (see
+//! [`anyref_handle_i31`]). The mark-sweep collector ([`super::gc_collect`]) reclaims slots into a
+//! free-list and bumps each freed slot's generation (the stale-handle check); `Collector::Null`
+//! keeps it allocate-only. Guest allocation draws a limiter-granted reservation; the heap's bound is
+//! the limiter, not a wasm-style maximum (an `ABORT_SAFETY_CAP` only prevents an OOM-abort).
 #![allow(dead_code)]
 // `i31` (un)boxing is intentional 31-bit two's-complement wraparound.
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
@@ -18,9 +15,13 @@ use crate::trap::Trap;
 use crate::value::{AnyRef, Rooted, Val};
 use crate::Result;
 
-/// Per-store GC-heap byte ceiling when `Config::gc_memory_threshold` is unset. Generous and
-/// fixed for now (no physical-RAM detection yet); a precise limiter-batch budget comes later.
-const DEFAULT_GC_HEAP_LIMIT: usize = 1 << 30; // 1 GiB
+/// A fixed **abort-safety** cap on a store's GC heap (bytes), applied **only when no
+/// `ResourceLimiter` is installed** (with a limiter, the limiter is the sole bound and the guest
+/// heap may grow past this — it is *not* a wasm-style maximum). It exists so a hostile allocation
+/// traps rather than OOM-aborting when nothing else bounds it, and also bounds the free budget and
+/// the host/const-eval paths (which never consult the limiter). Physical-RAM detection is a later
+/// refinement.
+pub(crate) const ABORT_SAFETY_CAP: usize = 1 << 30; // 1 GiB
 
 /// Top bit of an `anyref` handle: set ⇒ the handle is an unboxed `i31`; clear ⇒ a heap slot
 /// index (so slot indices use the low 31 bits).
@@ -76,15 +77,14 @@ pub(crate) enum ObjKind {
 }
 
 /// A managed object's header. `type_id` is the engine-canonical type id (baked at allocation),
-/// used for casts + field layout; `kind` distinguishes struct/array/extern; `len` is the array
-/// element count (0 for structs). `mark`/`generation` are inert until a tracing collector.
+/// used for casts + field layout; `kind` distinguishes struct/array/extern. Deliberately tiny: the
+/// array element count is *derived* from the body length and the element stride (not stored), the
+/// mark bit lives in the heap's mark bitmap, and the slot *generation* lives in the heap's parallel
+/// `generations` vector — so the header is just an id + a tag, and a slot is just an `Option`.
 #[derive(Debug)]
 pub(crate) struct GcHeader {
     pub type_id: CanonicalTypeId,
     pub kind: ObjKind,
-    pub len: u32,
-    pub mark: bool,
-    pub generation: u32,
 }
 
 /// One heap-allocated managed object: a header plus a single tightly-packed body buffer. Body
@@ -99,23 +99,25 @@ impl GcObject {
     /// A struct object from its packed field bytes.
     pub(crate) fn new_struct(type_id: CanonicalTypeId, data: Box<[u8]>) -> Self {
         GcObject {
-            header: header(type_id, ObjKind::Struct, 0),
+            header: header(type_id, ObjKind::Struct),
             data,
         }
     }
 
-    /// An array object of `len` elements from its packed element bytes.
-    pub(crate) fn new_array(type_id: CanonicalTypeId, len: u32, data: Box<[u8]>) -> Self {
+    /// An array object from its packed element bytes. The element count is `data.len() / stride`
+    /// (recovered via [`array_len`](Self::array_len)), not stored.
+    pub(crate) fn new_array(type_id: CanonicalTypeId, data: Box<[u8]>) -> Self {
         GcObject {
-            header: header(type_id, ObjKind::Array, len),
+            header: header(type_id, ObjKind::Array),
             data,
         }
     }
 
     /// An `extern` wrapper around externref-arena index `idx`.
     pub(crate) fn extern_wrapper(idx: u32) -> Self {
+        let header = header(CanonicalTypeId::new(u32::MAX), ObjKind::Extern);
         GcObject {
-            header: header(CanonicalTypeId::new(u32::MAX), ObjKind::Extern, 0),
+            header,
             data: idx.to_le_bytes().to_vec().into_boxed_slice(),
         }
     }
@@ -128,224 +130,271 @@ impl GcObject {
         }
     }
 
-    /// Estimated heap footprint: the inline object plus its body buffer.
-    fn byte_size(&self) -> usize {
-        core::mem::size_of::<GcObject>() + self.data.len()
+    /// Array element count, derived from the body length and element `stride` (≥ 1 always; no div0).
+    pub(crate) fn array_len(&self, stride: usize) -> u32 {
+        (self.data.len() / stride.max(1)) as u32
+    }
+
+    /// Heap footprint of this object for `used`/limiter accounting: [`OBJECT_OVERHEAD`] + body.
+    /// Must match [`object_charge`] so `used` is consistent across alloc/reserve/sweep.
+    pub(crate) fn byte_size(&self) -> usize {
+        OBJECT_OVERHEAD.saturating_add(self.data.len())
     }
 }
 
-fn header(type_id: CanonicalTypeId, kind: ObjKind, len: u32) -> GcHeader {
-    GcHeader {
-        type_id,
-        kind,
-        len,
-        mark: false,
-        generation: 0,
-    }
+/// Fixed per-object cost charged on top of the body bytes: the `slots` cell (`Option<GcObject>`),
+/// the parallel `generations` `u32`, and ~16 B for the body `Box`'s allocator overhead. Keeps
+/// `used` a faithful, slightly-conservative bound (mark bitmap / free-list omitted as negligible).
+const OBJECT_OVERHEAD: usize =
+    core::mem::size_of::<Option<GcObject>>() + core::mem::size_of::<u32>() + 16;
+
+/// The heap byte charge of an object with a `data_len`-byte body — the reservation pre-charge (see
+/// `Execution::gc_reserve`). Mirrors [`GcObject::byte_size`].
+pub(crate) fn object_charge(data_len: usize) -> usize {
+    OBJECT_OVERHEAD.saturating_add(data_len)
 }
 
-/// The store's managed-object heap: a grow-only handle table under the null collector. A
-/// `Rooted<AnyRef>` whose handle decodes to `Slot(i)` indexes `slots[i]`. Freed wholesale on
-/// `Store` drop (no reclamation until a tracing collector lands).
+fn header(type_id: CanonicalTypeId, kind: ObjKind) -> GcHeader {
+    GcHeader { type_id, kind }
+}
+
+/// Initial reservation-growth step. The step **doubles** each grow (so the heap ramps up quickly)
+/// but is **capped at the store's `gc_heap_reservation`** (floored at this batch), so a large heap
+/// grows in bounded linear chunks rather than doubling its whole footprint. ARCHITECTURE §14.
+const RESERVE_BATCH: usize = 64 * 1024;
+
+/// The store's managed-object heap (handle table). A `Rooted<AnyRef>` whose handle decodes to
+/// `Slot(i)` indexes `slots[i]`. Guest allocation draws a byte budget (`reserved`) from the limiter,
+/// collecting (tracing collector) then growing it when exhausted; host/const-eval allocation is
+/// ceiling-bounded (`alloc_unreserved`). `Collector::Null` keeps `collecting = false`.
 #[derive(Debug)]
 pub(crate) struct GcHeap {
-    slots: Vec<GcObject>,
-    used_bytes: usize,
-    limit: usize,
+    /// The objects (or `None` when swept), indexed by slot; an empty slot is just a niche-`None`.
+    slots: Vec<Option<GcObject>>,
+    /// Per-slot reuse counter, **parallel** to `slots`. Bumped on free so a host `Rooted` that
+    /// outlived its object faults rather than aliasing a reused slot ([`super::gc_ref`] check). Kept
+    /// out of the slot so it survives the free *and* so the slot has no tail padding.
+    generations: Vec<u32>,
+    /// Swept slot indices available for reuse (LIFO).
+    free: Vec<u32>,
+    /// Bytes backing live objects.
+    used: usize,
+    /// Bytes the guest path may allocate within before growing again (the engine-wide committed
+    /// total tracks this). Growth ≤ `reservation` skips the limiter; beyond it is limiter-gated.
+    reserved: usize,
+    /// Pre-authorized free budget (`Config::gc_heap_reservation`): reservation growth up to here
+    /// skips the limiter, and it caps a single growth step.
+    reservation: usize,
+    /// The next reservation-growth step: starts at [`RESERVE_BATCH`], doubles each grow, capped at
+    /// `max(reservation, RESERVE_BATCH)`.
+    next_grow: usize,
+    /// Mark bitmap (1 bit per slot), used only during a collection: the mark phase sets a slot's
+    /// bit, sweep frees the live slots whose bit is clear, then the bitmap is cleared. Out of the
+    /// object header so "clear all marks" is a `memset` and the scan is sequential, not pointer-
+    /// chasing. Empty/all-zero between collections.
+    marks: Vec<u64>,
+    /// Whether a tracing collector runs (`Collector::Auto`/`MarkSweep`); `false` = allocate-only.
+    collecting: bool,
 }
 
 impl GcHeap {
-    /// Bytes currently backing live GC objects (the heap is allocate-only under the null
-    /// collector, so this is everything allocated so far). Wasmtime's `Store::gc_heap_capacity`.
+    /// Bytes currently backing live GC objects. Wasmtime's `Store::gc_heap_capacity`.
     pub(crate) fn byte_size(&self) -> usize {
-        self.used_bytes
+        self.used
     }
 
-    /// Creates a heap whose byte ceiling is `threshold` (else [`DEFAULT_GC_HEAP_LIMIT`]).
-    pub(crate) fn new(threshold: Option<usize>) -> Self {
+    /// Creates a heap with the store's pre-authorized `reservation` (free budget + growth-step cap).
+    /// The real growth bound beyond it is the limiter; `collecting` selects tracing (mark-sweep) vs.
+    /// allocate-only (null) behavior.
+    pub(crate) fn new(collecting: bool, reservation: usize) -> Self {
         GcHeap {
             slots: Vec::new(),
-            used_bytes: 0,
-            limit: threshold.unwrap_or(DEFAULT_GC_HEAP_LIMIT),
+            generations: Vec::new(),
+            free: Vec::new(),
+            marks: Vec::new(),
+            used: 0,
+            reserved: 0,
+            // The free budget skips the limiter, so bound it by the abort cap for OOM-safety.
+            reservation: reservation.min(ABORT_SAFETY_CAP),
+            next_grow: RESERVE_BATCH,
+            collecting,
         }
     }
 
-    /// Allocates `object`, returning its slot index. Charges its estimated size against the
-    /// heap ceiling; exhaustion traps (never UB, never `abort`). Allocate-only — the null
-    /// collector never reclaims, so this only grows until the store drops.
+    pub(crate) fn is_collecting(&self) -> bool {
+        self.collecting
+    }
+
+    /// Bytes currently reserved (the engine-wide committed total tracks these).
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    /// Whether growing the reservation to `target` stays within the pre-authorized budget — if so
+    /// the run loop grants it directly, with **no limiter consultation** (and no suspend).
+    pub(crate) fn is_free_grant(&self, target: usize) -> bool {
+        target <= self.reservation
+    }
+
+    /// Whether this store's live footprint is large enough to bother honoring an engine-wide
+    /// GC-pressure request (tiny tenants ignore it, avoiding a thundering herd).
+    pub(crate) fn footprint_over_floor(&self) -> bool {
+        self.used >= RESERVE_BATCH
+    }
+
+    /// Whether an object of `size` bytes fits the current guest reservation (the fast path: no
+    /// collection, no limiter consultation).
+    pub(crate) fn fits(&self, size: usize) -> bool {
+        self.used
+            .checked_add(size)
+            .is_some_and(|n| n <= self.reserved)
+    }
+
+    /// The hard ceiling for the limiter-less allocation paths (host/const-eval, `array.new_data`/
+    /// `_elem`): the largest budget already legitimately established for this store — the
+    /// limiter-granted `reserved`, the pre-authorized free `reservation`, or the no-limiter abort
+    /// cap as the floor. A limiter that grew `reserved` past the abort cap therefore lets these
+    /// paths follow, instead of being stuck at the cap.
+    fn unreserved_ceiling(&self) -> usize {
+        self.reserved.max(self.reservation).max(ABORT_SAFETY_CAP)
+    }
+
+    /// Whether an unreserved allocation of `size` bytes fits the [`unreserved_ceiling`] (else it
+    /// traps rather than risk an OOM-abort).
+    pub(crate) fn can_fit_limit(&self, size: usize) -> bool {
+        self.used
+            .checked_add(size)
+            .is_some_and(|n| n <= self.unreserved_ceiling())
+    }
+
+    /// The new (absolute) reservation we'd like for an allocation of `size` that doesn't currently
+    /// fit: one growth step (`next_grow`) beyond the current reservation, but always at least enough
+    /// to hold `used + size`. The step is bounded (it doubles only up to the reservation), so a large
+    /// heap grows in linear chunks rather than doubling its whole footprint. **Not** capped at the
+    /// abort-safety cap — the limiter decides the bound (`grow_gc_reservation` applies the cap only
+    /// when no limiter is installed), so a limited heap can grow past it.
+    pub(crate) fn desired_reservation(&self, size: usize) -> usize {
+        let need = self.used.saturating_add(size);
+        self.reserved.saturating_add(self.next_grow).max(need)
+    }
+
+    /// Records a reservation growth to `target` bytes (absolute), advancing the growth step
+    /// (doubled, capped at `max(reservation, RESERVE_BATCH)`). Returns the bytes actually added (for
+    /// the engine-wide committed-bytes accounting). The caller (`grow_gc_reservation` or the free
+    /// path) has already bounded `target` against the limiter or the abort cap.
+    pub(crate) fn grant(&mut self, target: usize) -> usize {
+        let old = self.reserved;
+        self.reserved = target;
+        let step_cap = self.reservation.max(RESERVE_BATCH);
+        self.next_grow = self.next_grow.saturating_mul(2).min(step_cap);
+        self.reserved.saturating_sub(old)
+    }
+
+    /// Places `object` in a free or fresh slot, charging its size against `used`. Only fails if the
+    /// handle space is exhausted (the budget is the caller's concern).
     pub(crate) fn alloc(&mut self, object: GcObject) -> Result<u32> {
         let size = object.byte_size();
-        let Some(used) = self
-            .used_bytes
-            .checked_add(size)
-            .filter(|&n| n <= self.limit)
-        else {
-            return Err(Trap::AllocationTooLarge.into());
-        };
-        // Slot indices must stay below `NULL_REF` (so a stored slot handle is never the null
-        // sentinel) — which also keeps them inside the 31-bit `anyref` range.
+        if let Some(index) = self.free.pop() {
+            debug_assert!(
+                self.slots[index as usize].is_none(),
+                "reusing a live gc slot"
+            );
+            // The slot's generation persists from when it was freed — do not reset it.
+            self.slots[index as usize] = Some(object);
+            self.used = self.used.saturating_add(size);
+            return Ok(index);
+        }
+        // Slot indices must stay below `NULL_REF` (so a stored handle is never the null sentinel),
+        // which also keeps them inside the 31-bit `anyref` range.
         if self.slots.len() as u64 >= u64::from(NULL_REF) {
             return Err(Trap::AllocationTooLarge.into());
         }
         let index = self.slots.len() as u32;
-        self.slots.push(object);
-        self.used_bytes = used;
+        self.slots.push(Some(object));
+        self.generations.push(0); // parallel; fresh slot starts at generation 0
+        self.used = self.used.saturating_add(size);
         Ok(index)
     }
 
-    /// Traps unless `extra_bytes` more would still fit under the heap ceiling. Used to bound a
-    /// large `array.new*` *before* building its backing `Vec`, so a hostile element count traps
-    /// rather than aborting the process on a failed host allocation.
+    /// Allocates a host- or const-eval-built object, bounded by the hard ceiling (these paths have
+    /// no run-loop to suspend for a limiter consultation, so they grow `used` up to `limit`, then
+    /// trap). A guest collection later reclaims any of these that become unreachable.
+    pub(crate) fn alloc_unreserved(&mut self, object: GcObject) -> Result<u32> {
+        if !self.can_fit_limit(object.byte_size()) {
+            return Err(Trap::AllocationTooLarge.into());
+        }
+        self.alloc(object)
+    }
+
+    /// Traps unless `extra_bytes` fits under the hard ceiling (pre-check before building a large
+    /// `array.new*` backing `Vec`, so a hostile element count traps rather than OOM-aborting).
     pub(crate) fn check_capacity(&self, extra_bytes: usize) -> Result<()> {
-        match self.used_bytes.checked_add(extra_bytes) {
-            Some(n) if n <= self.limit => Ok(()),
-            _ => Err(Trap::AllocationTooLarge.into()),
+        if self.can_fit_limit(extra_bytes) {
+            Ok(())
+        } else {
+            Err(Trap::AllocationTooLarge.into())
         }
     }
 
-    /// The object at `index`, or `None` if out of range (a guest-flowed handle must trap, not
-    /// panic, once the aggregate instructions land).
+    /// The object at slot `index`, or `None` if out of range or swept (a guest-/host-flowed handle
+    /// must fault, not panic).
     pub(crate) fn get(&self, index: u32) -> Option<&GcObject> {
-        self.slots.get(index as usize)
+        self.slots.get(index as usize)?.as_ref()
     }
 
     pub(crate) fn get_mut(&mut self, index: u32) -> Option<&mut GcObject> {
-        self.slots.get_mut(index as usize)
+        self.slots.get_mut(index as usize)?.as_mut()
+    }
+
+    /// The current generation of slot `index` (for the host stale-handle check); `None` if out of
+    /// range.
+    pub(crate) fn generation(&self, index: u32) -> Option<u32> {
+        self.generations.get(index as usize).copied()
+    }
+
+    /// Marks slot `index` reachable; returns `true` if it was newly marked (so the caller traces
+    /// its children exactly once). A dangling/already-swept index is ignored.
+    pub(crate) fn mark(&mut self, index: u32) -> bool {
+        let i = index as usize;
+        // Ignore a dangling/swept index — only live slots are roots.
+        if self.slots.get(i).is_none_or(Option::is_none) {
+            return false;
+        }
+        let (word, bit) = (i / 64, 1u64 << (i % 64));
+        if word >= self.marks.len() {
+            self.marks.resize(word + 1, 0);
+        }
+        if self.marks[word] & bit != 0 {
+            false
+        } else {
+            self.marks[word] |= bit;
+            true
+        }
+    }
+
+    /// Frees every unmarked live slot (running each freed object's reclamation is the caller's job
+    /// for externref payloads — GC structs/arrays own only plain bytes), recycles the freed indices,
+    /// and bumps their generation. Clears the mark bitmap for the next collection. `used` is updated.
+    pub(crate) fn sweep(&mut self) {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            let Some(obj) = slot.as_ref() else {
+                continue;
+            };
+            let marked = self
+                .marks
+                .get(i / 64)
+                .is_some_and(|word| word & (1 << (i % 64)) != 0);
+            if !marked {
+                self.used = self.used.saturating_sub(obj.byte_size());
+                *slot = None;
+                self.generations[i] = self.generations[i].wrapping_add(1);
+                self.free.push(i as u32);
+            }
+        }
+        self.marks.clear(); // all-zero between collections
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    use super::*;
-    use crate::canon::{RefKind, ScalarKind, Slot};
-    use crate::store::gc_codec::{read_slot, read_slot_packed, write_slot};
-    use crate::value::V128;
-
-    fn scalar(offset: usize, kind: ScalarKind) -> Slot {
-        Slot::Scalar { offset, kind }
-    }
-
-    #[test]
-    fn alloc_and_read_struct_and_array() {
-        let mut heap = GcHeap::new(Some(1 << 20));
-        // struct { i32, i32 } at offsets 0,4.
-        let mut sdata = vec![0u8; 8];
-        write_slot(scalar(0, ScalarKind::I32), &mut sdata, Val::I32(1));
-        write_slot(scalar(4, ScalarKind::I32), &mut sdata, Val::I32(2));
-        let s = heap
-            .alloc(GcObject::new_struct(
-                CanonicalTypeId::new(0),
-                sdata.into_boxed_slice(),
-            ))
-            .unwrap();
-        // array i64[3].
-        let a = heap
-            .alloc(GcObject::new_array(
-                CanonicalTypeId::new(1),
-                3,
-                vec![0u8; 24].into_boxed_slice(),
-            ))
-            .unwrap();
-        assert_ne!(s, a);
-        let so = heap.get(s).unwrap();
-        assert_eq!(so.header.kind, ObjKind::Struct);
-        assert_eq!(
-            read_slot(scalar(4, ScalarKind::I32), &so.data).unwrap_i32(),
-            2
-        );
-        let ao = heap.get(a).unwrap();
-        assert_eq!(ao.header.kind, ObjKind::Array);
-        assert_eq!(ao.header.len, 3);
-        assert!(heap.get(999).is_none());
-    }
-
-    #[test]
-    fn scalar_round_trip_per_kind() {
-        let cases = [
-            (ScalarKind::I8, Val::I32(-1), 1),
-            (ScalarKind::I16, Val::I32(-1), 2),
-            (ScalarKind::I32, Val::I32(-123_456), 4),
-            (ScalarKind::I64, Val::I64(i64::MIN), 8),
-            (ScalarKind::F32, Val::F32(1.5_f32.to_bits()), 4),
-            (ScalarKind::F64, Val::F64(2.5_f64.to_bits()), 8),
-            (ScalarKind::V128, Val::V128(V128::from(u128::MAX)), 16),
-        ];
-        for (kind, v, width) in cases {
-            let mut data = vec![0u8; width];
-            write_slot(scalar(0, kind), &mut data, v);
-            let got = read_slot(scalar(0, kind), &data);
-            // Packed kinds read back zero-extended; compare via the i32 low bits there.
-            match kind {
-                ScalarKind::I8 => assert_eq!(got.unwrap_i32(), 0xFF),
-                ScalarKind::I16 => assert_eq!(got.unwrap_i32(), 0xFFFF),
-                _ => assert_eq!(format!("{got:?}"), format!("{v:?}")),
-            }
-        }
-    }
-
-    #[test]
-    fn packed_sign_and_zero_extension() {
-        let mut data = vec![0u8; 2];
-        write_slot(scalar(0, ScalarKind::I8), &mut data, Val::I32(-1));
-        assert_eq!(read_slot_packed(scalar(0, ScalarKind::I8), &data, true), -1);
-        assert_eq!(
-            read_slot_packed(scalar(0, ScalarKind::I8), &data, false),
-            0xFF
-        );
-    }
-
-    #[test]
-    fn ref_slot_null_and_nonnull() {
-        let slot = Slot::Ref {
-            offset: 0,
-            kind: RefKind::Any,
-        };
-        let mut data = vec![0u8; 4];
-        write_slot(slot, &mut data, Val::AnyRef(None));
-        assert!(matches!(read_slot(slot, &data), Val::AnyRef(None)));
-        write_slot(slot, &mut data, anyref_value(anyref_handle_slot(42)));
-        match read_slot(slot, &data) {
-            Val::AnyRef(Some(r)) => assert_eq!(r.raw(), 42),
-            _ => panic!("expected non-null anyref"),
-        }
-    }
-
-    #[test]
-    fn packed_i8_array_body_is_compact() {
-        // An i8[1000] body is 1000 bytes, not 1000 * size_of::<Val>().
-        let obj = GcObject::new_array(CanonicalTypeId::new(0), 1000, vec![0u8; 1000].into());
-        assert_eq!(obj.data.len(), 1000);
-        assert!(obj.byte_size() < 1000 + 64);
-    }
-
-    #[test]
-    fn i31_handle_round_trips() {
-        for v in [0_i32, 1, -1, 42, -42, (1 << 30) - 1, -(1 << 30)] {
-            assert_eq!(
-                decode_anyref_handle(anyref_handle_i31(v)),
-                AnyRefHandle::I31(v)
-            );
-        }
-        assert_eq!(
-            decode_anyref_handle(anyref_handle_slot(123)),
-            AnyRefHandle::Slot(123)
-        );
-    }
-
-    #[test]
-    fn alloc_past_limit_traps() {
-        let mut heap = GcHeap::new(Some(64)); // smaller than the object below
-        let err = heap
-            .alloc(GcObject::new_array(
-                CanonicalTypeId::new(0),
-                256,
-                vec![0u8; 256].into_boxed_slice(),
-            ))
-            .unwrap_err();
-        assert_eq!(
-            *err.downcast_ref::<Trap>().unwrap(),
-            Trap::AllocationTooLarge
-        );
-    }
-}
+#[path = "gc_tests.rs"]
+mod tests;

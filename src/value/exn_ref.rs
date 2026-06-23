@@ -40,11 +40,16 @@ impl ExnRef {
                 return Err(Error::msg("exception field value has the wrong type"));
             }
         }
-        Ok(store.as_context_mut().inner_mut().alloc_exn(ExnEntity {
+        let mut ctx = store.as_context_mut();
+        let inner = ctx.inner_mut();
+        let exn = inner.alloc_exn(ExnEntity {
             tag: *tag,
             args: fields.to_vec(),
             backtrace: None,
-        }))
+        });
+        // Register as a host root so a guest collection keeps the exception's GC-typed args alive.
+        inner.push_gc_root(exn.raw(), crate::canon::RefKind::Exn);
+        Ok(exn)
     }
 }
 

@@ -9,6 +9,7 @@ pub struct Config {
     max_wasm_stack: Option<usize>,
     collector: Collector,
     gc_memory_threshold: Option<usize>,
+    gc_heap_reservation: u64,
     async_support: bool,
     wasm_backtrace: bool,
     wasm_backtrace_details: WasmBacktraceDetails,
@@ -23,6 +24,10 @@ impl Default for Config {
             max_wasm_stack: None,
             collector: Collector::default(),
             gc_memory_threshold: None,
+            // A small pre-authorized GC budget by default, so a typical store's early allocation
+            // doesn't suspend to the limiter on every batch; growth beyond it is limiter-gated.
+            // Set to 0 for a limiter-strict store (every grow consults the limiter).
+            gc_heap_reservation: 256 * 1024,
             // Enabled by default (unlike wasmtime, where it's opt-in): this interpreter is
             // fiber-less, so an async-enabled store runs sync calls just as well, and defaulting
             // on lets embedders use `call_async`/`fuel_async_yield_interval` without an explicit
@@ -123,8 +128,19 @@ impl Config {
         self
     }
 
+    /// The GC heap's **pre-authorized reservation** (bytes): the byte budget a store may grow its
+    /// GC heap to **without consulting the `ResourceLimiter`** (the embedder has authorized it up
+    /// front), and the cap on a single reservation-growth step. Growth beyond it is limiter-gated.
+    /// Defaults to `0` (every grow consults the limiter). Unlike wasmtime this reserves a *budget*,
+    /// not address space (we hold no mmap'd region).
     pub fn gc_heap_reservation(&mut self, bytes: u64) -> &mut Self {
+        self.gc_heap_reservation = bytes;
         self
+    }
+
+    /// The configured GC-heap reservation in bytes (saturated to `usize`).
+    pub(crate) fn gc_heap_reservation_bytes(&self) -> usize {
+        usize::try_from(self.gc_heap_reservation).unwrap_or(usize::MAX)
     }
 
     pub fn gc_heap_guard_size(&mut self, bytes: u64) -> &mut Self {
@@ -206,7 +222,7 @@ impl Config {
         self
     }
 
-    /// The selected garbage collector (read by the `Engine`; uniform until a tracing collector lands).
+    /// The selected garbage collector (resolved to the internal strategy by `Engine::new`).
     pub(crate) fn collector_kind(&self) -> Collector {
         self.collector
     }
@@ -238,19 +254,60 @@ impl Config {
     }
 }
 
-/// Garbage-collector selection, mirroring `wasmtime::Collector`.
+/// Garbage-collector selection, mostly mirroring `wasmtime::Collector`.
 ///
-/// Our interpreter implements a single internal strategy — non-moving
-/// stop-the-world mark-sweep; all variants are accepted for API compatibility
-/// and select the same collector.
+/// Our interpreter implements a single tracing strategy — non-moving stop-the-world
+/// **mark-sweep**. `Auto` selects it; `Null` stays allocate-only (matching wasmtime). The
+/// extra [`Collector::MarkSweep`] variant names that strategy explicitly (it has no wasmtime
+/// analog — naming it keeps us a superset, so drop-in embedder code, which never references it,
+/// still compiles). The two collectors we do **not** implement —
+/// [`Collector::DeferredReferenceCounting`] and [`Collector::Copying`] — are **rejected** at
+/// [`Engine::new`](crate::Engine::new), the same way wasmtime errors when a selected collector is
+/// unavailable. See `docs/ARCHITECTURE.md` §14.
 #[non_exhaustive]
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub enum Collector {
+    /// Automatically select a collector — resolves to non-moving mark-sweep here.
     #[default]
     Auto,
+    /// Deferred reference counting — **not implemented** (rejected at `Engine::new`).
     DeferredReferenceCounting,
+    /// Allocate-only: never reclaims, traps on heap exhaustion.
     Null,
+    /// Copying collector — **not implemented** (rejected at `Engine::new`).
     Copying,
+    /// Non-moving stop-the-world mark-sweep (our own variant; no wasmtime analog).
+    MarkSweep,
+}
+
+/// The internal collector strategy actually run, resolved from the public [`Collector`] at
+/// `Engine::new`. Two-way so the heap/run loop switch on it without re-deriving from the
+/// (`#[non_exhaustive]`, partly-rejected) public enum.
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub(crate) enum CollectorKind {
+    /// Allocate-only; reclaims nothing (`Collector::Null`).
+    Null,
+    /// Non-moving stop-the-world mark-sweep (`Collector::Auto`/`MarkSweep`).
+    MarkSweep,
+}
+
+impl Collector {
+    /// Resolves the public selection to the internal strategy, **rejecting** the collectors we
+    /// don't implement (wasmtime likewise errors at `Engine::new` for an unavailable collector).
+    pub(crate) fn resolve(self) -> crate::Result<CollectorKind> {
+        match self {
+            Collector::Auto | Collector::MarkSweep => Ok(CollectorKind::MarkSweep),
+            Collector::Null => Ok(CollectorKind::Null),
+            Collector::DeferredReferenceCounting => Err(crate::Error::msg(
+                "the deferred reference-counting collector is not supported \
+                 (use Collector::Auto, Collector::MarkSweep, or Collector::Null)",
+            )),
+            Collector::Copying => Err(crate::Error::msg(
+                "the copying collector is not supported \
+                 (use Collector::Auto, Collector::MarkSweep, or Collector::Null)",
+            )),
+        }
+    }
 }
 
 /// Cranelift optimization level, mirroring `wasmtime::OptLevel`. Accepted for API

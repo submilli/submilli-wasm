@@ -1,6 +1,7 @@
 //! `Module` — parse + validate + compile a wasm binary to internal bytecode.
 
 pub(crate) mod compile;
+pub(crate) mod const_expr;
 pub(crate) mod debug;
 pub(crate) mod handler;
 pub(crate) mod inner;
@@ -82,8 +83,10 @@ impl Module {
     }
 
     /// Like [`Module::new`] but accepts binary `.wasm` only.
+    ///
+    /// Validation is fused into the decode/compile pass (see [`parse::parse_module`]), so the
+    /// binary is walked once — not validated by a separate full pass and then re-parsed.
     pub fn from_binary(engine: &Engine, binary: &[u8]) -> Result<Module> {
-        Module::validate(engine, binary)?;
         let inner = parse::parse_module(engine, binary)?;
         Ok(Module(Arc::new(inner)))
     }

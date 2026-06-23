@@ -39,6 +39,11 @@ pub(crate) enum Outcome {
         delta: u64,
         init: Ref,
     },
+    /// A guest GC allocation outgrew the reservation: grow it to `reserved_target` bytes through the
+    /// (generic) limiter, then re-execute the allocating op. See `Execution::gc_reserve`.
+    GcGrow {
+        reserved_target: usize,
+    },
 }
 
 /// What a single [`step`](super::Execution::step) decided: advance, or perform a
@@ -82,6 +87,12 @@ pub(super) enum StepOutcome {
         table: Table,
         delta: u64,
         init: Ref,
+        return_ip: u32,
+    },
+    /// Grow the GC reservation to `reserved_target` bytes (limiter-consulted), then re-execute the
+    /// allocating op at `return_ip`.
+    DoGcGrow {
+        reserved_target: usize,
         return_ip: u32,
     },
 }

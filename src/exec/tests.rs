@@ -8,12 +8,11 @@ use crate::canon::{AggKind, CompositeBody, IrVal, ModuleType};
 use crate::engine::Engine;
 use crate::instance::Instance;
 use crate::module::compile::{translate_function, CompileCtx};
-use crate::module::Module;
 use crate::store::Store;
 use crate::trap::Trap;
 use crate::value::{Finality, Val, ValType};
 use crate::Result;
-use wasmparser::{Parser, Payload};
+use wasmparser::{FuncValidatorAllocations, Parser, ValidPayload, Validator};
 
 /// Maps a (numeric) public `ValType` to module IR — these tests only use numeric signatures.
 fn ir(tys: &[ValType]) -> Vec<IrVal> {
@@ -33,7 +32,6 @@ fn ir(tys: &[ValType]) -> Vec<IrVal> {
 fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -> Result<Vec<Val>> {
     let engine = Engine::default();
     let bytes = wat::parse_str(wat).unwrap();
-    Module::validate(&engine, &bytes)?;
     let types = [ModuleType {
         group: 0,
         finality: Finality::Final,
@@ -51,9 +49,12 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         tag_types: &[],
     };
     let mut code = None;
+    let mut validator = Validator::new_with_features(crate::module::enabled_features());
     for payload in Parser::new(0).parse_all(&bytes) {
-        if let Payload::CodeSectionEntry(body) = payload.unwrap() {
-            code = Some(translate_function(&ctx, 0, &body, false)?);
+        let payload = payload.unwrap();
+        if let ValidPayload::Func(to_validate, body) = validator.payload(&payload).unwrap() {
+            let mut fv = to_validate.into_validator(FuncValidatorAllocations::default());
+            code = Some(translate_function(&ctx, 0, &body, &mut fv, false)?);
         }
     }
     let mut store = Store::new(&engine, ());

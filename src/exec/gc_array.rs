@@ -60,8 +60,10 @@ impl Execution {
         let type_id = module.inner().canonical_type_id(ty);
         let stride = module.inner().layout(ty).stride();
         let count = self.pop_i32() as u32 as usize;
+        // `byte_len` (count × stride) was already bounded by `gc_reserve` before this op ran
+        // (limiter or abort cap), so a too-large array has already trapped — no abort-cap re-check
+        // here, which would otherwise cap a limiter-approved large array.
         let byte_len = elem_bytes(count, stride)?;
-        inner.gc_check_capacity(byte_len)?;
         let mut data = vec![0u8; byte_len];
         let fill = if default {
             default_for_slot(module.inner().layout(ty).elem_at(0))
@@ -69,7 +71,7 @@ impl Execution {
             self.pop_val_for(module.inner().layout(ty).elem_at(0))
         };
         write_each(module.inner().layout(ty), &mut data, count, fill);
-        self.alloc_array(inner, type_id, count, data)
+        self.alloc_array(inner, type_id, data)
     }
 
     fn array_new_fixed(
@@ -88,7 +90,7 @@ impl Execution {
             let v = self.pop_val_for(layout.elem_at(i));
             write_slot(layout.elem_at(i), &mut data, v);
         }
-        self.alloc_array(inner, type_id, count, data)
+        self.alloc_array(inner, type_id, data)
     }
 
     fn array_new_data(
@@ -111,7 +113,7 @@ impl Execution {
         inner.gc_check_capacity(byte_len)?;
         // Scalar elements share the segment's little-endian layout — a direct byte copy.
         let body = seg[offset..offset + byte_len].to_vec();
-        self.alloc_array(inner, type_id, count, body)
+        self.alloc_array(inner, type_id, body)
     }
 
     fn array_new_elem(
@@ -133,7 +135,7 @@ impl Execution {
         for (i, r) in refs[offset..offset + count].iter().enumerate() {
             write_slot(layout.elem_at(i), &mut data, Val::from_ref(r.clone()));
         }
-        self.alloc_array(inner, type_id, count, data)
+        self.alloc_array(inner, type_id, data)
     }
 
     fn array_get(
@@ -176,7 +178,12 @@ impl Execution {
     fn array_len(&mut self, inner: &StoreInner) -> Result<()> {
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
-        self.push(Val::I32(arr_len(inner, obj) as i32));
+        // `array.len` carries no type immediate (it's polymorphic), so the element stride is
+        // recovered from the object's canonical type via the engine registry. Typically called once
+        // per array (a loop bound), so this lookup is amortized.
+        let type_id = inner.gc_object(obj).expect("live gc slot").header.type_id;
+        let stride = Layout::for_array(&inner.engine().array_field(type_id)).stride();
+        self.push(Val::I32(arr_len(inner, obj, stride) as i32));
         Ok(())
     }
 
@@ -188,7 +195,12 @@ impl Execution {
         let idx = self.pop_i32() as u32 as usize;
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
-        range(idx, len, arr_len(inner, obj), Trap::ArrayOutOfBounds)?;
+        range(
+            idx,
+            len,
+            arr_len(inner, obj, layout.stride()),
+            Trap::ArrayOutOfBounds,
+        )?;
         let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
         for i in idx..idx + len {
             write_slot(layout.elem_at(i), data, v);
@@ -211,8 +223,18 @@ impl Execution {
         let dst_r = self.pop_anyref();
         let src = anyref_slot(&src_r, Trap::NullArrayReference)?;
         let dst = anyref_slot(&dst_r, Trap::NullArrayReference)?;
-        range(src_idx, len, arr_len(inner, src), Trap::ArrayOutOfBounds)?;
-        range(dst_idx, len, arr_len(inner, dst), Trap::ArrayOutOfBounds)?;
+        range(
+            src_idx,
+            len,
+            arr_len(inner, src, stride),
+            Trap::ArrayOutOfBounds,
+        )?;
+        range(
+            dst_idx,
+            len,
+            arr_len(inner, dst, stride),
+            Trap::ArrayOutOfBounds,
+        )?;
         // Byte copy (handles match-width ref handles too); snapshot so src==dst overlap is safe.
         let from = src_idx * stride;
         let snapshot =
@@ -239,7 +261,12 @@ impl Execution {
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // Array (dst) range before the data (src) range — a `len` overrunning both reports
         // "out of bounds array access" (matches the spec ordering).
-        range(dst, len, arr_len(inner, obj), Trap::ArrayOutOfBounds)?;
+        range(
+            dst,
+            len,
+            arr_len(inner, obj, stride),
+            Trap::ArrayOutOfBounds,
+        )?;
         let byte_len = elem_bytes(len, stride)?;
         let dropped = inner.instance(instance).dropped_data[data as usize];
         let seg = &module.inner().datas[data as usize].bytes;
@@ -267,7 +294,12 @@ impl Execution {
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // Array (dst) range before the elem-segment (src) range, as in `array.init_data`.
-        range(dst, len, arr_len(inner, obj), Trap::ArrayOutOfBounds)?;
+        range(
+            dst,
+            len,
+            arr_len(inner, obj, layout.stride()),
+            Trap::ArrayOutOfBounds,
+        )?;
         let refs = self.segment_refs(inner, instance, elem);
         range(src, len, refs.len(), Trap::TableOutOfBounds)?;
         let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
@@ -277,26 +309,22 @@ impl Execution {
         Ok(())
     }
 
-    /// Allocates a fully-initialized array object (of `count` elements) and pushes its reference.
+    /// Allocates a fully-initialized array object and pushes its reference. The element count is
+    /// implicit in `data.len()` (= count × stride).
     fn alloc_array(
         &mut self,
         inner: &mut StoreInner,
         type_id: CanonicalTypeId,
-        count: usize,
         data: Vec<u8>,
     ) -> Result<()> {
-        let slot = inner.alloc_gc(GcObject::new_array(
-            type_id,
-            count as u32,
-            data.into_boxed_slice(),
-        ))?;
+        let slot = inner.alloc_gc(GcObject::new_array(type_id, data.into_boxed_slice()))?;
         self.push(anyref_value(anyref_handle_slot(slot)));
         Ok(())
     }
 
     /// The element slot at `idx`, bounds-checked against the object's element count.
     fn elem_slot(&self, inner: &StoreInner, obj: u32, layout: &Layout, idx: usize) -> Result<Slot> {
-        if idx < arr_len(inner, obj) {
+        if idx < arr_len(inner, obj, layout.stride()) {
             Ok(layout.elem_at(idx))
         } else {
             Err(Trap::ArrayOutOfBounds.into())
@@ -315,8 +343,11 @@ impl Execution {
     }
 }
 
-fn arr_len(inner: &StoreInner, obj: u32) -> usize {
-    inner.gc_object(obj).expect("live gc slot").header.len as usize
+fn arr_len(inner: &StoreInner, obj: u32, stride: usize) -> usize {
+    inner
+        .gc_object(obj)
+        .expect("live gc slot")
+        .array_len(stride) as usize
 }
 
 /// `count * width`, trapping (allocation-too-large) on overflow.

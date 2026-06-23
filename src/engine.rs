@@ -1,10 +1,10 @@
 //! `Engine` — shared, thread-safe compilation/runtime root; holds the epoch counter.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::canon::{AggKind, CanonicalTypeId, GroupId, ModuleType, TypeRegistry};
-use crate::config::{Collector, Config};
+use crate::config::{CollectorKind, Config};
 use crate::value::{FieldType, Finality, ValType};
 use crate::Result;
 
@@ -28,12 +28,25 @@ struct EngineInner {
     consume_fuel: bool,
     epoch_interruption: bool,
     is_async: bool,
-    /// Selected garbage collector. Recorded now; all variants behave allocate-only
-    /// (null collector) until a tracing collector lands.
-    collector: Collector,
-    /// Engine-wide GC-pressure threshold (bytes); also sizes each store's heap ceiling
-    /// for now (the engine-wide aggregate axis lands with the tracing collector).
+    /// The resolved collector strategy (mark-sweep or allocate-only null), decided at
+    /// `Engine::new` from `Config::collector`.
+    collector: CollectorKind,
+    /// Engine-wide GC-pressure threshold (bytes); also sizes each store's heap ceiling.
     gc_memory_threshold: Option<usize>,
+    /// Per-store pre-authorized GC budget (bytes): reservation growth within it skips the limiter,
+    /// and it caps a single growth step (`Config::gc_heap_reservation`).
+    gc_heap_reservation: usize,
+    /// Total GC bytes committed (reserved) across all of the engine's stores — updated at
+    /// reservation-batch granularity (never per object), so it has no hot-path cost. Drives the
+    /// engine-wide GC-pressure axis (§14).
+    gc_committed: AtomicUsize,
+    /// Per-store GC-request **mailboxes**: each live store registers a flag here (held as a `Weak`,
+    /// the store owns the `Arc`). When `gc_committed` crosses `gc_memory_threshold`, the engine
+    /// posts to every mailbox; each store reads (and clears) *its own* at a back-edge safe point and
+    /// self-collects. A `Store` is `!Sync`, so this is the only way the engine can *request* (never
+    /// force) a collection on another thread — and one store servicing its request leaves the others'
+    /// untouched. Dead mailboxes are pruned on post.
+    gc_requests: Mutex<Vec<Weak<AtomicBool>>>,
     /// Whether to capture backtraces (`Config::wasm_backtrace`); also gates the per-`Op` offset
     /// table + `name`-section retention at parse (#29c).
     wasm_backtrace: bool,
@@ -57,8 +70,11 @@ impl Engine {
                 consume_fuel: config.consume_fuel_enabled(),
                 epoch_interruption: config.epoch_interruption_enabled(),
                 is_async: config.async_support_enabled(),
-                collector: config.collector_kind(),
+                collector: config.collector_kind().resolve()?,
                 gc_memory_threshold: config.gc_memory_threshold_bytes(),
+                gc_heap_reservation: config.gc_heap_reservation_bytes(),
+                gc_committed: AtomicUsize::new(0),
+                gc_requests: Mutex::new(Vec::new()),
                 wasm_backtrace: config.wasm_backtrace_enabled(),
                 retain_dwarf: config.debug_info_enabled()
                     || (config.wasm_backtrace_enabled() && config.wasm_backtrace_details_enabled()),
@@ -257,17 +273,64 @@ impl Engine {
         self.inner.retain_dwarf
     }
 
-    /// The selected garbage collector. Recorded now; consulted once a tracing collector
-    /// lands — every variant is allocate-only (null collector) until then.
-    #[allow(dead_code)]
-    pub(crate) fn collector(&self) -> Collector {
+    /// The resolved collector strategy (mark-sweep or allocate-only null).
+    pub(crate) fn collector(&self) -> CollectorKind {
         self.inner.collector
     }
 
-    /// The engine-wide GC-pressure threshold in bytes, if configured. Sizes each store's
-    /// GC-heap ceiling for now (the engine-wide aggregate axis lands with the collector).
+    /// Whether the engine runs a tracing collector (i.e. not the allocate-only null collector).
+    pub(crate) fn is_collecting(&self) -> bool {
+        self.inner.collector == CollectorKind::MarkSweep
+    }
+
+    /// The engine-wide GC-pressure threshold in bytes, if configured. Sizes each store's GC-heap
+    /// ceiling and is the high-water mark for the engine-wide GC-pressure axis.
     pub(crate) fn gc_memory_threshold(&self) -> Option<usize> {
         self.inner.gc_memory_threshold
+    }
+
+    /// The per-store pre-authorized GC reservation in bytes (`Config::gc_heap_reservation`).
+    pub(crate) fn gc_heap_reservation(&self) -> usize {
+        self.inner.gc_heap_reservation
+    }
+
+    /// Registers a new store's GC-request mailbox, returning the flag the store owns (the engine
+    /// keeps a `Weak`). Posted to under engine-wide GC pressure; read-and-cleared by the store.
+    pub(crate) fn register_gc_request(&self) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut mailboxes) = self.inner.gc_requests.lock() {
+            mailboxes.push(Arc::downgrade(&flag));
+        }
+        flag
+    }
+
+    /// Records a reservation growth of `delta` GC bytes against the engine-wide committed total. If
+    /// it crosses `gc_memory_threshold` (when configured), posts a collection request to every live
+    /// store's mailbox (pruning dead ones). Batch-granular, so this is off the hot path.
+    pub(crate) fn add_gc_committed(&self, delta: usize) {
+        let total = self.inner.gc_committed.fetch_add(delta, Ordering::Relaxed) + delta;
+        if self.inner.gc_memory_threshold.is_none_or(|t| total <= t) {
+            return;
+        }
+        if let Ok(mut mailboxes) = self.inner.gc_requests.lock() {
+            mailboxes.retain(|w| match w.upgrade() {
+                Some(flag) => {
+                    flag.store(true, Ordering::Relaxed);
+                    true
+                }
+                None => false, // store dropped — prune its mailbox
+            });
+        }
+    }
+
+    /// Releases `delta` GC bytes from the engine-wide committed total (a store dropped its heap).
+    pub(crate) fn sub_gc_committed(&self, delta: usize) {
+        self.inner.gc_committed.fetch_sub(delta, Ordering::Relaxed);
+    }
+
+    /// Total GC bytes committed (reserved) across the engine's stores (for tests / introspection).
+    pub(crate) fn gc_committed_bytes(&self) -> usize {
+        self.inner.gc_committed.load(Ordering::Relaxed)
     }
 
     /// Compiles `bytes` and returns the serialized compiled artifact (as
@@ -312,3 +375,7 @@ impl EngineWeak {
         self.inner.upgrade().map(|inner| Engine { inner })
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

@@ -33,21 +33,22 @@ impl Execution {
             }
             Op::Select => {
                 let cond = self.pop_i32();
-                let b = self.pop();
-                let a = self.pop();
-                self.push_cell(if cond != 0 { a } else { b });
+                let b = self.pop_tagged();
+                let a = self.pop_tagged();
+                let (cell, tag) = if cond != 0 { a } else { b };
+                self.push_cell(cell, tag);
             }
             Op::LocalGet(i) => {
-                let v = self.values[(base + i) as usize];
-                self.push_cell(v);
+                let (cell, tag) = self.cell_at((base + i) as usize);
+                self.push_cell(cell, tag);
             }
             Op::LocalSet(i) => {
-                let v = self.pop();
-                self.values[(base + i) as usize] = v;
+                let (cell, tag) = self.pop_tagged();
+                self.set_cell((base + i) as usize, cell, tag);
             }
             Op::LocalTee(i) => {
-                let v = *self.values.last().expect("operand stack underflow");
-                self.values[(base + i) as usize] = v;
+                let (cell, tag) = self.top_cell();
+                self.set_cell((base + i) as usize, cell, tag);
             }
             Op::GlobalGet(g) => {
                 let handle = inner.instance(instance).globals[*g as usize];
@@ -106,17 +107,17 @@ impl Execution {
             Op::CallRef(_) => return self.do_call_ref(inner, instance, CallKind::Nested(next)),
             Op::ReturnCallRef(_) => return self.do_call_ref(inner, instance, CallKind::Tail),
             Op::BrOnNull(t) => {
-                let r = self.pop();
+                let (r, tag) = self.pop_tagged();
                 if r.is_null() {
                     self.take_branch(t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
-                self.push_cell(r); // non-null: keep it, fall through
+                self.push_cell(r, tag); // non-null: keep it, fall through
             }
             Op::BrOnNonNull(t) => {
-                let r = self.pop();
+                let (r, tag) = self.pop_tagged();
                 if !r.is_null() {
-                    self.push_cell(r); // non-null: keep it on the branch target
+                    self.push_cell(r, tag); // non-null: keep it on the branch target
                     self.take_branch(t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
@@ -201,6 +202,22 @@ impl Execution {
             }
             #[cfg(feature = "simd")]
             Op::Simd(s) => self.exec_simd(inner, s, instance)?,
+            // GC aggregate allocation: ensure the limiter-granted reservation covers it first (with
+            // operands still on the stack as roots); a reservation grow suspends and re-executes.
+            // `array.new_data`/`array.new_elem` are excluded — their size is bounded by the source
+            // segment, and their in-handler out-of-bounds check must trap before any size check.
+            alloc @ (Op::StructNew(_)
+            | Op::StructNewDefault(_)
+            | Op::ArrayNew(_)
+            | Op::ArrayNewDefault(_)
+            | Op::ArrayNewFixed { .. }) => {
+                if let Some(charge) = self.gc_alloc_charge(inner, instance, alloc)? {
+                    if let Some(out) = self.gc_reserve(inner, charge, ip) {
+                        return Ok(out);
+                    }
+                }
+                self.exec_gc(inner, alloc, instance)?;
+            }
             // Straight-line GC + numerics: exec_gc → exec_gc_array → exec_cast → exec_numeric.
             other => self.exec_gc(inner, other, instance)?,
         }

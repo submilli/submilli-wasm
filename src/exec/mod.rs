@@ -7,6 +7,7 @@ mod arith;
 mod call;
 mod cast;
 mod cell;
+mod collect;
 mod convert;
 mod exn;
 mod frame;
@@ -42,6 +43,11 @@ use outcome::{CallReq, ResolvedCall, StepOutcome};
 /// where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
 struct Execution {
     values: Vec<cell::Cell>,
+    /// Per-operand-slot reference tag ([`cell::RefTag`]), parallel to `values` (same length, moved
+    /// in lockstep). The cell stack is untyped, so this byte-shadow is how a tracing collector
+    /// recovers operand/local roots (ARCHITECTURE §7/§14, #27g). Maintained unconditionally; cheap
+    /// (1 B/slot) and far simpler to keep exhaustive than gating per-op.
+    shadow: Vec<cell::RefTag>,
     frames: Vec<Frame>,
 }
 
@@ -58,6 +64,7 @@ impl Execution {
     /// fixed-width untyped [`cell::Cell`] (8 or 16 bytes; see `cell`), not the ~32-byte `Val`.
     fn stack_bytes(&self) -> usize {
         self.values.len() * std::mem::size_of::<cell::Cell>()
+            + self.shadow.len() // 1 byte per operand slot (the GC root shadow)
             + self.frames.len() * std::mem::size_of::<Frame>()
     }
 
@@ -83,6 +90,9 @@ impl Execution {
         let dst = src - t.pop as usize;
         self.values.copy_within(src..len, dst);
         self.values.truncate(dst + keep);
+        // The root shadow moves in lockstep with the cell stack (same offsets/length).
+        self.shadow.copy_within(src..len, dst);
+        self.shadow.truncate(dst + keep);
     }
 
     fn top(&self) -> (Arc<CompiledFunc>, u32, u32, Instance) {
@@ -99,6 +109,8 @@ impl Execution {
         let dst = frame.locals_base as usize;
         self.values.copy_within(len - n..len, dst);
         self.values.truncate(dst + n);
+        self.shadow.copy_within(len - n..len, dst);
+        self.shadow.truncate(dst + n);
         self.frames.is_empty()
     }
 
@@ -112,6 +124,9 @@ impl Execution {
         let stack_limit = inner.engine().max_wasm_stack();
         let fuel_enabled = inner.engine().consume_fuel();
         let epoch_enabled = inner.engine().epoch_interruption();
+        // The engine-wide GC-pressure axis is only live under a tracing collector (else the
+        // mailbox is never posted to — no hot-path cost by default).
+        let gc_pressure_watch = inner.gc.is_collecting();
         let (mut code, mut ip, mut base, mut instance) = self.top();
         loop {
             if ip as usize >= code.ops.len() {
@@ -142,6 +157,13 @@ impl Execution {
             if epoch_enabled && inner.epoch_deadline_reached() {
                 self.frames.last_mut().expect("current frame").ip = ip;
                 return Ok(Outcome::EpochDeadline);
+            }
+            // Honor an engine-wide GC-pressure request posted to this store's mailbox at this safe
+            // point (operands are roots via the shadow). Read-and-clear, so we collect once per
+            // posted request (not over and over); only large-footprint stores bother (no thundering
+            // herd); request, not force — a finishing store simply never reaches here.
+            if gc_pressure_watch && inner.gc.footprint_over_floor() && inner.take_gc_request() {
+                self.gc_collect_now(inner);
             }
             match self.step(inner, &code, ip, base, instance) {
                 Err(e) => match self.unwind(inner, e, ip) {
@@ -226,6 +248,13 @@ impl Execution {
                 }) => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
                     return Ok(Outcome::TableGrow { table, delta, init });
+                }
+                Ok(StepOutcome::DoGcGrow {
+                    reserved_target,
+                    return_ip,
+                }) => {
+                    self.frames.last_mut().expect("caller frame").ip = return_ip;
+                    return Ok(Outcome::GcGrow { reserved_target });
                 }
             }
         }

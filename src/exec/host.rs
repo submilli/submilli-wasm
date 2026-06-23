@@ -38,6 +38,7 @@ pub(crate) fn execute<T>(
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     let mut exec = Execution {
+        shadow: args.iter().map(cell::RefTag::of_val).collect(),
         values: args.into_iter().map(cell::encode).collect(),
         frames: Vec::new(),
     };
@@ -69,6 +70,7 @@ pub(crate) fn execute<T>(
             Outcome::TableGrow { table, delta, init } => {
                 exec.do_grow_table(store, table, delta, init)?;
             }
+            Outcome::GcGrow { reserved_target } => store.grow_gc_reservation(reserved_target)?,
         }
     }
 }
@@ -86,6 +88,7 @@ pub(crate) async fn execute_async<T>(
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     let mut exec = Execution {
+        shadow: args.iter().map(cell::RefTag::of_val).collect(),
         values: args.into_iter().map(cell::encode).collect(),
         frames: Vec::new(),
     };
@@ -116,6 +119,9 @@ pub(crate) async fn execute_async<T>(
             Outcome::TableGrow { table, delta, init } => {
                 exec.do_grow_table_async(store, table, delta, init).await?;
             }
+            // GC reservation growth uses the sync limiter path (errors if an async limiter is
+            // installed — combining an async limiter with the GC heap is unsupported for now).
+            Outcome::GcGrow { reserved_target } => store.grow_gc_reservation(reserved_target)?,
         }
     }
 }
@@ -218,6 +224,20 @@ impl Execution {
                 unreachable!("HostCall only suspends on sync host funcs")
             }
         };
+        // Scope the host roots created during the call (the GC host API registers a root per
+        // `StructRef`/`ArrayRef`/`ExternRef` it builds). Without this they accumulate for the
+        // store's life — a host fn that builds a GC object per call (e.g. one string per line) would
+        // pin every one, defeating collection. Returned values survive via `push_results` (operand
+        // roots); anything the host stored into a global/table/pending-exception is rooted there.
+        let roots_mark = store.inner.gc_roots_mark();
+        // Park the live operands (including this call's params, still on the stack) as roots for the
+        // call's duration, so host GC allocation (`gc_reserve_host`) can safely collect: the guest's
+        // operands are otherwise unreachable from `Store<T>` (they live in this `Execution`, parked
+        // in the driver loop). Truncated below with the host roots; on return the operands are live
+        // on the stack again (and the results become operand-rooted via `push_results`).
+        for (handle, kind) in self.operand_roots() {
+            store.inner.push_gc_root(handle, kind);
+        }
         let params = self.pop_params(&param_tys);
         let cb = store.host_funcs[host_index as usize].clone();
         // Expose the live wasm frames to `WasmBacktrace::capture(caller)` for the host call's
@@ -230,6 +250,7 @@ impl Execution {
         );
         store.inner.swap_host_frames(prev);
         if let Err(e) = result {
+            store.inner.gc_roots_truncate(roots_mark);
             return self.host_call_error(&mut store.inner, e);
         }
         // The host returned normally, so it did not throw. Drop any exception it set via
@@ -237,6 +258,7 @@ impl Execution {
         // scoped to a single host call and must be empty once one completes without throwing.
         store.inner.take_pending_exception();
         self.push_results(results);
+        store.inner.gc_roots_truncate(roots_mark); // results are now operand-rooted
         Ok(())
     }
 
@@ -279,6 +301,11 @@ impl Execution {
             ),
             _ => unreachable!("HostAsync only suspends on async host funcs"),
         };
+        // Scope the host roots and park the live operands/params as roots (see `invoke_host`).
+        let roots_mark = store.inner.gc_roots_mark();
+        for (handle, kind) in self.operand_roots() {
+            store.inner.push_gc_root(handle, kind);
+        }
         let params = self.pop_params(&param_tys);
         let cb = store.async_host_funcs[host_index as usize].clone();
         let prev = store.inner.swap_host_frames(self.host_frame_snapshot());
@@ -289,11 +316,13 @@ impl Execution {
         };
         store.inner.swap_host_frames(prev);
         if let Err(e) = outcome {
+            store.inner.gc_roots_truncate(roots_mark);
             return self.host_call_error(&mut store.inner, e);
         }
         // See `invoke_host`: a host that returned normally leaves no pending exception.
         store.inner.take_pending_exception();
         self.push_results(results);
+        store.inner.gc_roots_truncate(roots_mark);
         Ok(())
     }
 

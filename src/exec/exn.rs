@@ -114,7 +114,9 @@ impl Execution {
             let (code, base, instance) = (frame.code.clone(), frame.locals_base, frame.instance);
             if let Some(rec) = find_clause(&code, fault_ip, inner, instance, thrown) {
                 let floor = base + code.n_params + code.local_types.len() as u32;
-                self.values.truncate((floor + rec.restore_height) as usize);
+                let restore = (floor + rec.restore_height) as usize;
+                self.values.truncate(restore);
+                self.shadow.truncate(restore);
                 if rec.payload_args {
                     for a in inner.exn(exn).args.clone() {
                         self.push(a);
@@ -127,6 +129,7 @@ impl Execution {
                 return Ok(());
             }
             self.values.truncate(base as usize);
+            self.shadow.truncate(base as usize);
             self.frames.pop();
             match self.frames.last() {
                 Some(f) => fault_ip = f.ip.saturating_sub(1),

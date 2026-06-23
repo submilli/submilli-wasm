@@ -33,4 +33,8 @@ impl<E> Arena<E> {
     pub(super) fn len(&self) -> u32 {
         self.0.len() as u32
     }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &E> {
+        self.0.iter()
+    }
 }

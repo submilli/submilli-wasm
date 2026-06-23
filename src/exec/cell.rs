@@ -30,6 +30,43 @@ pub(super) const SLOT_BYTES: usize = 8;
 #[derive(Copy, Clone)]
 pub(super) struct Cell([u8; SLOT_BYTES]);
 
+/// The reference-hierarchy tag stored in the operand-stack root shadow (one per slot, `Copy` so it
+/// moves with the cell stack's `copy_within`). [`NONE`](RefTag::NONE) marks a non-reference slot;
+/// the others say which arena a live handle points into, so the tracing collector decodes and
+/// traces it (#27g). A compact newtype, not the `RefKind` enum, so the shadow stays a byte vector.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(super) struct RefTag(u8);
+
+impl RefTag {
+    pub(super) const NONE: RefTag = RefTag(0);
+    const FUNC: RefTag = RefTag(1);
+    const EXTERN: RefTag = RefTag(2);
+    const ANY: RefTag = RefTag(3);
+    const EXN: RefTag = RefTag(4);
+
+    /// The shadow tag for a `Val` about to be pushed (its reference hierarchy, or `NONE`).
+    pub(super) fn of_val(v: &Val) -> RefTag {
+        match v {
+            Val::FuncRef(_) => RefTag::FUNC,
+            Val::ExternRef(_) => RefTag::EXTERN,
+            Val::AnyRef(_) => RefTag::ANY,
+            Val::ExnRef(_) => RefTag::EXN,
+            _ => RefTag::NONE,
+        }
+    }
+
+    /// The `RefKind` this tag denotes (for decoding the slot's handle), or `None` for a non-ref.
+    pub(super) fn refkind(self) -> Option<RefKind> {
+        match self {
+            RefTag::FUNC => Some(RefKind::Func),
+            RefTag::EXTERN => Some(RefKind::Extern),
+            RefTag::ANY => Some(RefKind::Any),
+            RefTag::EXN => Some(RefKind::Exn),
+            _ => None,
+        }
+    }
+}
+
 impl Cell {
     fn lo<const N: usize>(self) -> [u8; N] {
         let mut out = [0u8; N];
@@ -199,16 +236,54 @@ pub(super) fn refkind_of_irheap(heap: &IrHeap) -> RefKind {
 
 impl Execution {
     pub(super) fn pop(&mut self) -> Cell {
+        self.shadow.pop();
         self.values.pop().expect("operand stack underflow")
     }
 
+    /// Pops a cell together with its root-shadow tag (for type-agnostic moves that must carry the
+    /// reference hierarchy: `select`, `br_on_null`/`br_on_non_null`).
+    pub(super) fn pop_tagged(&mut self) -> (Cell, RefTag) {
+        let tag = self.shadow.pop().expect("shadow underflow");
+        (self.values.pop().expect("operand stack underflow"), tag)
+    }
+
     pub(super) fn push(&mut self, v: Val) {
+        self.shadow.push(RefTag::of_val(&v));
         self.values.push(encode(v));
     }
 
-    /// Pushes an already-encoded cell (type-agnostic moves: `local.get`, `select`, `br_on_null`).
-    pub(super) fn push_cell(&mut self, cell: Cell) {
+    /// Pushes an already-encoded cell with its known shadow tag (type-agnostic moves:
+    /// `local.get`, `select`, `br_on_null`).
+    pub(super) fn push_cell(&mut self, cell: Cell, tag: RefTag) {
+        self.shadow.push(tag);
         self.values.push(cell);
+    }
+
+    /// The cell + shadow tag at operand index `i` (a `local.get` source).
+    pub(super) fn cell_at(&self, i: usize) -> (Cell, RefTag) {
+        (self.values[i], self.shadow[i])
+    }
+
+    /// Writes a cell + shadow tag at operand index `i` (a `local.set`/`local.tee` target).
+    pub(super) fn set_cell(&mut self, i: usize, cell: Cell, tag: RefTag) {
+        self.values[i] = cell;
+        self.shadow[i] = tag;
+    }
+
+    /// The top operand as an `i32` without popping (an `array.new*` count peek).
+    pub(super) fn top_i32(&self) -> i32 {
+        self.values
+            .last()
+            .expect("operand stack underflow")
+            .unwrap_i32()
+    }
+
+    /// The top cell + shadow tag without popping (a `local.tee` source).
+    pub(super) fn top_cell(&self) -> (Cell, RefTag) {
+        (
+            *self.values.last().expect("operand stack underflow"),
+            *self.shadow.last().expect("shadow underflow"),
+        )
     }
 
     pub(super) fn pop_i32(&mut self) -> i32 {
@@ -255,72 +330,29 @@ impl Execution {
     /// Splits off the top `tys.len()` operand cells and decodes them to `Val`s (host-call args).
     pub(super) fn pop_params(&mut self, tys: &[ValType]) -> Vec<Val> {
         let cells = self.values.split_off(self.values.len() - tys.len());
+        self.shadow.truncate(self.shadow.len() - tys.len());
         cells.iter().zip(tys).map(|(&c, t)| decode(c, t)).collect()
     }
 
     /// Encodes and pushes host-call results back onto the operand stack.
     pub(super) fn push_results(&mut self, results: Vec<Val>) {
+        self.shadow.extend(results.iter().map(RefTag::of_val));
         self.values.extend(results.into_iter().map(encode));
+    }
+
+    /// Iterates the live operand/local roots: each `(handle, RefKind)` for a non-null reference
+    /// slot, recovered from the root shadow. Drives the tracing collector's stack-root scan (#27g).
+    pub(super) fn operand_roots(&self) -> impl Iterator<Item = (u32, RefKind)> + '_ {
+        self.values
+            .iter()
+            .zip(&self.shadow)
+            .filter_map(|(cell, tag)| {
+                let kind = tag.refkind()?;
+                (!cell.is_null()).then(|| (cell.handle(), kind))
+            })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::func::Func;
-
-    #[test]
-    fn scalar_cells_round_trip() {
-        assert_eq!(decode(encode(Val::I32(-7)), &ValType::I32).unwrap_i32(), -7);
-        assert_eq!(
-            decode(encode(Val::I64(i64::MIN)), &ValType::I64).unwrap_i64(),
-            i64::MIN
-        );
-        let f32_bits = (-1.5f32).to_bits();
-        assert_eq!(
-            decode(encode(Val::F32(f32_bits)), &ValType::F32)
-                .unwrap_f32()
-                .to_bits(),
-            f32_bits
-        );
-        let f64_bits = 2.5f64.to_bits();
-        assert_eq!(
-            decode(encode(Val::F64(f64_bits)), &ValType::F64)
-                .unwrap_f64()
-                .to_bits(),
-            f64_bits
-        );
-    }
-
-    #[test]
-    fn ref_cells_encode_handle_and_null_sentinel() {
-        let nonnull = encode(Val::FuncRef(Some(Func::from_raw(5))));
-        assert!(!nonnull.is_null());
-        assert_eq!(nonnull.handle(), 5);
-        // Every null reference encodes to the reserved sentinel (not all-zero).
-        assert!(encode(Val::FuncRef(None)).is_null());
-        assert!(encode(Val::ExternRef(None)).is_null());
-        assert!(encode(Val::AnyRef(None)).is_null());
-        assert!(encode(Val::ExnRef(None)).is_null());
-    }
-
-    #[cfg(feature = "simd")]
-    #[test]
-    fn v128_cell_round_trips() {
-        let v = V128::from(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128);
-        assert_eq!(
-            decode(encode(Val::V128(v)), &ValType::V128).unwrap_v128(),
-            v
-        );
-    }
-
-    // Soundness of the 8-byte cell rests on validation never admitting a `v128` value type when
-    // the `simd` feature is off (ARCHITECTURE §7) — so no `v128` ever needs 16 bytes on the stack.
-    #[cfg(not(feature = "simd"))]
-    #[test]
-    fn v128_type_rejected_without_simd_feature() {
-        let engine = crate::Engine::default();
-        let bytes = wat::parse_str("(module (func (param v128)))").unwrap();
-        assert!(crate::Module::validate(&engine, &bytes).is_err());
-    }
-}
+#[path = "cell_tests.rs"]
+mod tests;
