@@ -90,7 +90,7 @@ fn gc_reservation_grows_past_abort_cap_with_limiter() {
     // abort-safety cap (which only applies when no limiter is present).
     let mut store = store_with(StoreLimitsBuilder::new().memory_size(usize::MAX).build());
     let target = crate::store::gc::ABORT_SAFETY_CAP + (1 << 20);
-    store.grow_gc_reservation(target).unwrap();
+    store.grow_gc_reservation(target, target as u64).unwrap();
     assert!(
         store.inner.gc.reserved() >= target,
         "limiter allowed growth past the abort cap"
@@ -102,6 +102,6 @@ fn gc_reservation_capped_at_abort_cap_without_limiter() {
     // No limiter: the abort-safety cap is the hard ceiling — growth up to it succeeds, past it traps.
     let cap = crate::store::gc::ABORT_SAFETY_CAP;
     let mut store = Store::new(&Engine::default(), ());
-    store.grow_gc_reservation(cap).unwrap();
-    assert!(store.grow_gc_reservation(cap + 1).is_err());
+    store.grow_gc_reservation(cap, cap as u64).unwrap();
+    assert!(store.grow_gc_reservation(cap + 1, 1).is_err());
 }

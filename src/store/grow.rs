@@ -6,7 +6,6 @@
 
 use super::{ResourceLimiter, ResourceLimiterInner, Store, PAGE_SIZE};
 use crate::extern_::{Memory, Table};
-use crate::trap::Trap;
 use crate::value::Ref;
 use crate::{Error, Result};
 
@@ -131,7 +130,7 @@ impl<T: 'static> Store<T> {
     /// `None`; the limiter is the sole growth bound. A denial traps (guest GC allocation has no
     /// soft-fail path). Updates the engine-wide committed-bytes counter that drives the GC-pressure
     /// axis. The reservation flow only calls this when `target` exceeds the current reservation.
-    pub(crate) fn grow_gc_reservation(&mut self, target: usize) -> Result<()> {
+    pub(crate) fn grow_gc_reservation(&mut self, target: usize, bytes_needed: u64) -> Result<()> {
         let current = self.inner.gc.reserved();
         if target <= current {
             return Ok(());
@@ -143,7 +142,9 @@ impl<T: 'static> Store<T> {
             None => target <= super::gc::ABORT_SAFETY_CAP,
         };
         if !allowed {
-            return Err(Trap::AllocationTooLarge.into());
+            // Matches wasmtime: a GC allocation the heap can't grow to satisfy is `GcHeapOutOfMemory`,
+            // not a generic `AllocationTooLarge` trap.
+            return Err(crate::gc::GcHeapOutOfMemory::new((), bytes_needed).into());
         }
         let granted = self.inner.gc.grant(target);
         self.inner.engine().add_gc_committed(granted);
@@ -183,7 +184,7 @@ impl<T: 'static> Store<T> {
             self.inner.engine().add_gc_committed(granted);
             return Ok(());
         }
-        self.grow_gc_reservation(target)
+        self.grow_gc_reservation(target, charge as u64)
     }
 
     /// Checks the limiter for a brand-new memory of `initial` pages (`Memory::new`).

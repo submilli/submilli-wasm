@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used)]
 
 use submilli_wasm::{
-    Collector, Config, Engine, FieldType, Func, FuncType, Instance, Module, Mutability, RootScope,
-    StorageType, Store, StoreLimitsBuilder, StructRef, StructRefPre, StructType, Trap, Val,
-    ValType,
+    Collector, Config, Engine, FieldType, Func, FuncType, GcHeapOutOfMemory, Instance, Module,
+    Mutability, RootScope, StorageType, Store, StoreLimitsBuilder, StructRef, StructRefPre,
+    StructType, Val, ValType,
 };
 
 fn engine_with(collector: Collector) -> Engine {
@@ -140,9 +140,9 @@ fn null_collector_traps_when_limiter_denies_gc_growth() {
 
     // The first `struct.new` needs a reservation larger than the 1 KiB the limiter allows → trap.
     let err = churn.call(&mut store, 10).unwrap_err();
-    assert_eq!(
-        *err.downcast_ref::<Trap>().unwrap(),
-        Trap::AllocationTooLarge
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "limiter-denied GC growth is GcHeapOutOfMemory, got: {err:#}"
     );
     assert_eq!(store.gc_heap_capacity(), 0, "nothing was allocated");
 }
@@ -170,9 +170,9 @@ fn gc_heap_reservation_is_free_budget_then_limiter_gated() {
 
     // Allocating past the 1 MiB reservation needs a limiter-gated grow, which is denied → trap.
     let err = churn.call(&mut store, 200_000).unwrap_err();
-    assert_eq!(
-        *err.downcast_ref::<Trap>().unwrap(),
-        Trap::AllocationTooLarge
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "limiter-denied GC growth is GcHeapOutOfMemory, got: {err:#}"
     );
 }
 
@@ -209,9 +209,9 @@ fn mark_sweep_frees_memory_under_limiter_pressure() {
     // Null collector, same cap: garbage accumulates past 1 MiB → the limiter denies the grow → trap.
     let (mut store, churn) = setup(Collector::Null);
     let err = churn.call(&mut store, count).unwrap_err();
-    assert_eq!(
-        *err.downcast_ref::<Trap>().unwrap(),
-        Trap::AllocationTooLarge
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "limiter-denied GC growth is GcHeapOutOfMemory, got: {err:#}"
     );
 }
 
@@ -333,7 +333,7 @@ fn host_allocation_collects_then_grows_within_one_call() {
     let cap = 1 << 20; // 1 MiB — vs ~7.6 MB of bodies the host churns below
     let count = 100_000;
 
-    let run = |collector| -> Result<usize, Trap> {
+    let run = |collector| -> submilli_wasm::Result<usize> {
         let mut cfg = Config::new();
         cfg.collector(collector).gc_heap_reservation(0);
         let engine = Engine::new(&cfg).unwrap();
@@ -366,8 +366,7 @@ fn host_allocation_collects_then_grows_within_one_call() {
         let inst = Instance::new(&mut store, &module, &[churn.into()]).unwrap();
         inst.get_typed_func::<(), ()>(&mut store, "run")
             .unwrap()
-            .call(&mut store, ())
-            .map_err(|e| *e.downcast_ref::<Trap>().unwrap())?;
+            .call(&mut store, ())?;
         Ok(store.gc_heap_capacity())
     };
 
@@ -378,5 +377,9 @@ fn host_allocation_collects_then_grows_within_one_call() {
     assert!(held < cap, "host garbage stayed bounded: {held} bytes");
 
     // Null collector, same cap: garbage accumulates (no reclamation) until the limiter denies → trap.
-    assert_eq!(run(Collector::Null), Err(Trap::AllocationTooLarge));
+    let err = run(Collector::Null).unwrap_err();
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "limiter-denied GC growth is GcHeapOutOfMemory, got: {err:#}"
+    );
 }

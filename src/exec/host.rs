@@ -133,7 +133,10 @@ fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Resu
             Outcome::TableGrow { table, delta, init } => {
                 exec.do_grow_table(store, table, delta, init)?;
             }
-            Outcome::GcGrow { reserved_target } => store.grow_gc_reservation(reserved_target)?,
+            Outcome::GcGrow {
+                reserved_target,
+                bytes_needed,
+            } => store.grow_gc_reservation(reserved_target, bytes_needed)?,
         }
     }
 }
@@ -179,7 +182,10 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
             }
             // GC reservation growth uses the sync limiter path (errors if an async limiter is
             // installed — combining an async limiter with the GC heap is unsupported for now).
-            Outcome::GcGrow { reserved_target } => store.grow_gc_reservation(reserved_target)?,
+            Outcome::GcGrow {
+                reserved_target,
+                bytes_needed,
+            } => store.grow_gc_reservation(reserved_target, bytes_needed)?,
         }
     }
 }

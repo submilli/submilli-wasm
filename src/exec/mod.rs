@@ -357,10 +357,14 @@ impl Execution {
                 }
                 Ok(StepOutcome::DoGcGrow {
                     reserved_target,
+                    bytes_needed,
                     return_ip,
                 }) => {
                     self.frames.last_mut().expect("caller frame").ip = return_ip;
-                    return Ok(Outcome::GcGrow { reserved_target });
+                    return Ok(Outcome::GcGrow {
+                        reserved_target,
+                        bytes_needed,
+                    });
                 }
             }
         }

@@ -61,6 +61,7 @@ impl Execution {
         }
         Some(StepOutcome::DoGcGrow {
             reserved_target,
+            bytes_needed: charge as u64,
             return_ip: ip,
         })
     }
