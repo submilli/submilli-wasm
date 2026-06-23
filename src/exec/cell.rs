@@ -27,7 +27,7 @@ pub(super) const SLOT_BYTES: usize = 8;
 
 /// One operand-stack slot: raw bytes, type known from validation (not stored). `Copy` so the
 /// `copy_within` branch/return fixups and local moves are plain byte copies.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub(super) struct Cell([u8; SLOT_BYTES]);
 
 /// The reference-hierarchy tag stored in the operand-stack root shadow (one per slot, `Copy` so it
@@ -342,7 +342,7 @@ impl Execution {
 
     /// Iterates the live operand/local roots: each `(handle, RefKind)` for a non-null reference
     /// slot, recovered from the root shadow. Drives the tracing collector's stack-root scan (#27g).
-    pub(super) fn operand_roots(&self) -> impl Iterator<Item = (u32, RefKind)> + '_ {
+    pub(crate) fn operand_roots(&self) -> impl Iterator<Item = (u32, RefKind)> + '_ {
         self.values
             .iter()
             .zip(&self.shadow)

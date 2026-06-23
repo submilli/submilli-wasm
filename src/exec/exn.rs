@@ -103,6 +103,7 @@ impl Execution {
         inner: &mut StoreInner,
         err: Error,
         mut fault_ip: u32,
+        stop_depth: usize,
     ) -> Result<()> {
         let exn = match err.downcast_ref::<PendingException>() {
             Some(p) => p.exn,
@@ -131,10 +132,17 @@ impl Execution {
             self.values.truncate(base as usize);
             self.shadow.truncate(base as usize);
             self.frames.pop();
-            match self.frames.last() {
-                Some(f) => fault_ip = f.ip.saturating_sub(1),
-                None => return Err(err),
+            // Stop at this call's boundary: an exception uncaught within these frames does not cross
+            // the delimiter into a parked outer call (it surfaces to that call's `Func::call`).
+            if self.frames.len() == stop_depth {
+                return Err(err);
             }
+            fault_ip = self
+                .frames
+                .last()
+                .expect("frame above the delimiter")
+                .ip
+                .saturating_sub(1);
         }
     }
 
@@ -145,6 +153,7 @@ impl Execution {
         &mut self,
         inner: &mut StoreInner,
         exn: Rooted<ExnRef>,
+        stop_depth: usize,
     ) -> Result<()> {
         let fault_ip = self
             .frames
@@ -158,7 +167,7 @@ impl Execution {
             let bt = self.capture_backtrace(inner, fault_ip);
             inner.exn_mut(exn).backtrace = Some(bt);
         }
-        self.unwind(inner, PendingException { exn }.into(), fault_ip)
+        self.unwind(inner, PendingException { exn }.into(), fault_ip, stop_depth)
     }
 }
 

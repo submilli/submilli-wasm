@@ -16,8 +16,7 @@ use super::arena::Arena;
 use super::entity::ExternRefs;
 use super::gc::GcHeap;
 use super::{
-    ExnEntity, FuncEntity, GlobalEntity, HostFrame, InstanceEntity, MemoryEntity, TableEntity,
-    TagEntity,
+    ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
 };
 
 /// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
@@ -70,8 +69,11 @@ pub(crate) struct StoreInner {
     epoch_deadline: u64,
     /// Exception surfaced from the last call / a host `throw`; taken via `take_pending_exception`.
     pub(super) pending_exception: Option<Rooted<ExnRef>>,
-    /// Live wasm frames during a host call, for `WasmBacktrace::capture` (#29d).
-    host_frames: Vec<HostFrame>,
+    /// The shared interpreter execution, parked here for the duration of a host call so a host fn
+    /// that re-enters wasm (`Func::call`) runs on the *same* operand/frame stacks (separated by a
+    /// [`Delimiter`](crate::exec::Delimiter)). `Some` exactly while a host callback is running; the
+    /// driver takes it out before each `run` and parks it back before invoking the callback.
+    exec_slot: Option<crate::exec::Execution>,
     /// This store's GC-request mailbox (the engine holds a `Weak`). The engine posts to it under
     /// engine-wide GC pressure; the run loop reads-and-clears it at a back-edge and self-collects.
     gc_request: Arc<AtomicBool>,
@@ -99,7 +101,7 @@ impl StoreInner {
             fuel_yield_interval: None,
             epoch_deadline: u64::MAX,
             pending_exception: None,
-            host_frames: Vec::new(),
+            exec_slot: None,
             gc_request,
         }
     }
@@ -119,14 +121,30 @@ impl StoreInner {
         self.pending_exception.take()
     }
 
-    pub(crate) fn host_frames(&self) -> &[HostFrame] {
-        &self.host_frames
+    /// Takes the parked shared execution out of its slot (the driver owns it while `run`ning).
+    pub(crate) fn take_exec(&mut self) -> Option<crate::exec::Execution> {
+        self.exec_slot.take()
     }
 
-    /// Swaps in a host-call frame snapshot, returning the previous one to restore (re-entrant
-    /// host→wasm→host must not clobber the outer frame's snapshot).
-    pub(crate) fn swap_host_frames(&mut self, frames: Vec<HostFrame>) -> Vec<HostFrame> {
-        std::mem::replace(&mut self.host_frames, frames)
+    /// Parks the shared execution back in its slot for the duration of a host call.
+    pub(crate) fn park_exec(&mut self, exec: crate::exec::Execution) {
+        debug_assert!(self.exec_slot.is_none(), "exec slot already occupied");
+        self.exec_slot = Some(exec);
+    }
+
+    /// The parked execution, if a host call is in progress — its frames back `WasmBacktrace::capture`.
+    pub(crate) fn parked_exec(&self) -> Option<&crate::exec::Execution> {
+        self.exec_slot.as_ref()
+    }
+
+    /// The operand/local GC roots of the parked execution (empty when none is parked). Seeds a
+    /// collection triggered from a host call (`gc_reserve_host`/`Store::gc`), where the guest's
+    /// operands live on the parked execution rather than a running one.
+    pub(crate) fn exec_roots(&self) -> Vec<(u32, crate::canon::RefKind)> {
+        self.exec_slot
+            .as_ref()
+            .map(|e| e.operand_roots().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn engine(&self) -> &Engine {

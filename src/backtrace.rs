@@ -11,14 +11,24 @@ use crate::store::AsContext;
 #[derive(Clone, Debug)]
 pub struct WasmBacktrace {
     frames: Vec<FrameInfo>,
+    /// Indices into `frames` where a host↔wasm re-entry boundary sits (a host fn re-entered wasm
+    /// via `Func::call`): a boundary precedes `frames[i]`. Presentational — `frames()` stays pure
+    /// wasm (wasmtime-compatible); `Display` renders a `<host>` line at each.
+    host_boundaries: Vec<usize>,
 }
 
 impl std::fmt::Display for WasmBacktrace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "wasm backtrace:")?;
         for (i, frame) in self.frames.iter().enumerate() {
+            if self.host_boundaries.contains(&i) {
+                writeln!(f, "  <host>")?;
+            }
             let name = frame.func_name().unwrap_or("<unknown>");
             writeln!(f, "  {i}: func[{}] {name}", frame.func_index())?;
+        }
+        if self.host_boundaries.contains(&self.frames.len()) {
+            writeln!(f, "  <host>")?;
         }
         Ok(())
     }
@@ -37,12 +47,12 @@ impl WasmBacktrace {
         if !ctx.engine().wasm_backtrace_enabled() {
             return WasmBacktrace::from_frames(Vec::new());
         }
-        crate::exec::trace::from_host_frames(ctx.inner())
+        crate::exec::trace::from_parked(ctx.inner())
     }
 
     /// Like [`capture`](Self::capture) but ignores `Config::wasm_backtrace`.
     pub fn force_capture(store: impl AsContext) -> WasmBacktrace {
-        crate::exec::trace::from_host_frames(store.as_context().inner())
+        crate::exec::trace::from_parked(store.as_context().inner())
     }
 
     /// The captured frames, most-recent first.
@@ -52,7 +62,21 @@ impl WasmBacktrace {
 
     /// Builds a backtrace from already-collected frames (used by capture, #29d).
     pub(crate) fn from_frames(frames: Vec<FrameInfo>) -> WasmBacktrace {
-        WasmBacktrace { frames }
+        WasmBacktrace {
+            frames,
+            host_boundaries: Vec::new(),
+        }
+    }
+
+    /// Builds a backtrace plus the host-re-entry boundary positions (for `Display` markers).
+    pub(crate) fn from_frames_with_boundaries(
+        frames: Vec<FrameInfo>,
+        host_boundaries: Vec<usize>,
+    ) -> WasmBacktrace {
+        WasmBacktrace {
+            frames,
+            host_boundaries,
+        }
     }
 }
 

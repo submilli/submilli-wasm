@@ -13,8 +13,8 @@ mod limits;
 
 pub use context::{AsContext, AsContextMut, StoreContext, StoreContextMut};
 pub(crate) use entity::{
-    ExnEntity, FuncEntity, GlobalEntity, HostFrame, InstanceEntity, MemoryEntity, TableEntity,
-    TagEntity, PAGE_SIZE,
+    ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
+    PAGE_SIZE,
 };
 pub(crate) use gc::{
     anyref_handle_i31, anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle,
@@ -141,10 +141,12 @@ impl<T: 'static> Store<T> {
     }
 
     /// Forces a garbage collection now (mirrors `wasmtime::Store::gc`). A no-op under
-    /// `Collector::Null`. Called outside execution, so the roots are the store's entities plus
-    /// host-held `Rooted`s — there is no live operand stack to scan.
+    /// `Collector::Null`. The roots are the store's entities plus host-held `Rooted`s; when called
+    /// from inside a host function, the parked execution's operands are seeded too
+    /// (`exec_roots`), so a guest reference on the stack survives an embedder-forced collection.
     pub fn gc(&mut self) {
-        self.inner.gc_collect(&[]);
+        let roots = self.inner.exec_roots();
+        self.inner.gc_collect(&roots);
     }
 
     /// Throws `exception` from a host function so the guest's `try_table` can catch it (#28g).

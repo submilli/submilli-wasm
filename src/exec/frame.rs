@@ -19,4 +19,17 @@ pub(crate) struct Frame {
     /// This function's index in its defining module — for backtraces (#29e), avoiding a
     /// pointer-scan over `module.functions` at capture time.
     pub func_index: u32,
+    /// A boundary marker, not an executable frame: it separates one (sub-)call's frames from the
+    /// parked outer call's on the single shared operand/frame stack. The run loop never executes
+    /// one (`stop_depth` stops the call above it); its `code`/`instance` are inert filler.
+    pub delimiter: Option<Delimiter>,
+}
+
+/// What a delimiter frame marks. `HostReentry` is a host→wasm re-entry (`Func::call` from a host
+/// function) — rendered as a host-boundary marker in backtraces; `TopLevel` is the embedder→wasm
+/// entry at the bottom of the stack, which carries no backtrace marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delimiter {
+    TopLevel,
+    HostReentry,
 }

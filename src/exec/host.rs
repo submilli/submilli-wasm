@@ -5,15 +5,18 @@
 
 use std::sync::Arc;
 
+use super::epoch::apply_epoch_deadline;
+#[cfg(feature = "async")]
+use super::epoch::{apply_epoch_deadline_async, yield_now};
 use super::exn::surface_exception;
+use super::frame::Delimiter;
 use super::{cell, Execution, Outcome};
 use crate::exception::ThrownException;
 use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
 use crate::instance::Instance;
 use crate::module::op::CompiledFunc;
-use crate::store::{FuncEntity, Store, UpdateDeadline};
-use crate::trap::Trap;
+use crate::store::{FuncEntity, Store};
 use crate::value::{Ref, Val, ValType};
 use crate::Result;
 
@@ -27,6 +30,69 @@ fn decode_results(result_tys: &[ValType], cells: Vec<cell::Cell>) -> Vec<Val> {
         .collect()
 }
 
+/// The boundary state of one (top-level or re-entrant) call on the shared execution: where its
+/// operands begin (`value_base`), the parked outer frame depth (`stop_depth`), and the depth `run`
+/// stops at (`run_stop`, one above the delimiter).
+struct Boundary {
+    value_base: usize,
+    stop_depth: usize,
+    run_stop: usize,
+}
+
+/// Takes the shared execution (fresh if none is parked), pushes this call's boundary + args + entry
+/// frame, and returns the execution alongside its [`Boundary`]. The delimiter is a host re-entry
+/// when outer frames are already parked, else the top-level entry.
+fn enter<T>(
+    store: &mut Store<T>,
+    instance: Instance,
+    func_index: u32,
+    code: Arc<CompiledFunc>,
+    args: Vec<Val>,
+) -> (Execution, Boundary) {
+    let mut exec = store.inner.take_exec().unwrap_or_default();
+    let value_base = exec.values.len();
+    let stop_depth = exec.frames.len();
+    let delim = if stop_depth == 0 {
+        Delimiter::TopLevel
+    } else {
+        Delimiter::HostReentry
+    };
+    exec.enter_call(delim, instance, func_index, code, args);
+    let b = Boundary {
+        value_base,
+        stop_depth,
+        run_stop: stop_depth + 1,
+    };
+    (exec, b)
+}
+
+/// Closes out a (sub-)call: extracts results (or restores the stacks on error), re-parks the shared
+/// execution for the outer call to resume (top-level drops it), and surfaces any error.
+fn finish<T>(
+    store: &mut Store<T>,
+    mut exec: Execution,
+    b: &Boundary,
+    result_tys: &[ValType],
+    outcome: Result<()>,
+) -> Result<Vec<Val>> {
+    let result = match outcome {
+        Ok(()) => Ok(decode_results(
+            result_tys,
+            exec.take_results(b.value_base, b.stop_depth),
+        )),
+        Err(e) => {
+            exec.discard_to(b.value_base, b.stop_depth);
+            Err(surface_exception(&mut store.inner, e))
+        }
+    };
+    // A top-level call (no parked outer frames) drops the execution; a re-entry re-parks it so the
+    // outer driver resumes on the same — now restored — stacks.
+    if b.stop_depth != 0 {
+        store.inner.park_exec(exec);
+    }
+    result
+}
+
 /// Runs `code` (of `instance`) with `args`, servicing host calls, and returns the
 /// results. The wasm core runs on `&mut store.inner`; only host calls touch `T`.
 pub(crate) fn execute<T>(
@@ -37,23 +103,20 @@ pub(crate) fn execute<T>(
     args: Vec<Val>,
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
-    let mut exec = Execution {
-        shadow: args.iter().map(cell::RefTag::of_val).collect(),
-        values: args.into_iter().map(cell::encode).collect(),
-        frames: Vec::new(),
-    };
-    exec.push_call(instance, func_index, code);
+    let (mut exec, b) = enter(store, instance, func_index, code, args);
+    let outcome = drive(&mut exec, store, b.run_stop);
+    finish(store, exec, &b, result_tys, outcome)
+}
+
+/// Drives the resumable core to completion (sync), servicing host calls and grow suspensions.
+/// Returns `Ok(())` when the call finishes (results left on `exec` above its `value_base`); any
+/// error propagates raw, to be surfaced + cleaned up by [`finish`].
+fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Result<()> {
     loop {
-        let outcome = match exec.run(&mut store.inner) {
-            Ok(o) => o,
-            Err(e) => return Err(surface_exception(&mut store.inner, e)),
-        };
-        match outcome {
-            Outcome::Finished => return Ok(decode_results(result_tys, exec.values)),
+        match exec.run(&mut store.inner, run_stop)? {
+            Outcome::Finished => return Ok(()),
             Outcome::HostCall { func, instance } => {
-                if let Err(e) = exec.invoke_host(store, func, instance) {
-                    return Err(surface_exception(&mut store.inner, e));
-                }
+                exec.invoke_host(store, func, instance, run_stop)?;
             }
             #[cfg(feature = "async")]
             Outcome::HostAsync { .. } => {
@@ -76,8 +139,8 @@ pub(crate) fn execute<T>(
 }
 
 /// Async sibling of [`execute`]: drives the same resumable core to completion as a
-/// `Future`, so the call can be parked under an executor. Mirrors `execute`'s loop and
-/// reuses the same (sync) servicing helpers; async host calls are awaited here.
+/// `Future`, so the call can be parked under an executor. Mirrors `execute` but awaits
+/// async host calls and yields.
 #[cfg(feature = "async")]
 pub(crate) async fn execute_async<T>(
     store: &mut Store<T>,
@@ -87,28 +150,23 @@ pub(crate) async fn execute_async<T>(
     args: Vec<Val>,
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
-    let mut exec = Execution {
-        shadow: args.iter().map(cell::RefTag::of_val).collect(),
-        values: args.into_iter().map(cell::encode).collect(),
-        frames: Vec::new(),
-    };
-    exec.push_call(instance, func_index, code);
+    let (mut exec, b) = enter(store, instance, func_index, code, args);
+    let outcome = drive_async(&mut exec, store, b.run_stop).await;
+    finish(store, exec, &b, result_tys, outcome)
+}
+
+/// Async sibling of [`drive`].
+#[cfg(feature = "async")]
+async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Result<()> {
     loop {
-        let outcome = match exec.run(&mut store.inner) {
-            Ok(o) => o,
-            Err(e) => return Err(surface_exception(&mut store.inner, e)),
-        };
-        match outcome {
-            Outcome::Finished => return Ok(decode_results(result_tys, exec.values)),
+        match exec.run(&mut store.inner, run_stop)? {
+            Outcome::Finished => return Ok(()),
             Outcome::HostCall { func, instance } => {
-                if let Err(e) = exec.invoke_host(store, func, instance) {
-                    return Err(surface_exception(&mut store.inner, e));
-                }
+                exec.invoke_host(store, func, instance, run_stop)?;
             }
             Outcome::HostAsync { func, instance } => {
-                if let Err(e) = exec.invoke_host_async(store, func, instance).await {
-                    return Err(surface_exception(&mut store.inner, e));
-                }
+                exec.invoke_host_async(store, func, instance, run_stop)
+                    .await?;
             }
             Outcome::FuelYield => {
                 yield_now().await;
@@ -126,80 +184,6 @@ pub(crate) async fn execute_async<T>(
     }
 }
 
-/// A one-shot yield to the async executor: returns `Pending` once (waking immediately),
-/// then `Ready`, giving the executor a chance to poll other tasks.
-#[cfg(feature = "async")]
-async fn yield_now() {
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct YieldNow(bool);
-    impl Future for YieldNow {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 {
-                Poll::Ready(())
-            } else {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-    YieldNow(false).await;
-}
-
-/// Invokes the store's epoch-deadline callback (defaulting to `Interrupt`), leaving it
-/// reinstalled. The returned `UpdateDeadline` is acted on by the (sync/async) caller.
-fn take_epoch_action<T>(store: &mut Store<T>) -> Result<UpdateDeadline> {
-    let mut cb = store.epoch_callback.take();
-    let action = match cb.as_mut() {
-        Some(f) => f(store.as_context_mut()),
-        None => Ok(UpdateDeadline::Interrupt),
-    };
-    store.epoch_callback = cb;
-    action
-}
-
-/// Extends the epoch deadline by `delta` ticks beyond the current epoch.
-fn extend_epoch_deadline<T>(store: &mut Store<T>, delta: u64) {
-    let next = store.inner.engine().current_epoch().saturating_add(delta);
-    store.inner.set_epoch_deadline(next);
-}
-
-/// Applies the store's epoch-deadline policy in a *sync* context: trap, or
-/// extend-and-continue. `Yield` requires async, so it traps here.
-fn apply_epoch_deadline<T>(store: &mut Store<T>) -> Result<()> {
-    match take_epoch_action(store)? {
-        UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
-        UpdateDeadline::Continue(delta) => {
-            extend_epoch_deadline(store, delta);
-            Ok(())
-        }
-        #[cfg(feature = "async")]
-        UpdateDeadline::Yield(_) => Err(Trap::Interrupt.into()),
-    }
-}
-
-/// Async epoch-deadline policy: like [`apply_epoch_deadline`] but `Yield(delta)` yields
-/// to the executor and then extends the deadline (rather than trapping).
-#[cfg(feature = "async")]
-async fn apply_epoch_deadline_async<T>(store: &mut Store<T>) -> Result<()> {
-    match take_epoch_action(store)? {
-        UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
-        UpdateDeadline::Continue(delta) => {
-            extend_epoch_deadline(store, delta);
-            Ok(())
-        }
-        UpdateDeadline::Yield(delta) => {
-            yield_now().await;
-            extend_epoch_deadline(store, delta);
-            Ok(())
-        }
-    }
-}
-
 impl Execution {
     /// Invokes a suspended host function: pops its args off the operand stack,
     /// runs the closure with a `Caller`, and pushes the results back. A host `Err`
@@ -209,6 +193,7 @@ impl Execution {
         store: &mut Store<T>,
         func: Func,
         instance: Instance,
+        stop_depth: usize,
     ) -> Result<()> {
         let (param_tys, mut results, host_index) = match store.inner.func(func) {
             FuncEntity::Host { ty, host_index } => (
@@ -230,28 +215,25 @@ impl Execution {
         // pin every one, defeating collection. Returned values survive via `push_results` (operand
         // roots); anything the host stored into a global/table/pending-exception is rooted there.
         let roots_mark = store.inner.gc_roots_mark();
-        // Park the live operands (including this call's params, still on the stack) as roots for the
-        // call's duration, so host GC allocation (`gc_reserve_host`) can safely collect: the guest's
-        // operands are otherwise unreachable from `Store<T>` (they live in this `Execution`, parked
-        // in the driver loop). Truncated below with the host roots; on return the operands are live
-        // on the stack again (and the results become operand-rooted via `push_results`).
-        for (handle, kind) in self.operand_roots() {
-            store.inner.push_gc_root(handle, kind);
-        }
         let params = self.pop_params(&param_tys);
         let cb = store.host_funcs[host_index as usize].clone();
-        // Expose the live wasm frames to `WasmBacktrace::capture(caller)` for the host call's
-        // duration; restore the previous snapshot after (so re-entrant calls don't clobber it).
-        let prev = store.inner.swap_host_frames(self.host_frame_snapshot());
+        // Park the shared execution so a host fn that re-enters wasm (`Func::call`) runs on these
+        // same stacks; reclaim it after the call (a re-entrant call re-parks it on its way out). The
+        // guest's live operands stay reachable for GC while parked — the collector seeds from the
+        // slot (`StoreInner::exec_roots`) on a host-triggered collection.
+        store.inner.park_exec(std::mem::take(self));
         let result = cb(
             Caller::new(store.as_context_mut(), Some(instance)),
             &params,
             &mut results,
         );
-        store.inner.swap_host_frames(prev);
+        *self = store
+            .inner
+            .take_exec()
+            .expect("re-entrant call must re-park the shared execution");
         if let Err(e) = result {
             store.inner.gc_roots_truncate(roots_mark);
-            return self.host_call_error(&mut store.inner, e);
+            return self.host_call_error(&mut store.inner, e, stop_depth);
         }
         // The host returned normally, so it did not throw. Drop any exception it set via
         // `Store::throw` but swallowed instead of propagating (host misuse) — the pending slot is
@@ -272,10 +254,11 @@ impl Execution {
         &mut self,
         inner: &mut crate::store::StoreInner,
         e: crate::Error,
+        stop_depth: usize,
     ) -> Result<()> {
         if e.is::<ThrownException>() {
             if let Some(exn) = inner.take_pending_exception() {
-                return self.raise_host_exception(inner, exn);
+                return self.raise_host_exception(inner, exn, stop_depth);
             }
         }
         Err(e)
@@ -290,6 +273,7 @@ impl Execution {
         store: &mut Store<T>,
         func: Func,
         instance: Instance,
+        stop_depth: usize,
     ) -> Result<()> {
         let (param_tys, mut results, host_index) = match store.inner.func(func) {
             FuncEntity::HostAsync { ty, host_index } => (
@@ -301,23 +285,24 @@ impl Execution {
             ),
             _ => unreachable!("HostAsync only suspends on async host funcs"),
         };
-        // Scope the host roots and park the live operands/params as roots (see `invoke_host`).
+        // Scope the host-created GC roots for the call's duration (see `invoke_host`).
         let roots_mark = store.inner.gc_roots_mark();
-        for (handle, kind) in self.operand_roots() {
-            store.inner.push_gc_root(handle, kind);
-        }
         let params = self.pop_params(&param_tys);
         let cb = store.async_host_funcs[host_index as usize].clone();
-        let prev = store.inner.swap_host_frames(self.host_frame_snapshot());
+        // Park the shared execution across the await (see `invoke_host`).
+        store.inner.park_exec(std::mem::take(self));
         let outcome = {
             let caller = Caller::new(store.as_context_mut(), Some(instance));
             let fut = cb(caller, &params, &mut results);
             std::boxed::Box::into_pin(fut).await
         };
-        store.inner.swap_host_frames(prev);
+        *self = store
+            .inner
+            .take_exec()
+            .expect("re-entrant call must re-park the shared execution");
         if let Err(e) = outcome {
             store.inner.gc_roots_truncate(roots_mark);
-            return self.host_call_error(&mut store.inner, e);
+            return self.host_call_error(&mut store.inner, e, stop_depth);
         }
         // See `invoke_host`: a host that returned normally leaves no pending exception.
         store.inner.take_pending_exception();

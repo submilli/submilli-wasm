@@ -9,6 +9,7 @@ mod cast;
 mod cell;
 mod collect;
 mod convert;
+mod epoch;
 mod exn;
 mod frame;
 mod gc;
@@ -33,7 +34,7 @@ use crate::trap::Trap;
 use crate::value::Val;
 use crate::Result;
 
-use self::frame::Frame;
+use self::frame::{Delimiter, Frame};
 pub(crate) use outcome::Outcome;
 use outcome::{CallReq, ResolvedCall, StepOutcome};
 
@@ -41,7 +42,8 @@ use outcome::{CallReq, ResolvedCall, StepOutcome};
 /// operand/frame stacks and holds no borrow into the `Store` across an [`Outcome`]
 /// suspend, so it can be *parked* between resumptions — the basis for async,
 /// where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
-struct Execution {
+#[derive(Debug)]
+pub(crate) struct Execution {
     values: Vec<cell::Cell>,
     /// Per-operand-slot reference tag ([`cell::RefTag`]), parallel to `values` (same length, moved
     /// in lockstep). The cell stack is untyped, so this byte-shadow is how a tracing collector
@@ -58,7 +60,53 @@ const _: fn() = || {
     assert_send::<Execution>();
 };
 
+/// An empty execution — the starting state for a top-level call, and the placeholder left behind
+/// (via `mem::take`) while the real execution is parked in the store across a host call.
+impl Default for Execution {
+    fn default() -> Self {
+        Execution {
+            values: Vec::new(),
+            shadow: Vec::new(),
+            frames: Vec::new(),
+        }
+    }
+}
+
 impl Execution {
+    /// Enters a (sub-)call on the shared stacks: a [`Delimiter`] boundary, the call's `args`, then
+    /// the entry frame. The boundary sits at the current frame depth; the entered call runs with a
+    /// `stop_depth` one above it (so the parked outer frames stay untouched).
+    fn enter_call(
+        &mut self,
+        delim: Delimiter,
+        instance: Instance,
+        func_index: u32,
+        code: Arc<CompiledFunc>,
+        args: Vec<Val>,
+    ) {
+        self.push_delimiter(delim, instance, code.clone());
+        self.shadow.extend(args.iter().map(cell::RefTag::of_val));
+        self.values.extend(args.into_iter().map(cell::encode));
+        self.push_call(instance, func_index, code);
+    }
+
+    /// On a finished (sub-)call: splits off its result cells (everything above `value_base`) and
+    /// restores the shared stacks to the parked outer state (frames back to `stop_depth`).
+    fn take_results(&mut self, value_base: usize, stop_depth: usize) -> Vec<cell::Cell> {
+        let results = self.values.split_off(value_base);
+        self.shadow.truncate(value_base);
+        self.frames.truncate(stop_depth);
+        results
+    }
+
+    /// On a trap / uncaught exception in a (sub-)call: discards its frames and operands, restoring
+    /// the shared stacks to the parked outer state so that call resumes pristine.
+    fn discard_to(&mut self, value_base: usize, stop_depth: usize) {
+        self.values.truncate(value_base);
+        self.shadow.truncate(value_base);
+        self.frames.truncate(stop_depth);
+    }
+
     /// Estimated byte footprint of the wasm execution stacks, checked against
     /// `Config::max_wasm_stack` at each call to bound runaway recursion. An operand slot is now a
     /// fixed-width untyped [`cell::Cell`] (8 or 16 bytes; see `cell`), not the ~32-byte `Val`.
@@ -79,6 +127,22 @@ impl Execution {
             locals_base,
             instance,
             func_index,
+            delimiter: None,
+        });
+    }
+
+    /// Pushes a [`Delimiter`] boundary marker (no operands, inert `code`/`instance` filler). The
+    /// next `push_call` lays the entered function's frame directly above it; `run`/`unwind` stop at
+    /// this frame's depth so the call below it stays parked and untouched.
+    fn push_delimiter(&mut self, kind: Delimiter, instance: Instance, code: Arc<CompiledFunc>) {
+        let locals_base = self.values.len() as u32;
+        self.frames.push(Frame {
+            code,
+            ip: 0,
+            locals_base,
+            instance,
+            func_index: 0,
+            delimiter: Some(kind),
         });
     }
 
@@ -101,8 +165,9 @@ impl Execution {
     }
 
     /// Pops the current frame, moving its top `n_results` operands down to the
-    /// frame base. Returns true if no frames remain (execution finished).
-    fn do_return(&mut self, n_results: u32) -> bool {
+    /// frame base. Returns true if the frame stack has fallen back to `stop_depth`
+    /// (this call's boundary) — i.e. the call this `run` was driving has finished.
+    fn do_return(&mut self, n_results: u32, stop_depth: usize) -> bool {
         let frame = self.frames.pop().expect("frame stack underflow");
         let n = n_results as usize;
         let len = self.values.len();
@@ -111,14 +176,16 @@ impl Execution {
         self.values.truncate(dst + n);
         self.shadow.copy_within(len - n..len, dst);
         self.shadow.truncate(dst + n);
-        self.frames.is_empty()
+        self.frames.len() == stop_depth
     }
 
+    /// Runs frames until the stack falls back to `stop_depth` (the boundary this `run` is
+    /// responsible for): `0` for a top-level call, or the parked outer depth for a host re-entry.
     #[allow(clippy::too_many_lines)] // the resumable dispatch loop; arms are short
-    fn run(&mut self, inner: &mut StoreInner) -> Result<Outcome> {
-        // A `return_call` to a host fn from the outermost frame pops the only frame, then the host
-        // pushes its results; re-entering here with no frames means the call finished (#39).
-        if self.frames.is_empty() {
+    fn run(&mut self, inner: &mut StoreInner, stop_depth: usize) -> Result<Outcome> {
+        // A `return_call` to a host fn from the boundary frame pops it, then the host pushes its
+        // results; re-entering here at `stop_depth` means the call finished (#39).
+        if self.frames.len() == stop_depth {
             return Ok(Outcome::Finished);
         }
         let stack_limit = inner.engine().max_wasm_stack();
@@ -130,7 +197,7 @@ impl Execution {
         let (mut code, mut ip, mut base, mut instance) = self.top();
         loop {
             if ip as usize >= code.ops.len() {
-                if self.do_return(code.n_results) {
+                if self.do_return(code.n_results, stop_depth) {
                     return Ok(Outcome::Finished);
                 }
                 (code, ip, base, instance) = self.top();
@@ -166,7 +233,7 @@ impl Execution {
                 self.gc_collect_now(inner);
             }
             match self.step(inner, &code, ip, base, instance) {
-                Err(e) => match self.unwind(inner, e, ip) {
+                Err(e) => match self.unwind(inner, e, ip, stop_depth) {
                     Ok(()) => (code, ip, base, instance) = self.top(),
                     Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
                 },
@@ -189,7 +256,7 @@ impl Execution {
                 // Tail call (#39): replace the current frame — `do_return(n_params)` repositions the
                 // args to the frame's base and pops it, then `push_call` lays the callee there.
                 Ok(StepOutcome::DoTailCall(req)) => {
-                    self.do_return(req.code.n_params);
+                    self.do_return(req.code.n_params, stop_depth);
                     self.push_call(req.instance, req.func_index, req.code.clone());
                     code = req.code;
                     ip = 0;
@@ -203,7 +270,7 @@ impl Execution {
                     instance,
                     n_params,
                 }) => {
-                    self.do_return(n_params);
+                    self.do_return(n_params, stop_depth);
                     return Ok(Outcome::HostCall { func, instance });
                 }
                 #[cfg(feature = "async")]
@@ -212,7 +279,7 @@ impl Execution {
                     instance,
                     n_params,
                 }) => {
-                    self.do_return(n_params);
+                    self.do_return(n_params, stop_depth);
                     return Ok(Outcome::HostAsync { func, instance });
                 }
                 Ok(StepOutcome::DoHostCall {

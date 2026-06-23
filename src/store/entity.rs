@@ -6,24 +6,12 @@
 //! reads/writes these through `StoreInner`.
 
 use core::any::Any;
-use std::sync::Arc;
 
 use crate::extern_::{Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
-use crate::module::op::CompiledFunc;
 use crate::module::Module;
 use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, TagType, Val};
-
-/// One entry of the host-call frame snapshot (`StoreInner::host_frames`): enough to rebuild a
-/// `FrameInfo` on demand for `WasmBacktrace::capture` from inside a host fn (#29d).
-#[derive(Debug)]
-pub(crate) struct HostFrame {
-    pub instance: Instance,
-    pub func_index: u32,
-    pub code: Arc<CompiledFunc>,
-    pub ip: u32,
-}
 
 /// One externref-arena entry: a host payload, or an *internalized* `anyref` produced by
 /// `extern.convert_any` (carrying that ref's handle so `any.convert_extern` recovers it).

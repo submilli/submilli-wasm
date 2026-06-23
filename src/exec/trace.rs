@@ -6,10 +6,11 @@ use std::sync::Arc;
 use crate::backtrace::{FrameInfo, WasmBacktrace};
 use crate::instance::Instance;
 use crate::module::op::CompiledFunc;
-use crate::store::{HostFrame, StoreInner};
+use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::Error;
 
+use super::frame::{Delimiter, Frame};
 use super::Execution;
 
 /// Builds one frame's [`FrameInfo`], or `None` if the instance isn't registered (only happens in
@@ -30,51 +31,52 @@ pub(crate) fn frame_info(
     Some(FrameInfo::new(module, func_index, code_offset))
 }
 
-/// Builds a backtrace from the store's host-call frame snapshot (for `WasmBacktrace::capture`).
-pub(crate) fn from_host_frames(inner: &StoreInner) -> WasmBacktrace {
-    let frames = inner
-        .host_frames()
-        .iter()
-        .rev()
-        .filter_map(|hf: &HostFrame| frame_info(inner, hf.instance, hf.func_index, &hf.code, hf.ip))
-        .collect();
-    WasmBacktrace::from_frames(frames)
+/// Builds a backtrace by walking `frames` most-recent first: wasm frames become [`FrameInfo`]s,
+/// host-re-entry delimiters become host-boundary markers (rendered by [`WasmBacktrace`]'s
+/// `Display`), and the top-level delimiter is skipped. `top_ip` overrides the ip of the topmost
+/// real frame (the live trap/throw site); the rest use their saved call-site ip (`frame.ip - 1`).
+fn build(inner: &StoreInner, frames: &[Frame], top_ip: Option<u32>) -> WasmBacktrace {
+    let last_real = frames.iter().rposition(|f| f.delimiter.is_none());
+    let mut infos = Vec::new();
+    let mut boundaries = Vec::new();
+    for (i, f) in frames.iter().enumerate().rev() {
+        match f.delimiter {
+            // A host→wasm boundary sits just above the frames already collected.
+            Some(Delimiter::HostReentry) => boundaries.push(infos.len()),
+            Some(Delimiter::TopLevel) => {} // embedder→wasm entry: no marker
+            None => {
+                let ip = match top_ip {
+                    Some(ip) if Some(i) == last_real => ip,
+                    _ => f.ip.saturating_sub(1),
+                };
+                if let Some(info) = frame_info(inner, f.instance, f.func_index, &f.code, ip) {
+                    infos.push(info);
+                }
+            }
+        }
+    }
+    WasmBacktrace::from_frames_with_boundaries(infos, boundaries)
+}
+
+/// Builds a backtrace from the parked execution (for `WasmBacktrace::capture` inside a host fn):
+/// every frame is at a call site, so all use `frame.ip - 1`. Empty when nothing is parked.
+pub(crate) fn from_parked(inner: &StoreInner) -> WasmBacktrace {
+    match inner.parked_exec() {
+        Some(exec) => build(inner, exec.frames(), None),
+        None => WasmBacktrace::from_frames(Vec::new()),
+    }
 }
 
 impl Execution {
-    /// Captures a backtrace from the live frame stack, most-recent first. The top frame uses
-    /// `top_ip` (the live trap/throw ip); callers use their saved call-site ip.
-    pub(super) fn capture_backtrace(&self, inner: &StoreInner, top_ip: u32) -> WasmBacktrace {
-        let last = self.frames.len().saturating_sub(1);
-        let frames = self
-            .frames
-            .iter()
-            .enumerate()
-            .rev()
-            .filter_map(|(i, f)| {
-                let ip = if i == last {
-                    top_ip
-                } else {
-                    f.ip.saturating_sub(1)
-                };
-                frame_info(inner, f.instance, f.func_index, &f.code, ip)
-            })
-            .collect();
-        WasmBacktrace::from_frames(frames)
+    /// The live frame stack (for backtrace capture from the parked execution).
+    pub(crate) fn frames(&self) -> &[Frame] {
+        &self.frames
     }
 
-    /// A snapshot of the live wasm frames for the host-call window. Each frame is at a call site,
-    /// so the recorded ip is `frame.ip - 1` (mirroring the unwinder's `fault_ip`).
-    pub(super) fn host_frame_snapshot(&self) -> Vec<HostFrame> {
-        self.frames
-            .iter()
-            .map(|f| HostFrame {
-                instance: f.instance,
-                func_index: f.func_index,
-                code: f.code.clone(),
-                ip: f.ip.saturating_sub(1),
-            })
-            .collect()
+    /// Captures a backtrace from the live frame stack, most-recent first (the top frame uses the
+    /// live trap/throw `top_ip`), spanning any parked outer calls with host-boundary markers.
+    pub(super) fn capture_backtrace(&self, inner: &StoreInner, top_ip: u32) -> WasmBacktrace {
+        build(inner, &self.frames, Some(top_ip))
     }
 
     /// For a trap reaching the run-loop boundary uncaught: attach a captured backtrace (gated on
