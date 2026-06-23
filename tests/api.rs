@@ -7,7 +7,7 @@
 use submilli_wasm::{
     Caller, Config, Engine, Extern, ExternRef, Func, FuncType, Global, GlobalType, Instance,
     Linker, Memory, MemoryType, Module, Mutability, Store, StoreLimits, StoreLimitsBuilder, Trap,
-    TypedFunc, UpdateDeadline, Val, ValType,
+    TypedFunc, UpdateDeadline, Val, ValType, WasmBacktrace,
 };
 
 fn module(engine: &Engine, wat: &str) -> Module {
@@ -265,6 +265,9 @@ fn epoch_deadline_traps() {
     let f = inst.get_func(&mut store, "f").unwrap();
     let err = f.call(&mut store, &[], &mut [Val::I32(0)]).unwrap_err();
     assert_eq!(*err.downcast_ref::<Trap>().unwrap(), Trap::Interrupt);
+    // Like every other trap, an epoch interrupt carries a captured backtrace (wasmtime parity):
+    // embedders downcast it to render the trap site.
+    assert!(err.downcast_ref::<WasmBacktrace>().is_some());
 }
 
 #[test]

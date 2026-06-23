@@ -128,7 +128,11 @@ fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Resu
             Outcome::FuelYield => {
                 return Err(crate::Error::msg("fuel yield requires an async store"))
             }
-            Outcome::EpochDeadline => apply_epoch_deadline(store)?,
+            Outcome::EpochDeadline => {
+                if let Err(e) = apply_epoch_deadline(store) {
+                    return Err(exec.attach_suspension_backtrace(&store.inner, e));
+                }
+            }
             Outcome::Grow { memory, delta } => exec.do_grow(store, memory, delta)?,
             Outcome::TableGrow { table, delta, init } => {
                 exec.do_grow_table(store, table, delta, init)?;
@@ -175,7 +179,11 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
                 yield_now().await;
                 store.inner.refuel_from_reserve();
             }
-            Outcome::EpochDeadline => apply_epoch_deadline_async(store).await?,
+            Outcome::EpochDeadline => {
+                if let Err(e) = apply_epoch_deadline_async(store).await {
+                    return Err(exec.attach_suspension_backtrace(&store.inner, e));
+                }
+            }
             Outcome::Grow { memory, delta } => exec.do_grow_async(store, memory, delta).await?,
             Outcome::TableGrow { table, delta, init } => {
                 exec.do_grow_table_async(store, table, delta, init).await?;

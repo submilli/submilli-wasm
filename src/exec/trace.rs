@@ -92,4 +92,15 @@ impl Execution {
             None => err, // non-trap (PendingException, or a host-surfaced error): left as-is
         }
     }
+
+    /// Attaches a backtrace to an error raised at a suspension point (e.g. an epoch-deadline
+    /// interrupt), where the run loop already saved the live ip on the top frame. Mirrors
+    /// [`attach_trap_backtrace`](Self::attach_trap_backtrace) but sources the ip from that frame
+    /// rather than the call site, so the interrupt trace points at the instruction we stopped on.
+    pub(super) fn attach_suspension_backtrace(&self, inner: &StoreInner, err: Error) -> Error {
+        match self.frames.last() {
+            Some(f) => self.attach_trap_backtrace(inner, err, f.ip),
+            None => err,
+        }
+    }
 }
