@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used)]
 
 use submilli_wasm::{
-    Collector, Config, Engine, FieldType, Func, FuncType, GcHeapOutOfMemory, Instance, Module,
-    Mutability, RootScope, StorageType, Store, StoreLimitsBuilder, StructRef, StructRefPre,
+    Collector, Config, Engine, ExternRef, FieldType, Func, FuncType, GcHeapOutOfMemory, Instance,
+    Module, Mutability, RootScope, StorageType, Store, StoreLimitsBuilder, StructRef, StructRefPre,
     StructType, Val, ValType,
 };
 
@@ -381,5 +381,109 @@ fn host_allocation_collects_then_grows_within_one_call() {
     assert!(
         err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
         "limiter-denied GC growth is GcHeapOutOfMemory, got: {err:#}"
+    );
+}
+
+// --- externref / exn arena reclamation (#27g follow-up) ---------------------------------------
+
+/// A module that throws + catches (discarding the `exnref`) `n` times — each iteration allocates an
+/// exception instance that is unreachable once caught, so the exn arena must reclaim them.
+const EXN_SPIN: &str = r#"(module
+    (tag $t)
+    (func $boom (throw $t))
+    (func (export "spin") (param $n i32)
+      (loop $l
+        (block $c (try_table (catch_all $c) (call $boom)))
+        (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+        (br_if $l (local.get $n)))))"#;
+
+#[test]
+fn exn_arena_reclaimed_under_mark_sweep() {
+    // A throw-loop allocates an `ExnEntity` per iteration; caught with `catch_all` (no binding), each
+    // is immediately unreachable. The exns charge the GC budget, so the throw path's reservation flow
+    // collects as it fills — the live footprint stays bounded far below the ~32 MB it would reach if
+    // the arena were still grow-only (the pre-fix OOM-abort DoS).
+    let engine = engine_with(Collector::Auto);
+    let mut store = Store::new(&engine, ());
+    let module = Module::new(&engine, wat::parse_str(EXN_SPIN).unwrap()).unwrap();
+    let inst = Instance::new(&mut store, &module, &[]).unwrap();
+    let spin = inst.get_typed_func::<i32, ()>(&mut store, "spin").unwrap();
+
+    spin.call(&mut store, 500_000).unwrap();
+    assert!(
+        store.gc_heap_capacity() < 1_000_000,
+        "exn garbage stayed bounded: {} bytes",
+        store.gc_heap_capacity()
+    );
+    store.gc();
+    assert_eq!(
+        store.gc_heap_capacity(),
+        0,
+        "all exns reclaimed once unreachable"
+    );
+}
+
+#[test]
+fn exn_throw_loop_completes_under_tight_limiter() {
+    // The same throw-loop under a 256 KiB cap with no free budget: every reservation grow is
+    // limiter-gated, but the collector keeps reclaiming the unreachable exns, so the loop completes
+    // far past the cap instead of trapping. (Grow-only, this would OOM/deny long before finishing.)
+    let mut cfg = Config::new();
+    cfg.collector(Collector::Auto).gc_heap_reservation(0);
+    let engine = Engine::new(&cfg).unwrap();
+    let mut store = Store::new(
+        &engine,
+        StoreLimitsBuilder::new().memory_size(256 * 1024).build(),
+    );
+    store.limiter(|s| s);
+    let module = Module::new(&engine, wat::parse_str(EXN_SPIN).unwrap()).unwrap();
+    let inst = Instance::new(&mut store, &module, &[]).unwrap();
+    let spin = inst.get_typed_func::<i32, ()>(&mut store, "spin").unwrap();
+
+    spin.call(&mut store, 200_000).unwrap();
+    assert!(store.gc_heap_capacity() <= 256 * 1024);
+}
+
+#[test]
+fn externref_arena_reclaimed_after_scope() {
+    // Host externrefs are rooted only for their `RootScope`; once it drops they're unreachable, so a
+    // collection reclaims the arena (no longer grow-only).
+    let engine = engine_with(Collector::Auto);
+    let mut store = Store::new(&engine, ());
+    {
+        let mut scope = RootScope::new(&mut store);
+        for i in 0..2_000u32 {
+            ExternRef::new(&mut scope, i).unwrap();
+        }
+    } // scope drop → the 2,000 host roots are removed
+    store.gc();
+    assert_eq!(
+        store.gc_heap_capacity(),
+        0,
+        "externrefs reclaimed once their RootScope dropped"
+    );
+}
+
+#[test]
+fn rooted_externref_survives_then_stale_after_reclaim() {
+    let engine = engine_with(Collector::Auto);
+    let mut store = Store::new(&engine, ());
+
+    // Created outside a scope → rooted for the store's life: survives a collection, payload readable.
+    let live = ExternRef::new(&mut store, 123u32).unwrap();
+    store.gc();
+    let got = live.data(&store).unwrap().unwrap();
+    assert_eq!(got.downcast_ref::<u32>(), Some(&123));
+
+    // Created in a scope that then drops → unrooted: a collection frees its slot and bumps the
+    // generation, so the escaped handle faults rather than reading a reused entry.
+    let stale = {
+        let mut scope = RootScope::new(&mut store);
+        ExternRef::new(&mut scope, 99u32).unwrap()
+    };
+    store.gc();
+    assert!(
+        stale.data(&store).is_err(),
+        "stale externref handle must fault after its entry is reclaimed"
     );
 }

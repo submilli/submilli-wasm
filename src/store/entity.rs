@@ -13,6 +13,15 @@ use crate::instance::Instance;
 use crate::module::Module;
 use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, TagType, Val};
 
+use super::reclaim::ReclaimArena;
+
+/// Per-arena-entry overhead charged into the GC-heap byte budget for an `externref`/`exn` entry: the
+/// slot `Option`, the parallel generation `u32`, and the `Box`/`Vec` allocator overhead — the
+/// externref/exn analog of the GC heap's per-object overhead. A `Host` externref's boxed payload is
+/// an opaque `T` whose size we can't see, so we charge this fixed wrapper cost (slightly
+/// conservative); it's enough to drive collection + the limiter so arena growth can't run unbounded.
+const ARENA_ENTRY_OVERHEAD: usize = 64;
+
 /// One externref-arena entry: a host payload, or an *internalized* `anyref` produced by
 /// `extern.convert_any` (carrying that ref's handle so `any.convert_extern` recovers it).
 pub(crate) enum ExternEntry {
@@ -20,18 +29,28 @@ pub(crate) enum ExternEntry {
     Internal(u32),
 }
 
-/// Store-side arena of `externref` entries. Grow-only for now: entries live for the store's
-/// lifetime (no reclamation until a tracing collector, whose host-root enumeration hook lands
-/// then). `Box<dyn Any>` isn't `Debug`, hence the manual impl.
-#[derive(Default)]
-pub(crate) struct ExternRefs(pub Vec<ExternEntry>);
-
-impl core::fmt::Debug for ExternRefs {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ExternRefs")
-            .field("len", &self.0.len())
-            .finish()
+impl ExternEntry {
+    /// Heap byte charge for the GC budget (the opaque `Host` payload is charged a fixed wrapper cost).
+    pub(crate) fn byte_size(&self) -> usize {
+        ARENA_ENTRY_OVERHEAD
     }
+}
+
+/// Heap byte charge for one `externref` entry — the reservation pre-charge host `ExternRef::new`
+/// uses before allocating (the `Host` payload's true size is opaque).
+pub(crate) fn extern_charge() -> usize {
+    ARENA_ENTRY_OVERHEAD
+}
+
+/// Store-side arena of `externref` entries — reclaimable (#27g): the mark-sweep collector frees
+/// unreachable entries and recycles their slots, so `extern.convert_any` / host `ExternRef::new`
+/// can't grow it without bound.
+pub(crate) type ExternRefs = ReclaimArena<ExternEntry>;
+
+/// Heap byte charge for an exception instance carrying `n_args` argument values (the reservation
+/// pre-charge `throw` computes before popping; mirrors [`ExnEntity::byte_size`]).
+pub(crate) fn exn_charge(n_args: usize) -> usize {
+    ARENA_ENTRY_OVERHEAD.saturating_add(n_args.saturating_mul(core::mem::size_of::<Val>()))
 }
 
 /// Size of a WebAssembly memory page, in bytes.
@@ -69,8 +88,9 @@ pub(crate) struct TagEntity {
 }
 
 /// An exception instance backing an `exnref`: the throwing tag plus the argument values it carries.
-/// `Rooted<ExnRef>` indexes the store's exn arena. The `args` are **GC roots** the future tracing
-/// collector (#27g) must enumerate (inert under the null collector; freed on `Store` drop).
+/// `Rooted<ExnRef>` indexes the store's exn arena. The `args` are **GC roots** the tracing collector
+/// (#27g) enumerates transitively; the arena itself is reclaimable, so an unreachable exception
+/// (e.g. one caught and dropped in a throw-loop) is freed by mark-sweep.
 #[derive(Debug)]
 pub(crate) struct ExnEntity {
     pub tag: Tag,
@@ -79,6 +99,13 @@ pub(crate) struct ExnEntity {
     /// `throw_ref` rethrow preserves the original site; `None` for host-created or when
     /// `wasm_backtrace` is off.
     pub backtrace: Option<crate::backtrace::WasmBacktrace>,
+}
+
+impl ExnEntity {
+    /// Heap byte charge for the GC budget (overhead + the carried argument values).
+    pub(crate) fn byte_size(&self) -> usize {
+        exn_charge(self.args.len())
+    }
 }
 
 /// Runtime data backing a [`Func`](crate::Func): either a defined wasm function

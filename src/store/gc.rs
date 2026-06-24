@@ -1,10 +1,9 @@
-//! The managed GC object heap: a store-side handle table for `struct`/`array` objects. Mirrors the
-//! `externref` arena in [`super::inner`] but holds typed aggregates instead of opaque host payloads.
-//! `i31` and nulls are never allocated here — `i31` is unboxed directly in the `anyref` handle (see
-//! [`anyref_handle_i31`]). The mark-sweep collector ([`super::gc_collect`]) reclaims slots into a
-//! free-list and bumps each freed slot's generation (the stale-handle check); `Collector::Null`
-//! keeps it allocate-only. Guest allocation draws a limiter-granted reservation; the heap's bound is
-//! the limiter, not a wasm-style maximum (an `ABORT_SAFETY_CAP` only prevents an OOM-abort).
+//! The managed GC object heap: a store-side handle table for `struct`/`array` objects. `i31` and
+//! nulls are never allocated here — `i31` is unboxed in the `anyref` handle ([`anyref_handle_i31`]).
+//! The mark-sweep collector ([`super::gc_collect`]) reclaims slots into a free-list and bumps each
+//! freed slot's generation (the stale-handle check); `Collector::Null` keeps it allocate-only. Guest
+//! allocation draws a limiter-granted reservation; the limiter is the heap's bound, not a wasm-style
+//! maximum (an `ABORT_SAFETY_CAP` only prevents an OOM-abort).
 #![allow(dead_code)]
 // `i31` (un)boxing is intentional 31-bit two's-complement wraparound.
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
@@ -16,11 +15,9 @@ use crate::value::{AnyRef, Rooted, Val};
 use crate::Result;
 
 /// A fixed **abort-safety** cap on a store's GC heap (bytes), applied **only when no
-/// `ResourceLimiter` is installed** (with a limiter, the limiter is the sole bound and the guest
-/// heap may grow past this — it is *not* a wasm-style maximum). It exists so a hostile allocation
-/// traps rather than OOM-aborting when nothing else bounds it, and also bounds the free budget and
-/// the host/const-eval paths (which never consult the limiter). Physical-RAM detection is a later
-/// refinement.
+/// `ResourceLimiter` is installed** (with a limiter, the limiter is the sole bound — not a wasm-style
+/// maximum). It traps a hostile allocation rather than OOM-aborting, and bounds the free budget and
+/// the limiter-less host/const-eval paths.
 pub(crate) const ABORT_SAFETY_CAP: usize = 1 << 30; // 1 GiB
 
 /// Top bit of an `anyref` handle: set ⇒ the handle is an unboxed `i31`; clear ⇒ a heap slot
@@ -142,9 +139,9 @@ impl GcObject {
     }
 }
 
-/// Fixed per-object cost charged on top of the body bytes: the `slots` cell (`Option<GcObject>`),
-/// the parallel `generations` `u32`, and ~16 B for the body `Box`'s allocator overhead. Keeps
-/// `used` a faithful, slightly-conservative bound (mark bitmap / free-list omitted as negligible).
+/// Fixed per-object cost on top of the body bytes: the `slots` cell (`Option<GcObject>`), the
+/// parallel `generations` `u32`, and ~16 B of `Box` allocator overhead — a slightly-conservative
+/// `used` bound (mark bitmap / free-list omitted as negligible).
 const OBJECT_OVERHEAD: usize =
     core::mem::size_of::<Option<GcObject>>() + core::mem::size_of::<u32>() + 16;
 
@@ -225,13 +222,22 @@ impl GcHeap {
         self.collecting
     }
 
+    /// Charges/credits externref/exn-arena bytes against `used` so those arenas share the GC heap's
+    /// budget (collect-then-grow + the limiter account them, #27g); `credit` is the sweep's refund.
+    pub(crate) fn charge(&mut self, bytes: usize) {
+        self.used = self.used.saturating_add(bytes);
+    }
+
+    pub(crate) fn credit(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes);
+    }
+
     /// Bytes currently reserved (the engine-wide committed total tracks these).
     pub(crate) fn reserved(&self) -> usize {
         self.reserved
     }
 
-    /// Whether growing the reservation to `target` stays within the pre-authorized budget — if so
-    /// the run loop grants it directly, with **no limiter consultation** (and no suspend).
+    /// Whether growing to `target` stays within the free budget (granted directly — no limiter).
     pub(crate) fn is_free_grant(&self, target: usize) -> bool {
         target <= self.reservation
     }
@@ -242,37 +248,31 @@ impl GcHeap {
         self.used >= RESERVE_BATCH
     }
 
-    /// Whether an object of `size` bytes fits the current guest reservation (the fast path: no
-    /// collection, no limiter consultation).
+    /// Whether `size` bytes fit the current guest reservation (the fast path: no collection/limiter).
     pub(crate) fn fits(&self, size: usize) -> bool {
         self.used
             .checked_add(size)
             .is_some_and(|n| n <= self.reserved)
     }
 
-    /// The hard ceiling for the limiter-less allocation paths (host/const-eval, `array.new_data`/
-    /// `_elem`): the largest budget already legitimately established for this store — the
-    /// limiter-granted `reserved`, the pre-authorized free `reservation`, or the no-limiter abort
-    /// cap as the floor. A limiter that grew `reserved` past the abort cap therefore lets these
-    /// paths follow, instead of being stuck at the cap.
+    /// The hard ceiling for the limiter-less alloc paths (host/const-eval, `array.new_data`/`_elem`):
+    /// the largest budget already legitimately established — the limiter-granted `reserved`, the free
+    /// `reservation`, or the abort cap as the floor (so a limiter that grew past the cap isn't stuck).
     fn unreserved_ceiling(&self) -> usize {
         self.reserved.max(self.reservation).max(ABORT_SAFETY_CAP)
     }
 
-    /// Whether an unreserved allocation of `size` bytes fits the [`unreserved_ceiling`] (else it
-    /// traps rather than risk an OOM-abort).
+    /// Whether an unreserved `size`-byte allocation fits [`unreserved_ceiling`] (else it traps).
     pub(crate) fn can_fit_limit(&self, size: usize) -> bool {
         self.used
             .checked_add(size)
             .is_some_and(|n| n <= self.unreserved_ceiling())
     }
 
-    /// The new (absolute) reservation we'd like for an allocation of `size` that doesn't currently
-    /// fit: one growth step (`next_grow`) beyond the current reservation, but always at least enough
-    /// to hold `used + size`. The step is bounded (it doubles only up to the reservation), so a large
-    /// heap grows in linear chunks rather than doubling its whole footprint. **Not** capped at the
-    /// abort-safety cap — the limiter decides the bound (`grow_gc_reservation` applies the cap only
-    /// when no limiter is installed), so a limited heap can grow past it.
+    /// The new (absolute) reservation for an allocation of `size` that doesn't fit: one growth step
+    /// (`next_grow`) beyond the current reservation, but at least enough to hold `used + size`. The
+    /// step doubles only up to the reservation (linear chunks for a large heap). **Not** abort-cap
+    /// bounded — the limiter decides the bound (`grow_gc_reservation` applies the cap limiter-less).
     pub(crate) fn desired_reservation(&self, size: usize) -> usize {
         let need = self.used.saturating_add(size);
         self.reserved.saturating_add(self.next_grow).max(need)

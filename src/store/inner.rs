@@ -2,7 +2,7 @@
 //! simple index arena. Public handles (`Memory`/`Global`/… ) are indices into these.
 
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::canon::CanonicalTypeId;
@@ -15,6 +15,7 @@ use crate::value::{ExnRef, Rooted};
 use super::arena::Arena;
 use super::entity::ExternRefs;
 use super::gc::GcHeap;
+use super::reclaim::ReclaimArena;
 use super::{
     ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
 };
@@ -42,7 +43,7 @@ pub(crate) struct StoreInner {
     /// Exception instances backing `exnref` values; `Rooted<ExnRef>` indexes here. Grow-only
     /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) enumerates
     /// transitively (the exn arena itself is not reclaimed yet — see `gc_collect`).
-    pub(super) exns: Arena<ExnEntity>,
+    pub(super) exns: ReclaimArena<ExnEntity>,
     pub(super) instances: Arena<InstanceEntity>,
     /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here. Traced for GC
     /// reachability; box reclamation is a follow-up (see `gc_collect`).
@@ -76,7 +77,7 @@ pub(crate) struct StoreInner {
     exec_slot: Option<crate::exec::Execution>,
     /// This store's GC-request mailbox (the engine holds a `Weak`). The engine posts to it under
     /// engine-wide GC pressure; the run loop reads-and-clears it at a back-edge and self-collects.
-    gc_request: Arc<AtomicBool>,
+    pub(super) gc_request: Arc<AtomicBool>,
 }
 
 impl StoreInner {
@@ -90,7 +91,7 @@ impl StoreInner {
             tables: Arena::default(),
             globals: Arena::default(),
             tags: Arena::default(),
-            exns: Arena::default(),
+            exns: ReclaimArena::default(),
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
             gc,
@@ -106,20 +107,9 @@ impl StoreInner {
         }
     }
 
-    /// Reads and clears this store's GC-request mailbox: `true` ⇒ the engine asked it to collect
-    /// (under engine-wide pressure) since the last check. Clearing affects only *this* store's
-    /// mailbox, so servicing it doesn't suppress the request for the engine's other stores.
-    pub(crate) fn take_gc_request(&self) -> bool {
-        self.gc_request.swap(false, Ordering::Relaxed)
-    }
-
-    pub(crate) fn set_pending_exception(&mut self, exn: Rooted<ExnRef>) {
-        self.pending_exception = Some(exn);
-    }
-
-    pub(crate) fn take_pending_exception(&mut self) -> Option<Rooted<ExnRef>> {
-        self.pending_exception.take()
-    }
+    // The GC-request mailbox (`take_gc_request`) and the pending-exception accessors
+    // (`set`/`take_pending_exception`) live in `managed` with the rest of the GC machinery; their
+    // fields (`gc_request`, `pending_exception`) stay on the struct above.
 
     /// Takes the parked shared execution out of its slot (the driver owns it while `run`ning).
     pub(crate) fn take_exec(&mut self) -> Option<crate::exec::Execution> {
@@ -262,18 +252,8 @@ impl StoreInner {
         self.tags.get(handle.index)
     }
 
-    /// Allocates an exception instance, returning its `exnref` handle.
-    pub(crate) fn alloc_exn(&mut self, entity: ExnEntity) -> Rooted<ExnRef> {
-        Rooted::from_raw(self.exns.alloc(entity))
-    }
-
-    pub(crate) fn exn(&self, handle: Rooted<ExnRef>) -> &ExnEntity {
-        self.exns.get(handle.raw())
-    }
-
-    pub(crate) fn exn_mut(&mut self, handle: Rooted<ExnRef>) -> &mut ExnEntity {
-        self.exns.get_mut(handle.raw())
-    }
+    // Exception-arena accessors (`alloc_exn`/`exn`/`exn_mut`/`exn_checked`/`exn_generation`) live in
+    // `managed` with the other GC-managed reference arenas (the `exns` field stays here).
 
     /// The handle the *next* [`alloc_instance`](Self::alloc_instance) will return,
     /// without allocating. Lets instantiation build `FuncEntity`s that point back

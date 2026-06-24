@@ -64,6 +64,12 @@ impl Execution {
     ) -> Result<StepOutcome> {
         let tag = inner.instance(instance).tags[tag_idx as usize];
         let params: Vec<ValType> = inner.tag(tag).ty.ty().params().collect();
+        // Reserve the exception's GC-budget footprint *before* popping, so its args stay on the
+        // operand stack as roots if a collection runs (#27g). A reservation grow suspends and
+        // re-executes this throw — idempotent, since nothing has been popped yet.
+        if let Some(out) = self.gc_reserve(inner, crate::store::exn_charge(params.len()), ip) {
+            return Ok(out);
+        }
         // Pop top-first (so the last param first), decoding by its type, then restore order.
         let mut args: Vec<Val> = params
             .iter()
@@ -79,7 +85,7 @@ impl Execution {
             tag,
             args,
             backtrace,
-        });
+        })?;
         Err(PendingException { exn }.into())
     }
 

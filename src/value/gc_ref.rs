@@ -77,6 +77,17 @@ impl<T> Rooted<T> {
         Ok(slot)
     }
 
+    /// Validates a captured generation against an arena slot's `current_generation`, returning the
+    /// slot index. Internal/`UNCHECKED` handles skip the check; a mismatch (or a missing slot, i.e.
+    /// `None`) means the referent was collected and its slot possibly reused — a stale handle. Used
+    /// by the reclaimable `externref`/`exn` arenas (the GC heap uses [`gc_slot_checked`](Self::gc_slot_checked)).
+    pub(crate) fn checked(self, current_generation: Option<u32>) -> Result<u32> {
+        if self.generation != UNCHECKED_GENERATION && current_generation != Some(self.generation) {
+            return Err(Error::msg("stale reference (object was collected)"));
+        }
+        Ok(self.index)
+    }
+
     /// Whether `a` and `b` refer to the same GC object (reference identity). Under the grow-only
     /// arena each live object has a unique handle, so this is handle equality. An associated
     /// function (not a method), matching `wasmtime::Rooted::ref_eq`'s `(store, a, b)` shape.
@@ -150,12 +161,17 @@ impl ExternRef {
         T: Any + Send + Sync + 'static,
     {
         let mut ctx = store.as_context_mut();
+        // Reserve through the limiter + charge the GC budget (the arena is reclaimable now, #27g).
+        let index = ctx.store_mut().gc_alloc_externref(Box::new(value))?;
         let inner = ctx.inner_mut();
-        let index = inner.alloc_externref(Box::new(value));
         // Register as a host root so a guest collection across this handle keeps it alive.
         inner.push_gc_root(index, crate::canon::RefKind::Extern);
-        // The externref arena is not reclaimed, so there is no generation to check.
-        Ok(Rooted::from_raw(index))
+        // Stamp the slot generation so a handle held past a reclaiming collection faults (vs. a
+        // reused slot). `RootScope`/`push_gc_root` keeps it live until the scope drops.
+        Ok(Rooted::from_raw_gen(
+            index,
+            inner.externref_generation(index),
+        ))
     }
 }
 
@@ -170,7 +186,7 @@ impl Rooted<ExternRef> {
     where
         T: 'static,
     {
-        Ok(store.into().inner().externref(self.index))
+        store.into().inner().externref_checked(*self)
     }
 
     /// Mutably borrows the host payload behind this `externref`. Mirrors
@@ -182,7 +198,7 @@ impl Rooted<ExternRef> {
     where
         T: 'static,
     {
-        Ok(store.into().into_inner_mut().externref_mut(self.index))
+        store.into().into_inner_mut().externref_checked_mut(*self)
     }
 }
 

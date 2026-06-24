@@ -41,15 +41,20 @@ impl ExnRef {
             }
         }
         let mut ctx = store.as_context_mut();
-        let inner = ctx.inner_mut();
-        let exn = inner.alloc_exn(ExnEntity {
+        // Reserve through the limiter + charge the GC budget (the exn arena is reclaimable now, #27g).
+        let exn = ctx.store_mut().gc_alloc_exn(ExnEntity {
             tag: *tag,
             args: fields.to_vec(),
             backtrace: None,
-        });
+        })?;
+        let inner = ctx.inner_mut();
         // Register as a host root so a guest collection keeps the exception's GC-typed args alive.
         inner.push_gc_root(exn.raw(), crate::canon::RefKind::Exn);
-        Ok(exn)
+        // Stamp the slot generation so the handle faults if held past a reclaiming collection.
+        Ok(Rooted::from_raw_gen(
+            exn.raw(),
+            inner.exn_generation(exn.raw()).unwrap_or(0),
+        ))
     }
 }
 
@@ -58,7 +63,7 @@ impl Rooted<ExnRef> {
     pub fn field(&self, mut store: impl AsContextMut, index: usize) -> Result<Val> {
         let ctx = store.as_context_mut();
         ctx.inner()
-            .exn(*self)
+            .exn_checked(*self)?
             .args
             .get(index)
             .copied()
@@ -67,13 +72,13 @@ impl Rooted<ExnRef> {
 
     /// The tag this exception was thrown with.
     pub fn tag(&self, mut store: impl AsContextMut) -> Result<Tag> {
-        Ok(store.as_context_mut().inner().exn(*self).tag)
+        Ok(store.as_context_mut().inner().exn_checked(*self)?.tag)
     }
 
     /// The exception's type (its tag's signature).
     pub fn ty(&self, store: impl AsContext) -> Result<ExnType> {
         let ctx = store.as_context();
-        let tag = ctx.inner().exn(*self).tag;
+        let tag = ctx.inner().exn_checked(*self)?.tag;
         ExnType::from_tag_type(&ctx.inner().tag(tag).ty)
     }
 

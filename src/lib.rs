@@ -63,10 +63,10 @@ pub use crate::config::{Collector, Config, OptLevel, WasmBacktraceDetails};
 pub use crate::engine::{Engine, EngineWeak};
 pub use crate::exception::ThrownException;
 pub use crate::extern_::{Extern, Global, Memory, MemoryAccessError, Table, Tag};
-pub use crate::gc::GcHeapOutOfMemory;
 pub use crate::func::{
     Caller, Func, IntoFunc, TypedFunc, WasmParams, WasmResults, WasmRet, WasmTy,
 };
+pub use crate::gc::GcHeapOutOfMemory;
 pub use crate::instance::Instance;
 pub use crate::linker::Linker;
 pub use crate::module::Module;

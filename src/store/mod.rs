@@ -8,13 +8,14 @@ mod gc_codec;
 mod gc_collect;
 mod grow;
 mod inner;
-mod inner_gc;
 mod limits;
+mod managed;
+mod reclaim;
 
 pub use context::{AsContext, AsContextMut, StoreContext, StoreContextMut};
 pub(crate) use entity::{
-    ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
-    PAGE_SIZE,
+    exn_charge, ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity,
+    TagEntity, PAGE_SIZE,
 };
 pub(crate) use gc::{
     anyref_handle_i31, anyref_handle_slot, anyref_value, decode_anyref_handle, AnyRefHandle,

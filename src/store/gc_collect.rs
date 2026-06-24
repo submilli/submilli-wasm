@@ -5,18 +5,19 @@
 //! (globals, tables, element-segment instances, the pending exception, and host-held `Rooted`s)
 //! live in `StoreInner`. A single unified worklist trace follows reference fields/elements through
 //! the per-type [`Layout`], spanning hierarchies (`extern.convert_any`/`any.convert_extern`).
-//! Sweep frees unmarked GC-heap slots (recycling their indices, bumping their generation).
+//! Sweep frees unmarked slots (recycling their indices, bumping their generation).
 //!
-//! Reclaimed for now: the GC object heap (structs/arrays/extern-wrappers). The externref and
-//! exception arenas are *traced* (so objects reachable only through them survive) but not yet
-//! reclaimed — a documented follow-up.
+//! All three GC-managed arenas are reclaimed: the GC object heap (structs/arrays/extern-wrappers)
+//! plus the **externref** and **exception** arenas (#27g). The trace visits each arena's reachable
+//! entries (the `extern_seen`/`exn_seen` sets); whatever isn't visited is freed in the sweep, its
+//! byte charge credited back to the shared GC budget.
 
 use std::collections::HashSet;
 
 use crate::canon::{Layout, RefKind, Slot};
 use crate::value::{Ref, Val};
 
-use super::entity::ExternEntry;
+use super::entity::{ExnEntity, ExternEntry};
 use super::gc::{decode_anyref_handle, AnyRefHandle};
 use super::gc_codec::{le_u32, NULL_REF};
 use super::{ObjKind, StoreInner};
@@ -45,8 +46,8 @@ impl StoreInner {
         }
         self.seed_entity_roots(&mut work);
 
-        // `Gc` reachability is the object's mark bit; the un-reclaimed extern/exn arenas use
-        // transient visited sets to keep the trace from looping on cycles through them.
+        // `Gc` reachability is the object's mark bit; the extern/exn arenas use visited sets that
+        // double as their mark sets — the sweep frees every entry NOT visited here.
         let mut extern_seen: HashSet<u32> = HashSet::new();
         let mut exn_seen: HashSet<u32> = HashSet::new();
         while let Some(r) = work.pop() {
@@ -69,6 +70,12 @@ impl StoreInner {
             }
         }
 
+        // Free the unreachable entries of each arena, crediting their bytes back to the shared GC
+        // budget; the visited sets are the live sets (#27g).
+        let freed = self.externrefs.sweep(&extern_seen, ExternEntry::byte_size);
+        self.gc.credit(freed);
+        let freed = self.exns.sweep(&exn_seen, ExnEntity::byte_size);
+        self.gc.credit(freed);
         self.gc.sweep();
     }
 
@@ -130,14 +137,14 @@ impl StoreInner {
     /// Traces an `externref` entry: an internalized `anyref` chains back into the GC heap; a host
     /// payload has no GC children.
     fn trace_extern(&self, index: u32, work: &mut Vec<Reached>) {
-        if let Some(ExternEntry::Internal(handle)) = self.externrefs.0.get(index as usize) {
+        if let Some(ExternEntry::Internal(handle)) = self.externrefs.get(index) {
             seed_handle(work, *handle, RefKind::Any);
         }
     }
 
     /// Traces an exception instance: its argument values are roots.
     fn trace_exn(&self, index: u32, work: &mut Vec<Reached>) {
-        if let Some(exn) = self.exns.get_opt(index) {
+        if let Some(exn) = self.exns.get(index) {
             for v in &exn.args {
                 seed_val(work, v);
             }

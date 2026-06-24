@@ -61,7 +61,7 @@ pub(crate) fn eval_const(inner: &mut StoreInner, ctx: &ConstCtx<'_>, e: &ConstEx
                 const_array_elem(inner, ctx, &mut stack, *ty, *elem)?
             }
             ConstOp::AnyConvertExtern => inner.any_convert_extern(pop(&mut stack))?,
-            ConstOp::ExternConvertAny => inner.extern_convert_any(pop(&mut stack)),
+            ConstOp::ExternConvertAny => inner.extern_convert_any(pop(&mut stack))?,
         };
         stack.push(v);
     }

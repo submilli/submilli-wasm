@@ -187,6 +187,25 @@ impl<T: 'static> Store<T> {
         self.grow_gc_reservation(target, charge as u64)
     }
 
+    /// Host `ExternRef::new`: reserve the entry's footprint through the limiter, then store it
+    /// (charging the GC budget). Bounded + reclaimable like the GC object heap (#27g).
+    pub(crate) fn gc_alloc_externref(
+        &mut self,
+        value: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Result<u32> {
+        self.gc_reserve_host(super::entity::extern_charge())?;
+        self.inner.alloc_externref(value)
+    }
+
+    /// Host `ExnRef::new`: reserve the exception's footprint through the limiter, then store it.
+    pub(crate) fn gc_alloc_exn(
+        &mut self,
+        entity: super::ExnEntity,
+    ) -> Result<crate::value::Rooted<crate::value::ExnRef>> {
+        self.gc_reserve_host(entity.byte_size())?;
+        self.inner.alloc_exn(entity)
+    }
+
     /// Checks the limiter for a brand-new memory of `initial` pages (`Memory::new`).
     pub(crate) fn limiter_allows_memory(&mut self, initial: u64, max: Option<u64>) -> Result<bool> {
         Ok(self

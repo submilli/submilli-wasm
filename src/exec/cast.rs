@@ -51,7 +51,8 @@ impl Execution {
             }
             Op::ExternConvertAny => {
                 let a = self.pop_anyref();
-                self.push(inner.extern_convert_any(a));
+                let e = inner.extern_convert_any(a)?;
+                self.push(e);
                 Ok(())
             }
             // Not a cast op — the remaining straight-line ops are numeric (chain's end).
