@@ -66,7 +66,7 @@ impl Memory {
         if !s.limiter_allows_memory(ty.minimum(), ty.maximum())? {
             return Err(Error::msg("memory minimum size exceeds the store limit"));
         }
-        Ok(s.inner.alloc_memory(MemoryEntity::new(ty)))
+        Ok(s.inner.alloc_memory(MemoryEntity::new(ty)?))
     }
 
     /// Async sibling of [`new`](Memory::new): awaits an async resource limiter on the
@@ -81,7 +81,7 @@ impl Memory {
         {
             return Err(Error::msg("memory minimum size exceeds the store limit"));
         }
-        Ok(s.inner.alloc_memory(MemoryEntity::new(ty)))
+        Ok(s.inner.alloc_memory(MemoryEntity::new(ty)?))
     }
 
     pub fn ty(&self, store: impl AsContext) -> MemoryType {
@@ -235,7 +235,7 @@ impl Table {
         if !s.limiter_allows_table(ty.minimum(), ty.maximum())? {
             return Err(Error::msg("table minimum size exceeds the store limit"));
         }
-        Ok(s.inner.alloc_table(TableEntity::new(ty, init)))
+        Ok(s.inner.alloc_table(TableEntity::new(ty, init)?))
     }
 
     /// Async sibling of [`new`](Table::new): awaits an async resource limiter on the
@@ -254,7 +254,7 @@ impl Table {
         {
             return Err(Error::msg("table minimum size exceeds the store limit"));
         }
-        Ok(s.inner.alloc_table(TableEntity::new(ty, init)))
+        Ok(s.inner.alloc_table(TableEntity::new(ty, init)?))
     }
 
     pub fn ty(&self, store: impl AsContext) -> TableType {

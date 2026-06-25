@@ -4,14 +4,17 @@
 //! `limiter_allows_*`, the count helpers) error if an async limiter is installed; the
 //! `*_async` siblings `.await` it (used by the async driver and `*_async` constructors).
 
+use super::limits::{DEFAULT_MEMORY_CEILING_BYTES, DEFAULT_TABLE_CEILING_ELEMS};
 use super::{ResourceLimiter, ResourceLimiterInner, Store, PAGE_SIZE};
 use crate::extern_::{Memory, Table};
 use crate::value::Ref;
 use crate::{Error, Result};
 
-/// Wasm pages → bytes (the limiter works in bytes for memory).
+/// Wasm pages → bytes (the limiter works in bytes for memory). Saturating so a hostile `memory64`
+/// page count (up to 2^48) can't overflow-panic the limiter check — a saturated `usize::MAX` simply
+/// exceeds any finite limit/ceiling and is denied.
 fn bytes(pages: u64) -> usize {
-    pages as usize * PAGE_SIZE
+    (pages as usize).saturating_mul(PAGE_SIZE)
 }
 
 impl<T: 'static> Store<T> {
@@ -83,7 +86,7 @@ impl<T: 'static> Store<T> {
                 l.memory_growing(bytes(current), bytes(desired), max.map(bytes))
             })?
             .transpose()?
-            .unwrap_or(true);
+            .unwrap_or(bytes(desired) <= DEFAULT_MEMORY_CEILING_BYTES);
         if allowed {
             if let Some(old) = self.inner.memory_mut(handle).grow(delta) {
                 return Ok(Some(old));
@@ -109,7 +112,7 @@ impl<T: 'static> Store<T> {
         let allowed = self
             .with_sync_limiter(|l| l.table_growing(current, desired, max))?
             .transpose()?
-            .unwrap_or(true);
+            .unwrap_or(desired <= DEFAULT_TABLE_CEILING_ELEMS);
         if allowed {
             if let Some(old) = self.inner.table_mut(handle).grow(delta, init) {
                 return Ok(Some(old));
@@ -206,20 +209,22 @@ impl<T: 'static> Store<T> {
         self.inner.alloc_exn(entity)
     }
 
-    /// Checks the limiter for a brand-new memory of `initial` pages (`Memory::new`).
+    /// Checks the limiter for a brand-new memory of `initial` pages (`Memory::new` or a defined
+    /// memory at instantiation). With no limiter, the finite default ceiling is the bound.
     pub(crate) fn limiter_allows_memory(&mut self, initial: u64, max: Option<u64>) -> Result<bool> {
         Ok(self
             .with_sync_limiter(|l| l.memory_growing(0, bytes(initial), max.map(bytes)))?
             .transpose()?
-            .unwrap_or(true))
+            .unwrap_or(bytes(initial) <= DEFAULT_MEMORY_CEILING_BYTES))
     }
 
-    /// Checks the limiter for a brand-new table of `initial` elements (`Table::new`).
+    /// Checks the limiter for a brand-new table of `initial` elements (`Table::new` or a defined
+    /// table at instantiation). With no limiter, the finite default ceiling is the bound.
     pub(crate) fn limiter_allows_table(&mut self, initial: u64, max: Option<u64>) -> Result<bool> {
         Ok(self
             .with_sync_limiter(|l| l.table_growing(0, initial as usize, max.map(|m| m as usize)))?
             .transpose()?
-            .unwrap_or(true))
+            .unwrap_or(initial as usize <= DEFAULT_TABLE_CEILING_ELEMS))
     }
 }
 
@@ -234,7 +239,7 @@ impl<T: 'static> Store<T> {
         max: Option<usize>,
     ) -> Result<bool> {
         match &mut self.limiter {
-            None => Ok(true),
+            None => Ok(desired <= DEFAULT_MEMORY_CEILING_BYTES),
             Some(ResourceLimiterInner::Sync(l)) => {
                 l(&mut self.data).memory_growing(current, desired, max)
             }
@@ -288,7 +293,7 @@ impl<T: 'static> Store<T> {
         max: Option<usize>,
     ) -> Result<bool> {
         match &mut self.limiter {
-            None => Ok(true),
+            None => Ok(desired <= DEFAULT_TABLE_CEILING_ELEMS),
             Some(ResourceLimiterInner::Sync(l)) => {
                 l(&mut self.data).table_growing(current, desired, max)
             }

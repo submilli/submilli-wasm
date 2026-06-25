@@ -148,6 +148,35 @@ fn null_collector_traps_when_limiter_denies_gc_growth() {
 }
 
 #[test]
+fn array_new_data_routes_through_limiter() {
+    // Regression for #31: `array.new_data` now routes its allocation through the limiter's GC-byte
+    // reservation (it previously checked only the static abort ceiling, ignoring the limiter). With a
+    // zero free budget and a 1 KiB cap, building a 2 KiB array from a data segment must trap as
+    // `GcHeapOutOfMemory` rather than silently allocate up to the abort cap.
+    let mut cfg = Config::new();
+    cfg.collector(Collector::Null).gc_heap_reservation(0);
+    let engine = Engine::new(&cfg).unwrap();
+    let mut store = Store::new(&engine, StoreLimitsBuilder::new().memory_size(1024).build());
+    store.limiter(|s| s);
+
+    let wat = format!(
+        "(module (type $a (array (mut i8))) (data $d \"{}\") \
+         (func (export \"make\") i32.const 0 i32.const 2048 array.new_data $a $d drop))",
+        "a".repeat(2048)
+    );
+    let module = Module::new(&engine, wat::parse_str(&wat).unwrap()).unwrap();
+    let inst = Instance::new(&mut store, &module, &[]).unwrap();
+    let make = inst.get_typed_func::<(), ()>(&mut store, "make").unwrap();
+
+    let err = make.call(&mut store, ()).unwrap_err();
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "array.new_data growth must be limiter-gated, got: {err:#}"
+    );
+    assert_eq!(store.gc_heap_capacity(), 0, "nothing was allocated");
+}
+
+#[test]
 fn gc_heap_reservation_is_free_budget_then_limiter_gated() {
     // With a pre-authorized `gc_heap_reservation`, growth *within* it skips the limiter entirely —
     // so even a deny-all limiter doesn't stop allocation up to the reservation; only growth beyond

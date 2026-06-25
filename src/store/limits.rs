@@ -8,6 +8,19 @@ use crate::{Error, Result};
 
 const DEFAULT_LIMIT: usize = 10_000;
 
+/// The finite default ceiling on a single memory's size (bytes), applied **only when no
+/// [`ResourceLimiter`] is installed** — with a limiter, the limiter is the sole bound. It equals the
+/// 32-bit architectural maximum (4 GiB), so `memory32` behavior is unchanged while a `memory64`
+/// (whose architectural ceiling is 2^48 pages) is held to a finite multi-tenant default rather than
+/// being effectively unbounded. Tunable policy knob (see `docs/SECURITY.md`); the GC heap's analog
+/// is [`super::gc::ABORT_SAFETY_CAP`].
+pub(crate) const DEFAULT_MEMORY_CEILING_BYTES: usize = 1usize << 32;
+
+/// The finite default ceiling on a single table's element count, applied **only when no
+/// [`ResourceLimiter`] is installed**. Equals the 32-bit architectural maximum (`u32::MAX`), so
+/// `table32` is unchanged while a `table64` (architectural ceiling `u64::MAX`) is held finite.
+pub(crate) const DEFAULT_TABLE_CEILING_ELEMS: usize = u32::MAX as usize;
+
 /// Controls resource growth (memory/table) and entity counts for a store.
 pub trait ResourceLimiter {
     fn memory_growing(

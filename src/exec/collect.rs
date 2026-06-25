@@ -86,6 +86,23 @@ impl Execution {
                 array_bytes(self.peek_count(), stride)?
             }
             Op::ArrayNewFixed { ty, n } => module.inner().layout(*ty).body_size(*n as usize),
+            Op::ArrayNewData { ty, data } => {
+                let stride = module.inner().layout(*ty).stride();
+                let dropped = inner.instance(instance).dropped_data[*data as usize];
+                let seg = if dropped {
+                    0
+                } else {
+                    module.inner().datas[*data as usize].bytes.len()
+                };
+                seg_clamped_charge(self.peek_count(), stride, seg)
+            }
+            Op::ArrayNewElem { ty, elem } => {
+                let stride = module.inner().layout(*ty).stride();
+                let seg = inner.instance(instance).elems[*elem as usize]
+                    .len()
+                    .saturating_mul(stride);
+                seg_clamped_charge(self.peek_count(), stride, seg)
+            }
             _ => return Ok(None),
         };
         Ok(Some(inner.gc_object_charge(data_len)))
@@ -102,4 +119,15 @@ fn array_bytes(count: usize, stride: usize) -> Result<usize> {
     count
         .checked_mul(stride)
         .ok_or_else(|| Trap::AllocationTooLarge.into())
+}
+
+/// The reservation charge for `array.new_data`/`array.new_elem`: the count-based body size clamped to
+/// the source segment's byte length. The clamp stops a hostile (soon-to-be-out-of-bounds or
+/// overflowing) count from over-reserving — the op then re-runs and traps with the correct
+/// out-of-bounds / too-large error from its own handler, while the reservation only ever grew by a
+/// bounded, segment-sized amount. A legitimate in-bounds count charges its exact body size.
+fn seg_clamped_charge(count: usize, stride: usize, seg_bytes: usize) -> usize {
+    count
+        .checked_mul(stride)
+        .map_or(seg_bytes, |v| v.min(seg_bytes))
 }

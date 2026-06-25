@@ -12,8 +12,15 @@ use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::Module;
 use crate::value::{FuncType, GlobalType, MemoryType, Ref, TableType, TagType, Val};
+use crate::{Error, Result};
 
 use super::reclaim::ReclaimArena;
+
+/// The error for a failed initial memory/table allocation (`try_reserve` denial or an over-large
+/// declared size). A clean instantiation/`new` failure — never an OOM-abort.
+fn alloc_err() -> Error {
+    Error::msg("failed to allocate the initial memory or table")
+}
 
 /// Per-arena-entry overhead charged into the GC-heap byte budget for an `externref`/`exn` entry: the
 /// slot `Option`, the parallel generation `u32`, and the `Box`/`Vec` allocator overhead — the
@@ -153,9 +160,17 @@ pub(crate) struct InstanceEntity {
 }
 
 impl MemoryEntity {
-    pub(crate) fn new(ty: MemoryType) -> Self {
-        let bytes = vec![0; ty.minimum() as usize * PAGE_SIZE];
-        MemoryEntity { bytes, ty }
+    /// Allocates the initial (zeroed) backing store. Fallible (`try_reserve_exact`) so an over-large
+    /// declared *initial* size returns a clean error instead of OOM-aborting the process, even with
+    /// no `ResourceLimiter` installed (the limiter/default-ceiling policy gate runs before this).
+    pub(crate) fn new(ty: MemoryType) -> Result<Self> {
+        let len = (ty.minimum() as usize)
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(alloc_err)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| alloc_err())?;
+        bytes.resize(len, 0);
+        Ok(MemoryEntity { bytes, ty })
     }
 
     pub(crate) fn size_pages(&self) -> u64 {
@@ -188,9 +203,14 @@ impl MemoryEntity {
 }
 
 impl TableEntity {
-    pub(crate) fn new(ty: TableType, init: Ref) -> Self {
-        let elems = vec![init; ty.minimum() as usize];
-        TableEntity { elems, ty }
+    /// Allocates the initial backing store (every slot the typed `init` ref). Fallible like
+    /// [`MemoryEntity::new`] so an over-large declared *initial* size errors rather than aborting.
+    pub(crate) fn new(ty: TableType, init: Ref) -> Result<Self> {
+        let len = ty.minimum() as usize;
+        let mut elems = Vec::new();
+        elems.try_reserve_exact(len).map_err(|_| alloc_err())?;
+        elems.resize(len, init);
+        Ok(TableEntity { elems, ty })
     }
 
     pub(crate) fn size(&self) -> u64 {

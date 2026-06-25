@@ -204,13 +204,16 @@ impl Execution {
             Op::Simd(s) => self.exec_simd(inner, s, instance)?,
             // GC aggregate allocation: ensure the limiter-granted reservation covers it first (with
             // operands still on the stack as roots); a reservation grow suspends and re-executes.
-            // `array.new_data`/`array.new_elem` are excluded — their size is bounded by the source
-            // segment, and their in-handler out-of-bounds check must trap before any size check.
+            // `array.new_data`/`array.new_elem` route through here too — their charge is clamped to
+            // the source segment size (`seg_clamped_charge`), so a would-be-out-of-bounds count
+            // reserves only a bounded amount and still traps with the correct error in its handler.
             alloc @ (Op::StructNew(_)
             | Op::StructNewDefault(_)
             | Op::ArrayNew(_)
             | Op::ArrayNewDefault(_)
-            | Op::ArrayNewFixed { .. }) => {
+            | Op::ArrayNewFixed { .. }
+            | Op::ArrayNewData { .. }
+            | Op::ArrayNewElem { .. }) => {
                 if let Some(charge) = self.gc_alloc_charge(inner, instance, alloc)? {
                     if let Some(out) = self.gc_reserve(inner, charge, ip) {
                         return Ok(out);

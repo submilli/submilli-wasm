@@ -40,6 +40,56 @@ fn check_limits<T: 'static>(
     Ok(())
 }
 
+/// Consults the limiter for each defined memory/table's *initial* size before instantiation
+/// allocates anything (wasmtime consults the limiter at memory/table creation, not only on grow).
+/// With no limiter installed, the finite default ceiling is the bound (`src/store/grow.rs`). A
+/// denial fails instantiation cleanly — nothing is allocated. (Imported memories/tables were
+/// already gated when first created.)
+fn check_initial_sizes<T: 'static>(
+    store: &mut impl AsContextMut<Data = T>,
+    module: &Module,
+) -> Result<()> {
+    let mut ctx = store.as_context_mut();
+    let s = ctx.store_mut();
+    let m = module.inner();
+    for mt in &m.memories {
+        if !s.limiter_allows_memory(mt.minimum(), mt.maximum())? {
+            return Err(Error::msg("memory minimum size exceeds the store limit"));
+        }
+    }
+    for td in &m.tables {
+        if !s.limiter_allows_table(td.ty.min, td.ty.max)? {
+            return Err(Error::msg("table minimum size exceeds the store limit"));
+        }
+    }
+    Ok(())
+}
+
+/// Async sibling of [`check_initial_sizes`]: awaits an async resource limiter.
+#[cfg(feature = "async")]
+async fn check_initial_sizes_async<T: 'static>(
+    store: &mut impl AsContextMut<Data = T>,
+    module: &Module,
+) -> Result<()> {
+    let mut ctx = store.as_context_mut();
+    let s = ctx.store_mut();
+    let m = module.inner();
+    for mt in &m.memories {
+        if !s
+            .limiter_allows_memory_async(mt.minimum(), mt.maximum())
+            .await?
+        {
+            return Err(Error::msg("memory minimum size exceeds the store limit"));
+        }
+    }
+    for td in &m.tables {
+        if !s.limiter_allows_table_async(td.ty.min, td.ty.max).await? {
+            return Err(Error::msg("table minimum size exceeds the store limit"));
+        }
+    }
+    Ok(())
+}
+
 /// Shared instantiation core: enforces limits, builds the instance, and resolves the
 /// optional `start` function — leaving the caller to run it sync ([`Instance::new`]) or
 /// async ([`Instance::new_async`]).
@@ -71,6 +121,7 @@ impl Instance {
     ) -> Result<Instance> {
         // Sync instantiation is permitted on an async-enabled store (no fibers here). A `start`
         // that calls an async host fn still errors via the sync driver's "synchronous context".
+        check_initial_sizes(&mut store, module)?;
         let (instance, start) = instantiate_resolve_start(&mut store, module, imports)?;
         // The start function runs before any export is callable; a trap aborts
         // instantiation. Routed through `Func::call` so it handles wasm/host starts.
@@ -93,6 +144,7 @@ impl Instance {
                 "cannot use `new_async` without `Config::async_support(true)`",
             ));
         }
+        check_initial_sizes_async(&mut store, module).await?;
         let (instance, start) = instantiate_resolve_start(&mut store, module, imports)?;
         if let Some(func) = start {
             func.call_async(&mut store, &[], &mut []).await?;

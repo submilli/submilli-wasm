@@ -33,7 +33,7 @@ pub(crate) fn instantiate(
     let (mut funcs, mut memories, mut globals, mut tables, mut tags) =
         link_imports(inner, module, imports)?;
     for mt in &m.memories {
-        memories.push(inner.alloc_memory(MemoryEntity::new(mt.clone())));
+        memories.push(inner.alloc_memory(MemoryEntity::new(mt.clone())?));
     }
     // Allocate a fresh entity per defined tag — this mints its store-address identity.
     for t in &m.tags {
@@ -102,7 +102,7 @@ fn alloc_defined_tables(
             None => null_ref(&td.ty.element.heap),
         };
         let ty = canon::materialize_table(m.engine(), &m.type_ids, &td.ty);
-        tables.push(inner.alloc_table(TableEntity::new(ty, init)));
+        tables.push(inner.alloc_table(TableEntity::new(ty, init)?));
     }
     Ok(())
 }
