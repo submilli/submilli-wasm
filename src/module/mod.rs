@@ -68,6 +68,36 @@ fn simd_features() -> WasmFeatures {
     WasmFeatures::empty()
 }
 
+/// Default validation-time module-size ceiling (bytes) — the **untrusted tier** (#32). Generous
+/// for real guest modules, finite for safety: the multi-tenant threat model forbids an unbounded
+/// default (a hostile module must not be able to OOM the compiler). Tunable via
+/// [`crate::Config::max_module_bytes`]; raised per-module for trusted packages via
+/// [`Module::new_with_limits`].
+pub(crate) const DEFAULT_MAX_MODULE_BYTES: usize = 256 << 20;
+
+/// Per-module validation-time complexity limits (#32). Bounds compiler memory so a hostile
+/// *module* can't OOM the compiler before it ever executes — layered on top of `wasmparser`'s
+/// hard per-dimension limits (function body size, locals, segment/type/function counts), which
+/// it does not expose for tuning. Currently a single aggregate cap; kept a struct (rather than a
+/// bare argument) so future per-dimension knobs are additive.
+///
+/// **Additive deviation from wasmtime** — no analog in `wasmtime`. [`Default`] yields the
+/// untrusted-tier ceiling ([`crate::Config::max_module_bytes`]); trusted/curated packages pass a
+/// higher — but still finite — `max_module_bytes` via [`Module::new_with_limits`].
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleLimits {
+    /// Maximum accepted module binary size, in bytes. Always finite (no unbounded option).
+    pub max_module_bytes: usize,
+}
+
+impl Default for ModuleLimits {
+    fn default() -> Self {
+        ModuleLimits {
+            max_module_bytes: DEFAULT_MAX_MODULE_BYTES,
+        }
+    }
+}
+
 /// A compiled, reusable WebAssembly module. Shareable across stores of the same
 /// engine; cloning is a cheap `Arc` bump.
 #[derive(Clone, Debug)]
@@ -87,7 +117,21 @@ impl Module {
     /// Validation is fused into the decode/compile pass (see [`parse::parse_module`]), so the
     /// binary is walked once — not validated by a separate full pass and then re-parsed.
     pub fn from_binary(engine: &Engine, binary: &[u8]) -> Result<Module> {
-        let inner = parse::parse_module(engine, binary)?;
+        let inner = parse::parse_module(engine, binary, engine.max_module_bytes())?;
+        Ok(Module(Arc::new(inner)))
+    }
+
+    /// Like [`Module::new`] but with explicit per-module [`ModuleLimits`] — the entry point for
+    /// **trusted/curated packages** that the embedder allows a higher (but still finite)
+    /// complexity ceiling than the engine's untrusted-tier default (#32).
+    ///
+    /// **Additive deviation from wasmtime** — there is no analog in `wasmtime`.
+    pub fn new_with_limits(
+        engine: &Engine,
+        bytes: impl AsRef<[u8]>,
+        limits: &ModuleLimits,
+    ) -> Result<Module> {
+        let inner = parse::parse_module(engine, bytes.as_ref(), limits.max_module_bytes)?;
         Ok(Module(Arc::new(inner)))
     }
 
@@ -113,6 +157,10 @@ impl Module {
     /// A corrupted artifact cannot cause undefined behavior here — the interpreter runs
     /// in safe Rust with bounds-checked dispatch, so the worst case is a trap rather than
     /// memory unsafety — but cross-version/garbage blobs are rejected up front.
+    ///
+    /// The validation-time module-size ceiling (#32) is intentionally **not** applied here:
+    /// the artifact is a trusted, embedder-only blob (not guest-reachable), matching wasmtime's
+    /// `unsafe` deserialize contract.
     #[allow(unsafe_code)] // No unsafe operations; `unsafe` is wasmtime API parity only.
     pub unsafe fn deserialize(engine: &Engine, bytes: impl AsRef<[u8]>) -> Result<Module> {
         let mut inner = serialize::decode(bytes.as_ref())?;
@@ -134,9 +182,16 @@ impl Module {
         Ok(Module(Arc::new(inner)))
     }
 
-    /// Validates a module without compiling it.
+    /// Validates a module without compiling it. Applies the engine's untrusted-tier
+    /// module-size ceiling (`Config::max_module_bytes`, #32) before parsing.
     pub fn validate(engine: &Engine, binary: &[u8]) -> Result<()> {
-        let _ = engine;
+        if binary.len() > engine.max_module_bytes() {
+            return Err(Error::msg(format!(
+                "module size {} exceeds configured limit {}",
+                binary.len(),
+                engine.max_module_bytes()
+            )));
+        }
         Validator::new_with_features(enabled_features())
             .validate_all(binary)
             .map(|_| ())

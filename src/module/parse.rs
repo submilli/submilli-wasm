@@ -35,7 +35,23 @@ pub(crate) fn wp_err(e: BinaryReaderError) -> Error {
 /// section and function body is walked exactly once — not re-parsed by a separate `validate_all`).
 /// Debug retention is driven by the engine's config (#29c): the per-`Op` offsets + `name` section,
 /// and `.debug_*` bytes.
-pub(crate) fn parse_module(engine: &Engine, bytes: &[u8]) -> Result<ModuleInner> {
+pub(crate) fn parse_module(
+    engine: &Engine,
+    bytes: &[u8],
+    max_module_bytes: usize,
+) -> Result<ModuleInner> {
+    // Validation-time complexity bound (#32): reject an oversize module before allocating any of
+    // the decode/compile state (the streaming decode + the data-segment byte copies below are
+    // O(input)). `wasmparser` enforces the per-dimension ceilings (function body size, locals,
+    // segment/type/function counts); this caps their aggregate so a hostile module can't OOM the
+    // compiler. The trusted-artifact `Module::deserialize` path is exempt.
+    if bytes.len() > max_module_bytes {
+        return Err(Error::msg(format!(
+            "module size {} exceeds configured limit {}",
+            bytes.len(),
+            max_module_bytes
+        )));
+    }
     let keep_offsets = engine.wasm_backtrace_enabled();
     let keep_dwarf = engine.retain_dwarf();
     let mut m = empty_inner();

@@ -36,6 +36,9 @@ struct EngineInner {
     /// Per-store pre-authorized GC budget (bytes): reservation growth within it skips the limiter,
     /// and it caps a single growth step (`Config::gc_heap_reservation`).
     gc_heap_reservation: usize,
+    /// Default validation-time module-size ceiling (bytes) for `Module::new` — the untrusted
+    /// tier (`Config::max_module_bytes`, #32). Trusted modules override it per-compile.
+    max_module_bytes: usize,
     /// Total GC bytes committed (reserved) across all of the engine's stores — updated at
     /// reservation-batch granularity (never per object), so it has no hot-path cost. Drives the
     /// engine-wide GC-pressure axis (§14).
@@ -73,6 +76,7 @@ impl Engine {
                 collector: config.collector_kind().resolve()?,
                 gc_memory_threshold: config.gc_memory_threshold_bytes(),
                 gc_heap_reservation: config.gc_heap_reservation_bytes(),
+                max_module_bytes: config.max_module_bytes_value(),
                 gc_committed: AtomicUsize::new(0),
                 gc_requests: Mutex::new(Vec::new()),
                 wasm_backtrace: config.wasm_backtrace_enabled(),
@@ -292,6 +296,11 @@ impl Engine {
     /// The per-store pre-authorized GC reservation in bytes (`Config::gc_heap_reservation`).
     pub(crate) fn gc_heap_reservation(&self) -> usize {
         self.inner.gc_heap_reservation
+    }
+
+    /// The default validation-time module-size ceiling for `Module::new` (`Config::max_module_bytes`).
+    pub(crate) fn max_module_bytes(&self) -> usize {
+        self.inner.max_module_bytes
     }
 
     /// Registers a new store's GC-request mailbox, returning the flag the store owns (the engine

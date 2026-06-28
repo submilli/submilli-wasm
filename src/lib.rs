@@ -69,7 +69,7 @@ pub use crate::func::{
 pub use crate::gc::GcHeapOutOfMemory;
 pub use crate::instance::Instance;
 pub use crate::linker::Linker;
-pub use crate::module::Module;
+pub use crate::module::{Module, ModuleLimits};
 #[cfg(feature = "async")]
 pub use crate::store::ResourceLimiterAsync;
 pub use crate::store::{

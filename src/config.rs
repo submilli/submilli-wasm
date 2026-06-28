@@ -10,6 +10,7 @@ pub struct Config {
     collector: Collector,
     gc_memory_threshold: Option<usize>,
     gc_heap_reservation: u64,
+    max_module_bytes: usize,
     async_support: bool,
     wasm_backtrace: bool,
     wasm_backtrace_details: WasmBacktraceDetails,
@@ -28,6 +29,8 @@ impl Default for Config {
             // doesn't suspend to the limiter on every batch; growth beyond it is limiter-gated.
             // Set to 0 for a limiter-strict store (every grow consults the limiter).
             gc_heap_reservation: 256 * 1024,
+            // The untrusted-tier module-size ceiling (#32); a finite default, never unbounded.
+            max_module_bytes: crate::module::DEFAULT_MAX_MODULE_BYTES,
             // Enabled by default (unlike wasmtime, where it's opt-in): this interpreter is
             // fiber-less, so an async-enabled store runs sync calls just as well, and defaulting
             // on lets embedders use `call_async`/`fuel_async_yield_interval` without an explicit
@@ -78,6 +81,26 @@ impl Config {
     /// The configured max wasm stack size in bytes, if set.
     pub(crate) fn max_wasm_stack_bytes(&self) -> Option<usize> {
         self.max_wasm_stack
+    }
+
+    /// Sets the default maximum module binary size, in **bytes**, that [`Module::new`] will
+    /// compile on this engine — the **untrusted-tier** validation-time ceiling that bounds
+    /// compiler memory against a hostile module before it ever executes (#32). Trusted/curated
+    /// packages can raise it per-module via [`Module::new_with_limits`].
+    ///
+    /// **Additive deviation from wasmtime** — there is no analog in `wasmtime::Config`. The
+    /// default is a finite ceiling (256 MiB, never unbounded), per the multi-tenant threat model.
+    ///
+    /// [`Module::new`]: crate::Module::new
+    /// [`Module::new_with_limits`]: crate::Module::new_with_limits
+    pub fn max_module_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.max_module_bytes = bytes;
+        self
+    }
+
+    /// The configured default module-size ceiling in bytes (`Config::max_module_bytes`).
+    pub(crate) fn max_module_bytes_value(&self) -> usize {
+        self.max_module_bytes
     }
 
     pub fn wasm_multi_value(&mut self, enable: bool) -> &mut Self {
