@@ -114,6 +114,19 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// Instantiates `module`, linking `imports`, and runs its `start` function (if any).
+    ///
+    /// **Guest code runs here** — the `start` function and the active data/element segment
+    /// initializers execute *during* instantiation, before any export is callable. So fuel, epoch,
+    /// the stack-size limit, and the `ResourceLimiter` must be **armed before** `Instance::new`
+    /// (#32b): a hostile `start` can otherwise burn unbounded CPU or recurse. A trap in `start` or a
+    /// failing segment makes this return `Err`.
+    ///
+    /// Instantiation is **not transactional**: entities allocated before the failing step (memories,
+    /// tables, globals, the instance record) remain in the store until it is dropped — the failed
+    /// `Instance` is never returned, but its memory is not reclaimed early. The multi-tenant pattern
+    /// is therefore a **per-attempt `Store` discarded on failure** (matching wasmtime); see
+    /// `docs/ARCHITECTURE.md` §8.
     pub fn new(
         mut store: impl AsContextMut,
         module: &Module,
@@ -124,7 +137,8 @@ impl Instance {
         check_initial_sizes(&mut store, module)?;
         let (instance, start) = instantiate_resolve_start(&mut store, module, imports)?;
         // The start function runs before any export is callable; a trap aborts
-        // instantiation. Routed through `Func::call` so it handles wasm/host starts.
+        // instantiation. Routed through `Func::call` so it handles wasm/host starts. Fuel/epoch/
+        // stack limits already apply here (it runs through the metered run loop, #32b).
         if let Some(func) = start {
             func.call(&mut store, &[], &mut [])?;
         }
@@ -132,7 +146,9 @@ impl Instance {
     }
 
     /// Async sibling of [`new`](Instance::new): runs the `start` function as a `Future`
-    /// (so an async host fn it calls can suspend). Requires an async store.
+    /// (so an async host fn it calls can suspend). Requires an async store. The same
+    /// "arm limits before instantiation" and non-transactional-failure notes as [`new`](Instance::new)
+    /// apply (#32b).
     #[cfg(feature = "async")]
     pub async fn new_async(
         mut store: impl AsContextMut,
