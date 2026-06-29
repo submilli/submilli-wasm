@@ -1,6 +1,9 @@
 //! The flat opcode dispatch: one `step` per instruction, delegating to the per-category handlers.
 //! See ARCHITECTURE §7. The big `match` is the interpreter's single sanctioned long function.
 
+// Local/global/function indexing is into wasmparser-validated index spaces (#33 carve-out).
+#![allow(clippy::indexing_slicing)]
+
 use super::call::{self, CallKind};
 use super::{cell, Execution, StepOutcome};
 use crate::instance::Instance;

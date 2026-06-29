@@ -113,15 +113,31 @@ impl Func {
             Callee::Host(host_index) => {
                 let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();
                 let mut out = default_results(&ty);
-                cb(Caller::new(store.as_context_mut(), None), params, &mut out)?;
+                // Contain a host-fn panic (#33): clear any pending exception, then re-raise.
+                match crate::exec::guard::catch_host(|| {
+                    cb(Caller::new(store.as_context_mut(), None), params, &mut out)
+                }) {
+                    Ok(result) => result?,
+                    Err(payload) => {
+                        store.as_context_mut().store_mut().take_pending_exception();
+                        crate::exec::guard::reraise(payload);
+                    }
+                }
                 out
             }
             Callee::HostAsync(host_index) => {
                 let cb = store.as_context_mut().store_mut().async_host_funcs[host_index as usize]
                     .clone();
                 let mut out = default_results(&ty);
+                // Contain an async host-fn panic across the await (#33): poll inside `catch_unwind`.
                 let fut = cb(Caller::new(store.as_context_mut(), None), params, &mut out);
-                std::boxed::Box::into_pin(fut).await?;
+                match crate::exec::guard::CatchUnwind(std::boxed::Box::into_pin(fut)).await {
+                    Ok(result) => result?,
+                    Err(payload) => {
+                        store.as_context_mut().store_mut().take_pending_exception();
+                        crate::exec::guard::reraise(payload);
+                    }
+                }
                 out
             }
         };

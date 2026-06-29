@@ -122,7 +122,17 @@ impl Func {
             Callee::Host(host_index) => {
                 let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();
                 let mut out = default_results(&ty);
-                cb(Caller::new(store.as_context_mut(), None), params, &mut out)?;
+                // Contain a host-fn panic (#33): clear any pending exception it set via `Store::throw`
+                // before re-raising, so this store is left consistent for reuse (wasmtime parity).
+                match crate::exec::guard::catch_host(|| {
+                    cb(Caller::new(store.as_context_mut(), None), params, &mut out)
+                }) {
+                    Ok(result) => result?,
+                    Err(payload) => {
+                        store.as_context_mut().store_mut().take_pending_exception();
+                        crate::exec::guard::reraise(payload);
+                    }
+                }
                 out
             }
             #[cfg(feature = "async")]

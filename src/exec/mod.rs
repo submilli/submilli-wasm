@@ -3,6 +3,24 @@
 //! Each frame holds its code as `Arc<CompiledFunc>` so the loop reads ops while mutating the
 //! value/frame stacks and the store. `step` returns an owned outcome. See ARCHITECTURE §7.
 
+// Panic-safety gate for the exec hot path (#33). A validated guest must never panic the interpreter
+// (a panic = whole-process DoS under multi-tenant). These lint levels cascade to every `src/exec/*`
+// submodule, so accidental `panic!`/`todo!`/`unimplemented!` and unchecked indexing are caught here
+// rather than in review. The per-op handler modules (`memory`/`table`/`gc*`/…) legitimately index
+// *wasmparser-validated* module/instance index spaces and slices guarded by a just-checked bound, so
+// each carries a documented file-level `#![allow(clippy::indexing_slicing)]`; the run-loop core
+// (this file) and the numeric/conversion/host paths stay strict, so new unchecked indexing there is
+// rejected. `clippy::unreachable` is intentionally *not* denied — `unreachable!()` is the sanctioned
+// post-validation invariant assertion (same class as `expect`). `arithmetic_side_effects` is also not
+// gated — the loop's `ip`/height/depth math is benign and the lint too noisy; numeric ops already use
+// `wrapping_*`/`checked_*`, and the #35 fuzzer is the real net for arithmetic.
+#![deny(
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing
+)]
+
 mod arith;
 mod call;
 mod cast;
@@ -14,6 +32,7 @@ mod exn;
 mod frame;
 mod gc;
 mod gc_array;
+pub(crate) mod guard;
 pub(crate) mod host;
 mod memory;
 mod numeric;

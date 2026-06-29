@@ -8,6 +8,9 @@
 //! (`T`-generic) limiter, so it suspends to the driver (`Outcome::GcGrow`), exactly like
 //! `memory.grow`.
 
+// Segment indexing is into the wasmparser-validated data/elem index space (#33 carve-out).
+#![allow(clippy::indexing_slicing)]
+
 use super::{Execution, StepOutcome};
 use crate::canon::Layout;
 use crate::instance::Instance;

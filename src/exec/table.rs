@@ -2,6 +2,10 @@
 //! parts mirror the `memory.init`/`data.drop` handling in [`super::memory`]; the reference
 //! *value* ops (`ref.null` etc.) live in [`super::ref_`].
 
+// Indexing is into the wasmparser-validated table/elem index space or a just-checked range (#33
+// carve-out): never unchecked guest input.
+#![allow(clippy::indexing_slicing)]
+
 use super::{cell, Execution};
 use crate::instance::Instance;
 use crate::module::op::Op;

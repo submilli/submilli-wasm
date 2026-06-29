@@ -3,6 +3,9 @@
 //! loop intercepts it for handler search, and at the embedder boundary it becomes the public
 //! [`ThrownException`] with the `exnref` parked on the store's pending slot.
 
+// Tag indexing is into the wasmparser-validated tag index space (#33 carve-out).
+#![allow(clippy::indexing_slicing)]
+
 use crate::canon::RefKind;
 use crate::exception::ThrownException;
 use crate::extern_::Tag;

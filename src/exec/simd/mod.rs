@@ -3,6 +3,11 @@
 //! gc chain). Lane math is portable scalar code (see [`lanes`]); SIMD never traps except on a
 //! memory-op out-of-bounds.
 
+// Cascades to the whole `simd` subtree (#33 carve-out, exec hot-path gate). SIMD indexing is into
+// fixed-size lane arrays (`[T; N]`, statically in-bounds — lane indices are validated immediates) or
+// the bounds-checked `load_n`/`store_n` memory helpers — never unchecked guest input.
+#![allow(clippy::indexing_slicing)]
+
 mod bit;
 mod cvt;
 mod farith;

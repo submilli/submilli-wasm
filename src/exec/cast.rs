@@ -193,7 +193,10 @@ fn func_type_id(inner: &StoreInner, f: crate::func::Func) -> CanonicalTypeId {
             func_index,
         } => {
             let m = inner.instance(*instance).module.inner();
-            m.canonical_type_id(m.func_types[*func_index as usize])
+            // `func_index` is a wasmparser-validated function index for this module (#33 carve-out).
+            #[allow(clippy::indexing_slicing)]
+            let id = m.canonical_type_id(m.func_types[*func_index as usize]);
+            id
         }
         FuncEntity::Host { ty, .. } => ty.canonical_id(),
         #[cfg(feature = "async")]

@@ -1,5 +1,5 @@
 //! Runtime tests: execute arithmetic-free, instance-free functions.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::sync::Arc;
 

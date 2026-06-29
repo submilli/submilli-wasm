@@ -47,6 +47,8 @@ impl Execution {
         table: u32,
         kind: CallKind,
     ) -> Result<StepOutcome> {
+        // `table` is a wasmparser-validated table index for this instance (#33 carve-out).
+        #[allow(clippy::indexing_slicing)]
         let handle = inner.instance(instance).tables[table as usize];
         let idx = self.pop_index(inner.table(handle).ty.is_64());
         let f = match inner.table(handle).get(idx) {

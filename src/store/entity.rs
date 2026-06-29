@@ -163,6 +163,12 @@ impl MemoryEntity {
     /// Allocates the initial (zeroed) backing store. Fallible (`try_reserve_exact`) so an over-large
     /// declared *initial* size returns a clean error instead of OOM-aborting the process, even with
     /// no `ResourceLimiter` installed (the limiter/default-ceiling policy gate runs before this).
+    ///
+    /// **Zero-on-allocation (#33b):** the backing bytes are always `resize(len, 0)`-initialized
+    /// before the guest can read them — a guest must never observe a prior tenant's freed bytes or
+    /// allocator residue. Uninitialized fast-paths (`set_len`/`MaybeUninit`/`with_capacity`-then-expose)
+    /// are forbidden and already blocked by the crate's zero-`unsafe` invariant. The same holds for
+    /// `grow` below and `TableEntity::new`/`grow`. See `docs/SECURITY.md` (#36) for the full statement.
     pub(crate) fn new(ty: MemoryType) -> Result<Self> {
         let len = (ty.minimum() as usize)
             .checked_mul(PAGE_SIZE)

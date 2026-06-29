@@ -5,8 +5,14 @@
 //! a failed host allocation; every index access is bounds-checked against the element count
 //! (`ArrayOutOfBounds`), and data/elem segment ranges against the segment (`Memory`/`Table`OOB).
 
-// Index/width juggling on validated inputs is intentional narrowing.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+// Index/width juggling on validated inputs is intentional narrowing. Indexing is into the
+// wasmparser-validated data/elem index space or guarded by a just-checked bound (array element
+// count, segment range) — never unchecked guest input (#33 carve-out).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::indexing_slicing
+)]
 
 use super::gc::anyref_slot;
 use super::Execution;
@@ -44,7 +50,7 @@ impl Execution {
             Op::ArrayCopy { dst, .. } => self.array_copy(inner, instance, *dst),
             Op::ArrayInitData { ty, data } => self.array_init_data(inner, instance, *ty, *data),
             Op::ArrayInitElem { ty, elem } => self.array_init_elem(inner, instance, *ty, *elem),
-            // Not an array op — try the casts (then numerics) in the fall-through chain.
+            // Not an array op â try the casts (then numerics) in the fall-through chain.
             _ => self.exec_cast(inner, op, instance),
         }
     }
@@ -60,8 +66,8 @@ impl Execution {
         let type_id = module.inner().canonical_type_id(ty);
         let stride = module.inner().layout(ty).stride();
         let count = self.pop_i32() as u32 as usize;
-        // `byte_len` (count × stride) was already bounded by `gc_reserve` before this op ran
-        // (limiter or abort cap), so a too-large array has already trapped — no abort-cap re-check
+        // `byte_len` (count Ã stride) was already bounded by `gc_reserve` before this op ran
+        // (limiter or abort cap), so a too-large array has already trapped â no abort-cap re-check
         // here, which would otherwise cap a limiter-approved large array.
         let byte_len = elem_bytes(count, stride)?;
         let mut data = vec![0u8; byte_len];
@@ -111,7 +117,7 @@ impl Execution {
         let seg_len = if dropped { 0 } else { seg.len() };
         range(offset, byte_len, seg_len, Trap::MemoryOutOfBounds)?;
         inner.gc_check_capacity(byte_len)?;
-        // Scalar elements share the segment's little-endian layout — a direct byte copy.
+        // Scalar elements share the segment's little-endian layout â a direct byte copy.
         let body = seg[offset..offset + byte_len].to_vec();
         self.alloc_array(inner, type_id, body)
     }
@@ -259,7 +265,7 @@ impl Execution {
         let dst = self.pop_i32() as u32 as usize;
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
-        // Array (dst) range before the data (src) range — a `len` overrunning both reports
+        // Array (dst) range before the data (src) range â a `len` overrunning both reports
         // "out of bounds array access" (matches the spec ordering).
         range(
             dst,
@@ -310,7 +316,7 @@ impl Execution {
     }
 
     /// Allocates a fully-initialized array object and pushes its reference. The element count is
-    /// implicit in `data.len()` (= count × stride).
+    /// implicit in `data.len()` (= count Ã stride).
     fn alloc_array(
         &mut self,
         inner: &mut StoreInner,

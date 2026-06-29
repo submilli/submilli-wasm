@@ -1,7 +1,7 @@
 //! `Engine` — shared, thread-safe compilation/runtime root; holds the epoch counter.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use crate::canon::{AggKind, CanonicalTypeId, GroupId, ModuleType, TypeRegistry};
 use crate::config::{CollectorKind, Config};
@@ -87,44 +87,47 @@ impl Engine {
         })
     }
 
+    /// Reads the engine type registry, **recovering from lock poisoning** (#33): a panic while
+    /// some other store held this lock must not cascade a panic into every other tenant on the
+    /// engine. Registry operations are short and leave it structurally valid, so the recovered
+    /// guard is safe to use.
+    fn types_read(&self) -> RwLockReadGuard<'_, TypeRegistry> {
+        self.inner
+            .types
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Writes the engine type registry, recovering from lock poisoning — see [`Self::types_read`].
+    fn types_write(&self) -> RwLockWriteGuard<'_, TypeRegistry> {
+        self.inner
+            .types
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Interns a module's rec groups into the engine registry, returning the per-module-type
     /// canonical ids and the registered group ids (held by the `Module` for release on drop).
     pub(crate) fn intern_types(
         &self,
         types: &[ModuleType],
     ) -> (Vec<CanonicalTypeId>, Vec<GroupId>) {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .intern_module(types)
+        self.types_write().intern_module(types)
     }
 
     /// Releases a module's registered group ids (decrement refcounts; reclaim at zero).
     pub(crate) fn release_types(&self, group_ids: &[GroupId]) {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .release(group_ids);
+        self.types_write().release(group_ids);
     }
 
     /// Adds a registration to the group owning `id` (a type handle was cloned / materialized).
     pub(crate) fn incref_type(&self, id: CanonicalTypeId) {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .incref_type(id);
+        self.types_write().incref_type(id);
     }
 
     /// Removes a registration from the group owning `id` (a type handle was dropped).
     pub(crate) fn decref_type(&self, id: CanonicalTypeId) {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .decref_type(id);
+        self.types_write().decref_type(id);
     }
 
     /// Removes one registration from group `g` (a `RecGroup` / `Module` handle was dropped).
@@ -134,38 +137,22 @@ impl Engine {
 
     /// Adds one registration to group `g` (a `RecGroup` was cloned).
     pub(crate) fn incref_group(&self, g: GroupId) {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .incref_group(g);
+        self.types_write().incref_group(g);
     }
 
     /// The number of live (registered) rec groups — for leak/reclamation tests.
     pub(crate) fn live_group_count(&self) -> usize {
-        self.inner
-            .types
-            .read()
-            .expect("type registry poisoned")
-            .live_group_count()
+        self.types_read().live_group_count()
     }
 
     /// Whether canonical type `sub` is a declared subtype of `sup`.
     pub(crate) fn is_subtype(&self, sub: CanonicalTypeId, sup: CanonicalTypeId) -> bool {
-        self.inner
-            .types
-            .read()
-            .expect("type registry poisoned")
-            .is_subtype(sub, sup)
+        self.types_read().is_subtype(sub, sup)
     }
 
     /// The kind (func/struct/array) of a canonical type id, if registered.
     pub(crate) fn type_kind(&self, id: CanonicalTypeId) -> Option<AggKind> {
-        self.inner
-            .types
-            .read()
-            .expect("type registry poisoned")
-            .kind(id)
+        self.types_read().kind(id)
     }
 
     /// Interns a host-built func type and returns its canonical id. (The group is held by the
@@ -175,12 +162,7 @@ impl Engine {
         params: &[ValType],
         results: &[ValType],
     ) -> CanonicalTypeId {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .intern_func(params, results)
-            .0
+        self.types_write().intern_func(params, results).0
     }
 
     pub(crate) fn intern_struct_type(
@@ -189,10 +171,7 @@ impl Engine {
         supertype: Option<CanonicalTypeId>,
         fields: &[FieldType],
     ) -> CanonicalTypeId {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
+        self.types_write()
             .intern_struct(finality, supertype, fields)
             .0
     }
@@ -203,10 +182,7 @@ impl Engine {
         supertype: Option<CanonicalTypeId>,
         field: &FieldType,
     ) -> CanonicalTypeId {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
+        self.types_write()
             .intern_array(finality, supertype, field)
             .0
     }
@@ -218,11 +194,7 @@ impl Engine {
         members: &[ModuleType],
         externals: &[CanonicalTypeId],
     ) -> (Vec<CanonicalTypeId>, GroupId) {
-        self.inner
-            .types
-            .write()
-            .expect("type registry poisoned")
-            .intern_host_group(members, externals)
+        self.types_write().intern_host_group(members, externals)
     }
 
     /// The engine's canonical type registry lock (used by the two-phase materializers in `canon`,

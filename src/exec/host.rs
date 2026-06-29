@@ -3,6 +3,9 @@
 //! `Caller<'_, T>`. Keeping this thin and `T`-generic isolates the data type from
 //! the interpreter loop. See ARCHITECTURE §7/§10.
 
+// Indexing is `{async_,}host_funcs[host_index]` with `host_index` from a validated entity (#33).
+#![allow(clippy::indexing_slicing)]
+
 use std::sync::Arc;
 
 use super::epoch::apply_epoch_deadline;
@@ -236,11 +239,20 @@ impl Execution {
         // guest's live operands stay reachable for GC while parked — the collector seeds from the
         // slot (`StoreInner::exec_roots`) on a host-triggered collection.
         store.inner.park_exec(std::mem::take(self));
-        let result = cb(
-            Caller::new(store.as_context_mut(), Some(instance)),
-            &params,
-            &mut results,
-        );
+        // Contain a host-fn panic (#33): catch, restore store state, re-raise. See `guard`.
+        let result = match super::guard::catch_host(|| {
+            cb(
+                Caller::new(store.as_context_mut(), Some(instance)),
+                &params,
+                &mut results,
+            )
+        }) {
+            Ok(result) => result,
+            Err(payload) => {
+                super::guard::restore_after_panic(&mut store.inner, roots_mark);
+                super::guard::reraise(payload);
+            }
+        };
         *self = store
             .inner
             .take_exec()
@@ -305,10 +317,18 @@ impl Execution {
         let cb = store.async_host_funcs[host_index as usize].clone();
         // Park the shared execution across the await (see `invoke_host`).
         store.inner.park_exec(std::mem::take(self));
+        // Contain a host-fn panic across the await (#33): poll inside `CatchUnwind`; see `invoke_host`.
         let outcome = {
             let caller = Caller::new(store.as_context_mut(), Some(instance));
             let fut = cb(caller, &params, &mut results);
-            std::boxed::Box::into_pin(fut).await
+            super::guard::CatchUnwind(std::boxed::Box::into_pin(fut)).await
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(payload) => {
+                super::guard::restore_after_panic(&mut store.inner, roots_mark);
+                super::guard::reraise(payload);
+            }
         };
         *self = store
             .inner

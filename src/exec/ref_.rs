@@ -22,6 +22,8 @@ impl Execution {
                 Ok(())
             }
             Op::RefFunc(f) => {
+                // `f` is a wasmparser-validated function index for this instance (#33 carve-out).
+                #[allow(clippy::indexing_slicing)]
                 let func = inner.instance(instance).funcs[*f as usize];
                 self.push(Val::FuncRef(Some(func)));
                 Ok(())

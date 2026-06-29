@@ -53,7 +53,7 @@ pub(crate) fn func_sig(engine: &Engine, id: CanonicalTypeId) -> (Vec<ValType>, V
     let (p, r) = engine
         .types()
         .read()
-        .expect("type registry poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .func_body_raw(id);
     (
         p.iter().map(|v| mat_val(engine, v)).collect(),
@@ -66,7 +66,7 @@ pub(crate) fn struct_fields(engine: &Engine, id: CanonicalTypeId) -> Vec<FieldTy
     let fields = engine
         .types()
         .read()
-        .expect("type registry poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .struct_fields_raw(id);
     fields.iter().map(|f| mat_field(engine, f)).collect()
 }
@@ -76,7 +76,7 @@ pub(crate) fn array_field(engine: &Engine, id: CanonicalTypeId) -> FieldType {
     let field = engine
         .types()
         .read()
-        .expect("type registry poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .array_field_raw(id);
     mat_field(engine, &field)
 }

@@ -1,6 +1,6 @@
 //! The operand-stack cell: a fixed-width *untyped* byte slot replacing the tagged `Val` on the
-//! operand stack (ARCHITECTURE §7). wasm is statically typed post-validation, so the slot carries
-//! no tag — `8` bytes with the `simd` feature off, `16` with it on (only `v128` needs 16; every
+//! operand stack (ARCHITECTURE Â§7). wasm is statically typed post-validation, so the slot carries
+//! no tag â `8` bytes with the `simd` feature off, `16` with it on (only `v128` needs 16; every
 //! other value, including the `u32` reference handles, fits in 8). Encoding reuses the GC-body
 //! codec (`store::{read_slot, write_slot}`, offset-0 slots): scalars little-endian, references a
 //! 4-byte handle with the `NULL_REF` sentinel. No `unsafe`, no alignment requirement.
@@ -9,7 +9,9 @@
 #![allow(
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    // Operand-stack / local indexing is bounds-guaranteed by validation (stack height — #33).
+    clippy::indexing_slicing
 )]
 
 use super::Execution;
@@ -198,7 +200,7 @@ fn slot_for_valtype(ty: &ValType) -> Slot {
 }
 
 /// The cell kind for a GC field/element popped off the stack: the field's offset/packing is
-/// irrelevant (the stack holds the unpacked `i32`/`i64`/… value), only its hierarchy matters.
+/// irrelevant (the stack holds the unpacked `i32`/`i64`/â¦ value), only its hierarchy matters.
 fn stack_slot_for_field(field: Slot) -> Slot {
     match field {
         Slot::Scalar { kind, .. } => {
@@ -212,7 +214,7 @@ fn stack_slot_for_field(field: Slot) -> Slot {
     }
 }
 
-/// The reference hierarchy of a heap type — selects which `Val`/`Ref` variant a stored handle
+/// The reference hierarchy of a heap type â selects which `Val`/`Ref` variant a stored handle
 /// materializes into (mirrors `Val::null_for_heap`). Used to decode table-element refs.
 pub(super) fn refkind_of_heap(heap: &HeapType) -> RefKind {
     match heap {
@@ -291,7 +293,7 @@ impl Execution {
     }
 
     /// Pops an index/length/address operand, widening to `u64`. `is_64` (from the target
-    /// memory/table's type) selects the width — there is no runtime tag to read (#42).
+    /// memory/table's type) selects the width â there is no runtime tag to read (#42).
     pub(super) fn pop_index(&mut self, is_64: bool) -> u64 {
         let cell = self.pop();
         if is_64 {
@@ -310,7 +312,7 @@ impl Execution {
         });
     }
 
-    /// Pops a reference operand of a statically-known hierarchy (null → the typed null `Val`).
+    /// Pops a reference operand of a statically-known hierarchy (null â the typed null `Val`).
     pub(super) fn pop_ref(&mut self, kind: RefKind) -> Val {
         let cell = self.pop();
         read_slot(Slot::Ref { offset: 0, kind }, &cell.0)

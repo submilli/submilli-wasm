@@ -1,8 +1,10 @@
 //! Memory instructions: bounds-checked loads/stores plus size/grow/copy/fill, each on an explicit
 //! memory index (#41). `memory.init`/`data.drop` operate on passive data segments.
 
-// `&MemArg` arrives naturally from matching `&Op`; passing it by ref is fine.
-#![allow(clippy::trivially_copy_pass_by_ref)]
+// `&MemArg` arrives naturally from matching `&Op`; passing it by ref is fine. Indexing is into the
+// wasmparser-validated memory/data index space or guarded by a just-checked `checked_range` bound —
+// never unchecked guest input (#33 carve-out).
+#![allow(clippy::trivially_copy_pass_by_ref, clippy::indexing_slicing)]
 
 use super::Execution;
 use crate::extern_::Memory;
@@ -17,7 +19,7 @@ fn oob() -> Error {
     Trap::MemoryOutOfBounds.into()
 }
 
-/// The instance's memory at index `idx` (imported memories first, then defined — the wasm index
+/// The instance's memory at index `idx` (imported memories first, then defined â the wasm index
 /// space). `memory.grow` is serviced separately in the run loop (for the limiter).
 fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Memory {
     inner.instance(instance).memories[idx as usize]
@@ -25,7 +27,7 @@ fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Memory {
 
 impl Execution {
     /// Executes a memory op (loads/stores/size/copy/fill/init/data.drop). `step` routes
-    /// only these ops here (`memory.grow` excepted — see the run loop).
+    /// only these ops here (`memory.grow` excepted â see the run loop).
     #[allow(clippy::too_many_lines)] // flat per-width load/store dispatch
     pub(super) fn exec_memory(
         &mut self,
@@ -34,7 +36,7 @@ impl Execution {
         instance: Instance,
     ) -> Result<()> {
         match op {
-            // `data.drop` needs no memory (a module may carry passive data segments without one —
+            // `data.drop` needs no memory (a module may carry passive data segments without one â
             // common in GC modules using `array.new_data`).
             Op::DataDrop(seg) => inner.instance_mut(instance).dropped_data[*seg as usize] = true,
             Op::I32Load(m) => {
