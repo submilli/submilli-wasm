@@ -111,6 +111,8 @@ fn instantiate_resolve_start(
 #[derive(Copy, Clone, Debug)]
 pub struct Instance {
     pub(crate) index: u32,
+    /// The store this handle was minted by (#34); checked on access to reject cross-store misuse.
+    pub(crate) store: u64,
 }
 
 impl Instance {

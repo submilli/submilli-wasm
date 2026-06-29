@@ -38,3 +38,6 @@ jobs:
 
       - name: File-size guard
         run: ./scripts/check-line-count.sh
+
+      - name: Zero-unsafe guard
+        run: ./scripts/check-no-unsafe.sh

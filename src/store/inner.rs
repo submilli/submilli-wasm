@@ -31,9 +31,18 @@ pub(crate) enum FuelStep {
     Exhausted,
 }
 
+/// Process-unique store id generator. `0` is reserved as the **unchecked** sentinel (funcref *values*
+/// rebuilt from a bare operand-cell index carry it — they are same-store by construction), so ids
+/// start at `1`. See [`StoreInner::check_handle`] (#34).
+static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Non-generic storage for all of a store's runtime entities.
 #[derive(Debug)]
 pub(crate) struct StoreInner {
+    /// Process-unique id stamped onto every handle this store mints (#34). A handle whose `store`
+    /// doesn't match this is from another store — using it here is an embedder bug, caught by
+    /// [`check_handle`](Self::check_handle) rather than silently touching the wrong entity.
+    store_id: u64,
     engine: Engine,
     funcs: Arena<FuncEntity>,
     memories: Arena<MemoryEntity>,
@@ -85,6 +94,7 @@ impl StoreInner {
         let gc = GcHeap::new(engine.is_collecting(), engine.gc_heap_reservation());
         let gc_request = engine.register_gc_request();
         StoreInner {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             engine,
             funcs: Arena::default(),
             memories: Arena::default(),
@@ -190,65 +200,96 @@ impl StoreInner {
         self.engine.current_epoch() >= self.epoch_deadline
     }
 
+    /// This store's process-unique id (#34), stamped onto handles it mints.
+    pub(crate) fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// Guards an entity access against **cross-store handle misuse** (#34): a handle minted by another
+    /// store must not silently resolve to the wrong entity here. The `0` sentinel (an internal,
+    /// same-store-by-construction funcref value rebuilt from a bare cell index) is accepted. A real
+    /// mismatch is an embedder bug — not guest-reachable (a guest can't forge a foreign handle) — so
+    /// it panics, matching wasmtime's "wrong store" behavior.
+    #[inline]
+    fn check_handle(&self, store: u64) {
+        assert!(
+            store == 0 || store == self.store_id,
+            "handle used with the wrong store (cross-store misuse)"
+        );
+    }
+
     pub(crate) fn alloc_func(&mut self, entity: FuncEntity) -> Func {
         Func {
             index: self.funcs.alloc(entity),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn func(&self, handle: Func) -> &FuncEntity {
+        self.check_handle(handle.store);
         self.funcs.get(handle.index)
     }
 
     pub(crate) fn alloc_memory(&mut self, entity: MemoryEntity) -> Memory {
         Memory {
             index: self.memories.alloc(entity),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn memory(&self, handle: Memory) -> &MemoryEntity {
+        self.check_handle(handle.store);
         self.memories.get(handle.index)
     }
 
     pub(crate) fn memory_mut(&mut self, handle: Memory) -> &mut MemoryEntity {
+        self.check_handle(handle.store);
         self.memories.get_mut(handle.index)
     }
 
     pub(crate) fn alloc_table(&mut self, entity: TableEntity) -> Table {
         Table {
             index: self.tables.alloc(entity),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn table(&self, handle: Table) -> &TableEntity {
+        self.check_handle(handle.store);
         self.tables.get(handle.index)
     }
 
     pub(crate) fn table_mut(&mut self, handle: Table) -> &mut TableEntity {
+        self.check_handle(handle.store);
         self.tables.get_mut(handle.index)
     }
 
     pub(crate) fn alloc_global(&mut self, entity: GlobalEntity) -> Global {
         Global {
             index: self.globals.alloc(entity),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn global(&self, handle: Global) -> &GlobalEntity {
+        self.check_handle(handle.store);
         self.globals.get(handle.index)
     }
 
     pub(crate) fn global_mut(&mut self, handle: Global) -> &mut GlobalEntity {
+        self.check_handle(handle.store);
         self.globals.get_mut(handle.index)
     }
 
     pub(crate) fn alloc_tag(&mut self, entity: TagEntity) -> Tag {
         Tag {
             index: self.tags.alloc(entity),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn tag(&self, handle: Tag) -> &TagEntity {
+        self.check_handle(handle.store);
         self.tags.get(handle.index)
     }
 
@@ -262,16 +303,19 @@ impl StoreInner {
     pub(crate) fn reserve_instance(&self) -> Instance {
         Instance {
             index: self.instances.len(),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn alloc_instance(&mut self, entity: InstanceEntity) -> Instance {
         Instance {
             index: self.instances.alloc(entity),
+            store: self.store_id,
         }
     }
 
     pub(crate) fn instance(&self, handle: Instance) -> &InstanceEntity {
+        self.check_handle(handle.store);
         self.instances.get(handle.index)
     }
 
@@ -293,6 +337,7 @@ impl StoreInner {
     }
 
     pub(crate) fn instance_mut(&mut self, handle: Instance) -> &mut InstanceEntity {
+        self.check_handle(handle.store);
         self.instances.get_mut(handle.index)
     }
 }

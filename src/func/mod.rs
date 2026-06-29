@@ -30,12 +30,19 @@ use crate::Result;
 #[derive(Copy, Clone, Debug)]
 pub struct Func {
     pub(crate) index: u32,
+    /// The store this handle was minted by (#34); checked on access to reject cross-store misuse.
+    /// `0` = **unchecked** — a funcref *value* rebuilt from a bare operand-cell index by
+    /// [`from_raw`](Self::from_raw), which is same-store by construction (the cell encoding can't
+    /// carry the store id). The embedder's named `Func` handles (from `Instance::get_func`) are
+    /// minted with a real id and fully checked.
+    pub(crate) store: u64,
 }
 
 impl Func {
-    /// Wraps a raw store-arena index (the funcref handle stored in tables / GC bodies).
+    /// Wraps a raw store-arena index (the funcref handle stored in tables / GC bodies). The handle is
+    /// **unchecked** (`store: 0`) — a funcref value is same-store by construction (#34).
     pub(crate) fn from_raw(index: u32) -> Self {
-        Func { index }
+        Func { index, store: 0 }
     }
 
     /// The raw store-arena index behind this funcref handle.

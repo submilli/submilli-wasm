@@ -57,6 +57,8 @@ impl From<Tag> for Extern {
 #[derive(Copy, Clone, Debug)]
 pub struct Memory {
     pub(crate) index: u32,
+    /// The store this handle was minted by (#34); checked on access to reject cross-store misuse.
+    pub(crate) store: u64,
 }
 
 impl Memory {
@@ -190,6 +192,8 @@ impl std::error::Error for MemoryAccessError {}
 #[derive(Copy, Clone, Debug)]
 pub struct Global {
     pub(crate) index: u32,
+    /// The store this handle was minted by (#34); checked on access to reject cross-store misuse.
+    pub(crate) store: u64,
 }
 
 impl Global {
@@ -226,6 +230,8 @@ impl Global {
 #[derive(Copy, Clone, Debug)]
 pub struct Table {
     pub(crate) index: u32,
+    /// The store this handle was minted by (#34); checked on access to reject cross-store misuse.
+    pub(crate) store: u64,
 }
 
 impl Table {
@@ -313,6 +319,8 @@ impl Table {
 #[derive(Copy, Clone, Debug)]
 pub struct Tag {
     pub(crate) index: u32,
+    /// The store this handle was minted by (#34); checked on access to reject cross-store misuse.
+    pub(crate) store: u64,
 }
 
 impl Tag {
