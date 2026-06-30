@@ -1,0 +1,45 @@
+[package]
+name = "submilli-wasm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+wasm-smith = "0.252"
+submilli-wasm = { path = ".." }
+# Differential reference; pinned to the version the parent crate's compat tests target.
+wasmtime = "=45.0.2"
+
+# Detach from the parent package (which is not a workspace) so cargo treats `fuzz/`
+# as its own workspace root.
+[workspace]
+
+[profile.release]
+debug = 1
+
+# cargo-fuzz binaries (one per target). `test`/`doc`/`bench` off — they are libFuzzer entry points.
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "interpret"
+path = "fuzz_targets/interpret.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "differential"
+path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,58 @@
+name: Fuzz
+
+# cargo-fuzz needs a nightly toolchain + libFuzzer, so it lives in its own workflow (the main `ci.yml`
+# stays on stable). PRs only *build* the targets (fast, catches breakage); a daily schedule actually
+# fuzzes each target for a few minutes and uploads any crashing input. The `fuzz/` crate is a separate
+# workspace, so none of this affects the library build/lints.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 4 * * *" # daily, 04:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build fuzz targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Build all fuzz targets
+        run: cargo fuzz build
+
+  run:
+    name: Fuzz ${{ matrix.target }}
+    # Only actually fuzz on the schedule / manual trigger (not on every PR).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [validate, interpret, differential]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=180 -rss_limit_mb=4096
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
