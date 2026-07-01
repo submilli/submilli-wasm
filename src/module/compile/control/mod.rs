@@ -5,7 +5,7 @@ use wasmparser::{BlockType, BrTable};
 
 use super::{wp_err, Translator};
 use crate::canon::IrHeap;
-use crate::module::op::{BranchTarget, Op};
+use crate::module::op::{BrTableRange, BranchTarget, Op};
 use crate::Result;
 
 mod calls;
@@ -212,24 +212,25 @@ impl Translator<'_> {
     pub(super) fn br_table(&mut self, table: &BrTable<'_>) -> Result<()> {
         self.pop(1); // index
         let cases: Vec<u32> = table.targets().collect::<Result<_, _>>().map_err(wp_err)?;
-        let mut targets = Vec::with_capacity(cases.len());
+        // Append this table's targets (cases then default) contiguously to the side-table; the
+        // `Op` carries only the `{base, len}` range into it.
+        let base = self.br_table_targets.len() as u32;
+        let len = cases.len() as u32;
         let mut patches: Vec<(usize, PatchSlot)> = Vec::new();
         for (k, &depth) in cases.iter().enumerate() {
             let (bt, frame) = self.branch_target(depth);
-            targets.push(bt);
+            self.br_table_targets.push(bt);
             if let Some(i) = frame {
                 patches.push((i, PatchSlot::TableCase(k as u32)));
             }
         }
         let (default, default_frame) = self.branch_target(table.default());
+        self.br_table_targets.push(default);
         if let Some(i) = default_frame {
             patches.push((i, PatchSlot::TableDefault));
         }
         let idx = self.ops.len() as u32;
-        self.emit(Op::BrTable {
-            targets: targets.into_boxed_slice(),
-            default,
-        });
+        self.emit(Op::BrTable(BrTableRange { base, len }));
         for (i, slot) in patches {
             let frame = &mut self.ctrl[i];
             frame.end_patches.push(Patch { op: idx, slot });
@@ -345,6 +346,18 @@ impl Translator<'_> {
     }
 
     fn patch_ip(&mut self, op: u32, slot: PatchSlot, ip: u32) {
+        // `br_table` targets are out-of-line: resolve the flat side-table index, then patch there
+        // (kept separate to avoid aliasing `self.ops` and `self.br_table_targets`).
+        if let Op::BrTable(range) = &self.ops[op as usize] {
+            let range = *range;
+            let flat = match slot {
+                PatchSlot::TableCase(k) => range.base + k,
+                PatchSlot::TableDefault => range.base + range.len,
+                PatchSlot::Single => unreachable!("single slot on br_table"),
+            };
+            self.br_table_targets[flat as usize].ip = ip;
+            return;
+        }
         match &mut self.ops[op as usize] {
             Op::Br(t)
             | Op::BrIf(t)
@@ -355,11 +368,6 @@ impl Translator<'_> {
             | Op::BrOnCastFail { target: t, .. } => {
                 t.ip = ip;
             }
-            Op::BrTable { targets, default } => match slot {
-                PatchSlot::TableCase(k) => targets[k as usize].ip = ip,
-                PatchSlot::TableDefault => default.ip = ip,
-                PatchSlot::Single => unreachable!("single slot on br_table"),
-            },
             _ => unreachable!("patch on non-branch op"),
         }
     }

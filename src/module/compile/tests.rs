@@ -29,6 +29,15 @@ fn ir(tys: &[ValType]) -> Vec<IrVal> {
 /// type section (`sigs`), function-index→type map (`func_types`), and the
 /// compiled function's own type index.
 fn compile_one(wat: &str, sigs: &[Sig<'_>], func_types: &[u32], type_idx: u32) -> Result<Vec<Op>> {
+    Ok(compile_func(wat, sigs, func_types, type_idx)?.ops)
+}
+
+fn compile_func(
+    wat: &str,
+    sigs: &[Sig<'_>],
+    func_types: &[u32],
+    type_idx: u32,
+) -> Result<crate::module::op::CompiledFunc> {
     let _engine = Engine::default();
     let bytes = wat::parse_str(wat).expect("valid wat");
     let types: Vec<ModuleType> = sigs
@@ -58,7 +67,7 @@ fn compile_one(wat: &str, sigs: &[Sig<'_>], func_types: &[u32], type_idx: u32) -
             validator.payload(&payload).map_err(wp_err)?
         {
             let mut fv = to_validate.into_validator(FuncValidatorAllocations::default());
-            return Ok(translate_function(&ctx, type_idx, &body, &mut fv, false)?.ops);
+            return translate_function(&ctx, type_idx, &body, &mut fv, false);
         }
     }
     Err(crate::Error::msg("no function body"))
@@ -161,7 +170,7 @@ fn if_else_targets() {
 #[test]
 fn br_table_uniform_keep() {
     let (sigs, ft) = one((&[ValType::I32], &[ValType::I32]));
-    let ops = compile_one(
+    let func = compile_func(
         "(module (func (param i32) (result i32) \
             (block (result i32) i32.const 7 local.get 0 br_table 0 0)))",
         &sigs,
@@ -169,12 +178,15 @@ fn br_table_uniform_keep() {
         0,
     )
     .unwrap();
-    let last = ops.last().unwrap();
-    let Op::BrTable { targets, default } = last else {
+    let Op::BrTable(range) = func.ops.last().unwrap() else {
         panic!("expected BrTable")
     };
+    // Side-table layout: `len` case targets then the default. Every edge keeps the 1 block result.
+    let end = (range.base + range.len) as usize;
+    let default = &func.br_tables[end];
+    let cases = &func.br_tables[range.base as usize..end];
     assert_eq!(default.keep, 1);
-    assert!(targets.iter().all(|t| t.keep == 1));
+    assert!(cases.iter().all(|t| t.keep == 1));
 }
 
 #[test]

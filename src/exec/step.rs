@@ -79,9 +79,12 @@ impl Execution {
                     return Ok(StepOutcome::Advance(t.ip));
                 }
             }
-            Op::BrTable { targets, default } => {
+            Op::BrTable(range) => {
+                // Targets live out-of-line in `code.br_tables`: `len` cases then the default.
+                let cases = &code.br_tables[range.base as usize..(range.base + range.len) as usize];
+                let default = &code.br_tables[(range.base + range.len) as usize];
                 let i = self.pop_i32() as u32 as usize;
-                let t = targets.get(i).unwrap_or(default);
+                let t = cases.get(i).unwrap_or(default);
                 self.take_branch(t);
                 return Ok(StepOutcome::Advance(t.ip));
             }

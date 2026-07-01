@@ -13,6 +13,17 @@ conclusions. The spike itself was reverted; this doc is the takeaway.
 > `pulldown-cmark` **1.95 → 1.33 ms (1.58×)**; `coremark` **94.8 → 77.6 µs**. The interpreter
 > core and `Op` layout are unchanged, so runtime/cold-start don't regress. Everything below is
 > the original spike write-up.
+>
+> **Update 2 — re-profile + `Op` shrink landed.** After the write-once buffer landed, a re-profile
+> found the bottleneck had **moved off allocation entirely** (`alloc/free/memcpy` 34% → **10%**)
+> and onto **`wasmparser` decode** — the exact same floor wasmi pays. See **§9** for the full
+> decode-bound breakdown. The one surplus lever left that helped: **shrinking `Op` 32 → 24 B and
+> making it non-drop** (side-table `br_table` targets so nothing inline is `Box`ed). Landed on
+> `main`. Measured (interleaved best-of, same methodology): `spidermonkey Module::new`
+> **31.3 → 27.5 ms (1.53× wasmi, from ~1.72×)**; `pulldown-cmark` **1.31 → 1.19 ms**; CoreMark
+> score **194 → 194** (runtime unchanged — smaller hot-loop element, no regression). `Op` teardown
+> (`drop_in_place` over the op stream) went from **5.2% of the profile to ~0** (a `Vec<Op>` now
+> frees in one shot).
 
 ---
 
@@ -129,7 +140,7 @@ Everything after (inline, locals arena, de-`Arc`) sat within measurement noise.
 
 | lever | est. | cost |
 |-------|------|------|
-| **Shrink `Op` 32 → 24 B** (box the rare `BrTable`/`BrOnCast` variants) | ~26 ms | safe; helps runtime too (smaller hot-loop element) |
+| ~~**Shrink `Op` 32 → 24 B**~~ — **LANDED** (§9). *Not* by boxing the fat variants (that would keep it a drop type); instead the only `Box` (`BrTable.targets`) was moved to a per-function side-table, so `Op` became 24 B **and** non-drop at once. Measured 31.3 → 27.5 ms, runtime unchanged. | ~26 ms (est.) → **27.5 ms (actual)** | done; safe; killed the 5% teardown drop too |
 | **In-place / sidetable interpreter** — store *no* op array, keep the wasm bytes + only the branch/handler sidetable, re-decode operators at runtime (Titzer 2022, "A fast in-place interpreter for WebAssembly"; Wizard engine) | **~12 ms — beats wasmi** | new interpreter core; slower execution (re-decode per op). *On-thesis*: trades runtime for startup |
 
 Matching wasmi's 17.4 ms with a pre-decoded array likely needs a **smaller instruction
@@ -226,3 +237,84 @@ entirely our `Op` traffic — which is the conclusion in §5.
 - Going *below* wasmi on startup is possible but needs an architectural change — a smaller
   `Op` encoding, or the **in-place/sidetable** interpreter (store no ops, re-decode at
   runtime), which fits the project's `startup ≫ runtime` thesis but is a new engine core.
+
+---
+
+## 9. Re-profile after write-once landed: the regime is now *decode-bound* (+ `Op` shrink)
+
+Once the **write-once op buffer** landed (Update 1), the profile changed shape enough that the
+old "traffic-bound" conclusion no longer holds. Re-profiled with a dedicated loop harness
+(`examples/prof_module_new.rs`, which hammers `Module::new(spidermonkey)` and can also drive
+wasmi through the identical path), same Instruments/`xctrace` methodology as §6.
+
+### The bottleneck moved off allocation and onto `wasmparser` decode
+
+Self-time buckets, spidermonkey `Module::new`, **both engines profiled the same way**:
+
+| bucket | submilli | wasmi |
+|--------|---------:|------:|
+| `wasmparser` decode (`BinaryReader::visit_operator` alone = 28% / 39%) | **40%** | **55%** |
+| `wasmparser` validate | 11% | 13% |
+| alloc / free / memcpy | **10%** *(was 34%)* | 8% |
+| our `emit` (write `Op`s) | 7% | — *(inlined into its visitor)* |
+| our lowering dispatch | 3% | 0.5% |
+| teardown `drop_in_place` over the op stream | **5%** | 0.1% |
+
+The write-once change did exactly what it should: `alloc/free/memcpy` **34% → 10%**. Both engines
+are now dominated by the *same* function — `wasmparser`'s `visit_operator` decode — which is the
+shared floor the two non-JITs cannot get under with a pre-decoded array.
+
+### Phase-isolation: our decode+validate *floor* already ≈ wasmi's *whole* compile
+
+Stubbing out the lowering delegation (validate + decode only) and re-measuring, interleaved with
+wasmi in one thermal window (best-of):
+
+```
+submilli full            ~31 ms
+submilli decode+validate ~21 ms   ← our irreducible floor
+wasmi   full             ~19 ms   ← decode+validate+translate+build IR
+```
+
+So our **decode+validate alone (~21 ms) already meets wasmi's entire compile (~19 ms)** — both use
+the identical `wasmparser` `FuncValidator`. wasmi just folds its IR translation *into* that pass so
+tightly its total ≈ our validate-only. Our **lowering adds ~11 ms on top** — that is where the gap
+lived. (This corrects §5's read: the surplus was never mainly the *double* Op write — write-once
+already removed that — it is the decode dispatch plus the single 32-byte `Op` write + teardown.)
+
+### The lever taken: `Op` 32 → 24 B and non-drop
+
+`size_of::<Op>()` was **32** and `needs_drop::<Op>()` was **true** — both caused by the *only*
+inline `Box` in the enum, `BrTable { targets: Box<[BranchTarget]>, .. }`. Fix: flatten every
+`br_table`'s targets into a per-function side-table (`CompiledFunc.br_tables: Box<[BranchTarget]>`)
+and shrink the variant to `BrTable(BrTableRange { base, len })`. That `Box` was `Op`'s **only** drop
+field, so removing it makes `Op` **non-drop** outright — no need to `Copy`-derive `Op` or `IrHeap`
+(which would only spread `trivial_copy_pass_by_ref` churn).
+
+The 32 → 24 B shrink comes along for free but is a *separate* story from drop, and worth being
+precise about (measured with `size_of` on synthetic enums): the 24-byte floor is **co-pinned** by
+two things, and removing either alone would *not* get below 24 —
+- the `MemArg` loads/stores: `MemArg` is 16 B (a `u64` offset + `u32` memory) at **align 8**, and
+  the enum discriminant can't hide in its padding across all variants, so it rounds to 24;
+- `BrOnCast`/`BrOnCastFail`: their `IrHeap` (8) + `bool` (1) + `BranchTarget` (12) = 21 B payload
+  rounds to 24 on its own.
+The old inline `BrTable` (28 B: `Box` 16 + `BranchTarget` 12) was what forced **32**; with it gone,
+these two co-binding variants set the new 24-B ceiling. Going to 16 B would require side-tabling
+`MemArg`'s `u64` offset (touches every load/store) **and** the cast variants' target — not just one.
+
+Result (interleaved A/B/wasmi best-of, one thermal window; CoreMark from `bench_table`):
+
+| metric | before | after |
+|--------|-------:|------:|
+| spidermonkey `Module::new` | ~31.3 ms | **~27.5 ms** (1.72× → **1.53×** wasmi) |
+| pulldown-cmark `Module::new` | 1.31 ms | **1.19 ms** |
+| `Op` teardown (`drop_in_place`) | 5.2% of profile | **~0** (single `free`) |
+| CoreMark execution score | 194 | **194** (runtime unchanged) |
+
+### What's left
+
+The remaining ~1.5× is now **almost entirely the shared `wasmparser` decode floor plus our
+out-of-line per-op lowering** — not allocation, not `Op` traffic. Shaving it further means either a
+still-smaller instruction encoding (16 B needs *both* co-binding variants fixed — side-table
+`MemArg`'s `u64` offset, which touches every load/store, **and** the `BrOnCast`/`BrOnCastFail`
+target) or the architectural **in-place/sidetable** interpreter from §5's table (store no op array,
+re-decode at runtime — beats wasmi on startup, at a runtime cost; on-thesis).

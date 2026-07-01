@@ -1,5 +1,6 @@
 //! `Module` — parse + validate + compile a wasm binary to internal bytecode.
 
+pub(crate) mod code;
 pub(crate) mod compile;
 pub(crate) mod const_expr;
 pub(crate) mod debug;

@@ -38,11 +38,11 @@ absolutes. Lower = faster, except the CoreMark score (higher = faster).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark          53.25 us  748.58 us   36.33 us
-Module::new  pulldown-cmark     1.31 ms   22.76 ms  840.67 us
-Module::new  spidermonkey      29.55 ms  229.79 ms   18.04 ms
+Module::new  coremark          52.10 us  748.58 us   36.33 us
+Module::new  pulldown-cmark     1.19 ms   22.30 ms  818.08 us
+Module::new  spidermonkey      25.61 ms  188.22 ms   17.46 ms
 Store::new                         0 ns     125 ns       0 ns
-Cold start   coremark          63.38 us  777.50 us   36.42 us
+Cold start   coremark          62.00 us  777.50 us   36.42 us
 -------------------------------------------------------------
 CoreMark score (higher=fast)        194      38238       3160
 ```
@@ -54,8 +54,10 @@ trade this project makes on purpose. Note wasmtime here runs Cranelift with
 barely moves versus the optimized build — the JIT's compile cost dominates
 regardless of opt level, which is the whole point. wasmi (also non-JIT) still
 compiles a bit faster and executes faster, but on large modules the `Module::new`
-gap is down to **~1.6×** (from ~2.4×) after fusing validation into lowering and
-writing the op buffer once — see `PERF-NOTES.md`.
+gap is down to **~1.5×** (from ~2.4×) after fusing validation into lowering,
+writing the op buffer once, and shrinking `Op` to a 24-byte non-drop encoding —
+see `PERF-NOTES.md`. The remaining gap is now essentially the shared `wasmparser`
+decode floor both engines pay.
 
 ## Methodology & fairness
 

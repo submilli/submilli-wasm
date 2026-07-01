@@ -24,7 +24,7 @@ use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, ValidatorResour
 
 use crate::canon::{AggKind, IrVal, ModuleType};
 use crate::module::handler::HandlerSpan;
-use crate::module::op::{CompiledFunc, Op};
+use crate::module::op::{BranchTarget, CompiledFunc, Op};
 use crate::{Error, Result};
 
 use self::control::CtrlFrame;
@@ -103,6 +103,7 @@ pub(crate) fn translate_function(
         local_types: local_types.into_boxed_slice(),
         max_operands: t.max_operands,
         handlers: t.handlers.into_boxed_slice(),
+        br_tables: t.br_table_targets.into_boxed_slice(),
         offsets: t.offsets.map(Vec::into_boxed_slice),
     })
 }
@@ -115,6 +116,9 @@ struct Translator<'a> {
     ctrl: Vec<CtrlFrame>,
     reachable: bool,
     handlers: Vec<HandlerSpan>,
+    /// Flattened `br_table` target lists, accumulated across the body; moved into
+    /// [`CompiledFunc::br_tables`]. `Op::BrTable` carries only a `{base, len}` range into this.
+    br_table_targets: Vec<BranchTarget>,
     /// Byte offset of the operator currently being translated; recorded per emitted `Op` into
     /// `offsets` (when present) so a frame's `ip` can be mapped back to source via DWARF (#29a).
     cur_offset: u32,
@@ -132,6 +136,7 @@ impl<'a> Translator<'a> {
             ctrl: Vec::new(),
             reachable: true,
             handlers: Vec::new(),
+            br_table_targets: Vec::new(),
             cur_offset: 0,
             offsets: retain_offsets.then(|| Vec::with_capacity(op_hint)),
         }

@@ -5,7 +5,7 @@
 //! carry their resolved target plus the operand-stack fixup inline (the folded
 //! sidetable, see ARCHITECTURE §5).
 
-use crate::canon::{IrHeap, IrVal};
+use crate::canon::IrHeap;
 
 pub(crate) type TypeIdx = u32;
 pub(crate) type FuncIdx = u32;
@@ -31,7 +31,21 @@ pub(crate) struct BranchTarget {
     pub pop: u32,
 }
 
-/// One internal instruction.
+/// A `br_table`'s target list, stored out-of-line in [`CompiledFunc::br_tables`]: the `len` case
+/// targets occupy `[base .. base + len]` and the default sits at `base + len`. Keeping the targets
+/// out of the `Op` enum is what makes `Op` non-drop (the `Box` here was its only drop field) — so a
+/// `Vec<Op>` frees in one shot. (Size is separately pinned at 24 bytes by the `MemArg` loads/stores
+/// and the `BrOnCast`/`BrOnCastFail` variants, not by this.)
+#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BrTableRange {
+    pub base: u32,
+    pub len: u32,
+}
+
+/// One internal instruction. 24 bytes and **not** a drop type (`br_table` targets are side-tabled,
+/// so nothing inline is `Box`ed): a `Vec<Op>` frees in one shot at teardown instead of a
+/// discriminant-checked drop walk over every op, and the smaller payload cuts compile-time write
+/// traffic (each `Op` is written once at compile and read by-reference in the hot loop).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Op {
     // --- control ---
@@ -41,10 +55,8 @@ pub(crate) enum Op {
     BrIf(BranchTarget),
     /// Branch when the popped i32 condition is zero (used to lower `if`).
     BrIfNot(BranchTarget),
-    BrTable {
-        targets: Box<[BranchTarget]>,
-        default: BranchTarget,
-    },
+    /// Targets live in [`CompiledFunc::br_tables`]; see [`BrTableRange`].
+    BrTable(BrTableRange),
     Call(FuncIdx),
     CallIndirect {
         type_idx: TypeIdx,
@@ -378,23 +390,6 @@ pub(crate) enum Op {
     Simd(super::op_simd::SimdOp),
 }
 
-/// A function compiled to internal bytecode.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct CompiledFunc {
-    /// Lowered instruction stream — a pre-sized `Vec` moved straight in (each `Op` written once).
-    pub ops: Vec<Op>,
-    /// Index into the module's type section (gives param/result types).
-    pub type_idx: TypeIdx,
-    /// Number of parameters (cached from the function type).
-    pub n_params: u32,
-    /// Number of results (cached from the function type; used on return).
-    pub n_results: u32,
-    /// Declared local types (params excluded); default-zero the frame's locals at call time.
-    pub local_types: Box<[IrVal]>,
-    /// Peak operand-stack depth above the locals (for stack pre-reservation).
-    pub max_operands: u32,
-    /// Exception-handler table (one entry per `try_table`; #28d). Consulted only on throw.
-    pub handlers: Box<[crate::module::handler::HandlerSpan]>,
-    /// Per-`Op` source wasm byte offset for backtraces (#29a); `None` without debug retention.
-    pub offsets: Option<Box<[u32]>>,
-}
+/// The compiled-function record lives in [`super::code`]; re-exported here so the long-standing
+/// `module::op::CompiledFunc` path keeps resolving.
+pub(crate) use super::code::CompiledFunc;
