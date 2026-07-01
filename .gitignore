@@ -1,1 +1,6 @@
 /target
+
+# Large lifecycle-benchmark fixtures (5.6 MB); fetched by scripts/fetch-bench-wasm.sh.
+# The tiny coremark-minimal.wasm stays committed.
+/benches/wasm/spidermonkey.wasm
+/benches/wasm/pulldown-cmark.wasm

@@ -31,6 +31,14 @@ wast = "252"
 wat = "1"
 wasmtime = "=45.0.2"
 pollster = "0.3"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+wasmi = "=2.0.0-beta.4"
+
+# Cross-engine lifecycle benchmark (Store/Module::new/instantiate/execution vs
+# wasmtime + wasmi). See benches/support.rs; summary table: examples/bench_table.rs.
+[[bench]]
+name = "lifecycle"
+harness = false
 
 [lints.rust]
 unsafe_code = "warn"
