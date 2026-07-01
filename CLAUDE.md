@@ -33,7 +33,7 @@ Feature target: MVP + mutable-globals + sign-extension-ops + multi-value + refer
 
 ## Security (untrusted multi-tenant guests — non-negotiable)
 The interpreter runs untrusted, mutually-distrusting guest code. Treat every wasm-reachable
-path as adversarial. See `docs/PLAN.md` Phase 8 and (when it exists) `docs/SECURITY.md`.
+path as adversarial. See `SECURITY.md` (threat model) and `docs/PLAN.md` Phase 8.
 - **Zero-on-allocation.** Every guest-visible allocation MUST be fully initialized before the
   guest can read it — linear memory, tables, locals, GC objects. A guest must never observe a
   prior tenant's freed memory or the allocator's stale bytes. Use `vec![0; n]` / `resize(.., v)`

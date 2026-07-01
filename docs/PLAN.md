@@ -218,14 +218,14 @@ Several primitives are *designed* in earlier phases — the limiter (Phase 2), f
 
 *Verification:*
 - **Fuzzing** (`cargo-fuzz`): (a) validator/compiler — arbitrary bytes never panic, only `Err`; (b) interpreter — `wasm-smith`-generated valid modules never panic/UB/hang, only trap/return; (c) **differential** against `wasmtime`/`wasmi` on the generated corpus.
-- **Threat model** (`docs/SECURITY.md`): the trust boundary (guest = untrusted; host fns + embedder = trusted), what we guarantee (spatial isolation, bounded resources, panic-freedom on validated input, **zero-on-allocation so no cross-tenant memory is ever readable**), what we explicitly **don't** (timing/Spectre side channels — an interpreter is far less exposed than a JIT but is *not* formally isolated; non-deterministic `externref`/GC `Drop` timing), and the **required embedder configuration** for multi-tenant (limits + fuel/epoch + per-tenant store/linker + capability-scoped imports).
+- **Threat model** (`SECURITY.md`, repo root): the trust boundary (guest = untrusted; host fns + embedder = trusted), what we guarantee (spatial isolation, bounded resources, panic-freedom on validated input, **zero-on-allocation so no cross-tenant memory is ever readable**), what we explicitly **don't** (timing/Spectre side channels — an interpreter is far less exposed than a JIT but is *not* formally isolated; non-deterministic `externref`/GC `Drop` timing), and the **required embedder configuration** for multi-tenant (limits + fuel/epoch + per-tenant store/linker + capability-scoped imports).
 
 **Done when:**
 - Fuzzers run clean in CI: no panic/OOM/hang on arbitrary bytes (validator) or on `wasm-smith` modules (interpreter); differential parity with `wasmtime` on the generated corpus.
 - A guest that recurses unboundedly traps `StackOverflow`; one that grows/allocates past limits is denied or traps per the limiter; one that loops forever is interrupted by fuel/epoch.
 - A cross-store handle misuse errors/traps — never UB.
 - Zero-on-allocation verified: a fuzz/regression test writes a pattern into one store's memory/table, drops it, and confirms a fresh store (and `memory.grow` n pages) reads only zeros — including under any pooling allocator added for startup speed.
-- `docs/SECURITY.md` is published; the no-`unsafe` and type-index audits are CI-gated.
+- `SECURITY.md` (repo root) is published; the no-`unsafe` and type-index audits are CI-gated.
 
 **Risks:** the panic-safety audit is broad — lean on clippy gates + fuzzing as the real enforcement, not manual review alone. Fuel/epoch charge points must cover every back-edge or a tight loop escapes interruption. Don't regress startup speed with over-aggressive validation limits — make them configurable with safe defaults.
 

@@ -168,7 +168,7 @@ impl MemoryEntity {
     /// before the guest can read them — a guest must never observe a prior tenant's freed bytes or
     /// allocator residue. Uninitialized fast-paths (`set_len`/`MaybeUninit`/`with_capacity`-then-expose)
     /// are forbidden and already blocked by the crate's zero-`unsafe` invariant. The same holds for
-    /// `grow` below and `TableEntity::new`/`grow`. See `docs/SECURITY.md` (#36) for the full statement.
+    /// `grow` below and `TableEntity::new`/`grow`. See `SECURITY.md` (#36) for the full statement.
     pub(crate) fn new(ty: MemoryType) -> Result<Self> {
         let len = (ty.minimum() as usize)
             .checked_mul(PAGE_SIZE)
