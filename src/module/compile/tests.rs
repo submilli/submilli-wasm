@@ -67,7 +67,8 @@ fn compile_func(
             validator.payload(&payload).map_err(wp_err)?
         {
             let mut fv = to_validate.into_validator(FuncValidatorAllocations::default());
-            return translate_function(&ctx, type_idx, &body, &mut fv, false);
+            let mut scratch = super::Scratch::default();
+            return translate_function(&ctx, type_idx, &body, &mut fv, false, &mut scratch);
         }
     }
     Err(crate::Error::msg("no function body"))

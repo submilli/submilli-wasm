@@ -355,6 +355,8 @@ fn compile_bodies(
     };
     // Recycled across bodies so per-function validation reuses one scratch arena.
     let mut allocs = wasmparser::FuncValidatorAllocations::default();
+    // Recycled across bodies so per-function `ctrl`/`local_types` reuse one allocation.
+    let mut scratch = super::compile::Scratch::default();
     let mut out = Vec::with_capacity(bodies.len());
     for (i, (to_validate, body)) in funcs.into_iter().zip(bodies).enumerate() {
         let type_idx = m.func_types[m.num_imported_funcs as usize + i];
@@ -365,6 +367,7 @@ fn compile_bodies(
             body,
             &mut validator,
             retain_offsets,
+            &mut scratch,
         )?));
         allocs = validator.into_allocations();
     }

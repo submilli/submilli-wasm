@@ -54,7 +54,15 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         let payload = payload.unwrap();
         if let ValidPayload::Func(to_validate, body) = validator.payload(&payload).unwrap() {
             let mut fv = to_validate.into_validator(FuncValidatorAllocations::default());
-            code = Some(translate_function(&ctx, 0, &body, &mut fv, false)?);
+            let mut scratch = crate::module::compile::Scratch::default();
+            code = Some(translate_function(
+                &ctx,
+                0,
+                &body,
+                &mut fv,
+                false,
+                &mut scratch,
+            )?);
         }
     }
     let mut store = Store::new(&engine, ());

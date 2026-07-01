@@ -310,11 +310,28 @@ Result (interleaved A/B/wasmi best-of, one thermal window; CoreMark from `bench_
 | `Op` teardown (`drop_in_place`) | 5.2% of profile | **~0** (single `free`) |
 | CoreMark execution score | 194 | **194** (runtime unchanged) |
 
+### Two follow-up experiments (one flat, one a small win)
+
+Because the profile is **memory-stall-bound**, self-time % is *not* wall-clock — CPU work in the
+decode's stall shadow is free. Two things the profiler flagged, tested against wall-clock:
+
+- **`Op` 24 → 16 B** (side-table `MemArg`'s `u64` offset + the `BrOnCast` target): **flat** on
+  *both* compile *and* CoreMark. The `Op` write is stall-hidden, so less write traffic buys nothing;
+  a smaller hot-loop element didn't move CoreMark either. (This also retroactively shows the earlier
+  32 → 24 win was the **non-drop** change, not the size.) Not worth the churn.
+- **Recycle `local_types` + `ctrl` across bodies** (one `Scratch` reused for the whole module,
+  cleared per function, instead of fresh `Vec::new()` each time — mirrors wasmi's recycled
+  translator allocations): **~0.7–1.5 ms real** (spidermonkey ~27.1 → ~26.4 ms). Unlike the `Op`
+  write, `Vec` *regrowth* (`grow_amortized`/`realloc`, ~4.5% of the profile) is **not** fully
+  stall-hidden — killing it (inclusive `push_mut` 7.9% → 2.0%) shaved a measurable slice. Landed.
+
 ### What's left
 
-The remaining ~1.5× is now **almost entirely the shared `wasmparser` decode floor plus our
-out-of-line per-op lowering** — not allocation, not `Op` traffic. Shaving it further means either a
-still-smaller instruction encoding (16 B needs *both* co-binding variants fixed — side-table
-`MemArg`'s `u64` offset, which touches every load/store, **and** the `BrOnCast`/`BrOnCastFail`
-target) or the architectural **in-place/sidetable** interpreter from §5's table (store no op array,
-re-decode at runtime — beats wasmi on startup, at a runtime cost; on-thesis).
+The remaining ~1.45× is now **almost entirely the shared `wasmparser` decode floor plus the
+`visit_operator::<ValidateThenLower>` monomorphization** — our fused visitor decodes ~8 ms slower
+than wasmi's leaner `visit_operator::<FuncTranslator>` on identical, feature-neutral decode (matching
+wasmi's proposal set changed nothing). Un-fusing to materialize+match is *worse* (that was the old
+45 ms path). Closing it means slimming our ~500 lowering methods so `visit_operator` compiles as
+tight as wasmi's — speculative; confirm the mechanism in disassembly first. The other known lever is
+the architectural **in-place/sidetable** interpreter from §5 (store no op array, re-decode at
+runtime — beats wasmi on startup, at a runtime cost; on-thesis).

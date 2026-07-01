@@ -47,6 +47,15 @@ fn wp_err(e: BinaryReaderError) -> Error {
     Error::msg(e.to_string())
 }
 
+/// Reusable per-function translation buffers, recycled across every body in a module compile so a
+/// function's `ctrl`/`local_types` reuse the prior function's capacity instead of allocating (and
+/// regrowing from empty) each time — mirrors how wasmi recycles its translator allocations.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    ctrl: Vec<CtrlFrame>,
+    local_types: Vec<IrVal>,
+}
+
 /// Validates and translates a single function body into a [`CompiledFunc`] in one pass: each
 /// operator is validated (via `fv`) and lowered to internal bytecode as it is decoded, so the
 /// body's bytes are read exactly once. Module-level validation has already run in `parse_module`.
@@ -56,6 +65,7 @@ pub(crate) fn translate_function(
     body: &FunctionBody<'_>,
     fv: &mut FuncValidator<ValidatorResources>,
     retain_offsets: bool,
+    scratch: &mut Scratch,
 ) -> Result<CompiledFunc> {
     let (params, results) = ctx.types[type_idx as usize].func_sig();
     let n_params = params.len() as u32;
@@ -66,21 +76,27 @@ pub(crate) fn translate_function(
     // is negligible (the operator body, which dominates, is still walked exactly once below).
     fv.read_locals(&mut body.get_binary_reader())
         .map_err(wp_err)?;
-    let mut local_types: Vec<IrVal> = Vec::new();
+    scratch.local_types.clear();
     for entry in body.get_locals_reader().map_err(wp_err)? {
         let (count, ty) = entry.map_err(wp_err)?;
         let vt = conv_valtype(ctx.kinds, ty)?;
         for _ in 0..count {
-            local_types.push(vt.clone());
+            scratch.local_types.push(vt.clone());
         }
     }
+    let local_types: Box<[IrVal]> = scratch.local_types.as_slice().into();
 
     // Pre-size the op buffer from the body byte length so each `Op` is written exactly once (no
     // regrowth copies). Op count is always < body bytes (every op is ≥1 byte), so this never
     // under-reserves for real code; a modest over-reserve is freed when the `Vec` moves into the
-    // `CompiledFunc`.
+    // `CompiledFunc`. `ctrl` is handed the recycled buffer (empty, capacity preserved).
     let op_hint = body.range().len();
-    let mut t = Translator::with_capacity(ctx, retain_offsets, op_hint);
+    let mut t = Translator::with_capacity(
+        ctx,
+        retain_offsets,
+        op_hint,
+        std::mem::take(&mut scratch.ctrl),
+    );
     t.push_func_frame(n_results);
     let mut reader = body.get_operators_reader().map_err(wp_err)?;
     let mut vl = ValidateThenLower {
@@ -95,12 +111,14 @@ pub(crate) fn translate_function(
     }
     reader.finish().map_err(wp_err)?;
 
+    // Return the (now-empty) `ctrl` buffer to the scratch so the next body reuses its capacity.
+    scratch.ctrl = std::mem::take(&mut t.ctrl);
     Ok(CompiledFunc {
         ops: t.ops,
         type_idx,
         n_params,
         n_results,
-        local_types: local_types.into_boxed_slice(),
+        local_types,
         max_operands: t.max_operands,
         handlers: t.handlers.into_boxed_slice(),
         br_tables: t.br_table_targets.into_boxed_slice(),
@@ -127,13 +145,18 @@ struct Translator<'a> {
 }
 
 impl<'a> Translator<'a> {
-    fn with_capacity(ctx: &'a CompileCtx<'a>, retain_offsets: bool, op_hint: usize) -> Self {
+    fn with_capacity(
+        ctx: &'a CompileCtx<'a>,
+        retain_offsets: bool,
+        op_hint: usize,
+        ctrl: Vec<CtrlFrame>,
+    ) -> Self {
         Translator {
             ctx,
             ops: Vec::with_capacity(op_hint),
             height: 0,
             max_operands: 0,
-            ctrl: Vec::new(),
+            ctrl,
             reachable: true,
             handlers: Vec::new(),
             br_table_targets: Vec::new(),
