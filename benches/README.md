@@ -38,31 +38,38 @@ absolutes. Lower = faster, except the CoreMark score (higher = faster).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark         172.17 us  891.04 us   30.83 us
-Module::new  pulldown-cmark     1.28 ms   23.20 ms  792.12 us
-Module::new  spidermonkey      28.19 ms  226.44 ms   17.62 ms
+Module::new  coremark          53.25 us  748.58 us   36.33 us
+Module::new  pulldown-cmark     1.31 ms   22.76 ms  840.67 us
+Module::new  spidermonkey      29.55 ms  229.79 ms   18.04 ms
 Store::new                         0 ns     125 ns       0 ns
-Cold start   coremark          56.04 us  799.58 us   32.67 us
+Cold start   coremark          63.38 us  777.50 us   36.42 us
 -------------------------------------------------------------
-CoreMark score (higher=fast)        193      40667       3138
+CoreMark score (higher=fast)        194      38238       3160
 ```
 
-The story: submilli's `Module::new`/cold-start beats wasmtime **~5–18×** (it
+The story: submilli's `Module::new`/cold-start beats wasmtime **~5–17×** (it
 skips the Cranelift JIT), while wasmtime wins execution **~200×** — exactly the
-trade this project makes on purpose. wasmi (also non-JIT) still compiles a bit
-faster and executes faster, but on large modules the `Module::new` gap is down
-to **~1.6×** (from ~2.4×) after fusing validation into lowering and writing the
-op buffer once — see `PERF-NOTES.md`.
+trade this project makes on purpose. Note wasmtime here runs Cranelift with
+**optimization disabled** (`OptLevel::None`, see below), yet its `Module::new`
+barely moves versus the optimized build — the JIT's compile cost dominates
+regardless of opt level, which is the whole point. wasmi (also non-JIT) still
+compiles a bit faster and executes faster, but on large modules the `Module::new`
+gap is down to **~1.6×** (from ~2.4×) after fusing validation into lowering and
+writing the op buffer once — see `PERF-NOTES.md`.
 
 ## Methodology & fairness
 
 - **Engine is setup, not a measured phase.** The `Engine` is the long-lived,
   shared object (config + compiled-code cache); it's built once and reused, so
   it's excluded from every timed phase — matching how embedders actually use it.
-- **wasmtime runs its default config** (Cranelift, optimized). That's the real
-  drop-in comparison. wasmtime 45 also ships a baseline compiler (Winch) and an
-  interpreter (Pulley) that trade compile time for execution speed; we don't use
-  them, to keep "what you get out of the box" honest.
+- **wasmtime runs Cranelift with optimization disabled** (`OptLevel::None`, set
+  in `support.rs`). Since optimization is exactly the compile-time cost this
+  project skips, disabling it is the *fairest* floor for a startup comparison —
+  yet wasmtime's `Module::new` barely changes from the optimized default (the
+  register allocation / lowering / encoding that dominate a JIT run at every opt
+  level), so it stays ~5–17× slower to start. wasmtime 45 also ships a baseline
+  compiler (Winch) and an interpreter (Pulley) that trade compile time for
+  execution speed; we don't use them, to keep the default `Engine` honest.
 - **Module size matters.** Compile cost scales with module size but execution
   doesn't, so we run a tiny module (`coremark`, 7.6 KiB) and two large real ones
   (`pulldown-cmark` 1.6 MiB, `spidermonkey` 4.0 MiB). The small-module cold start

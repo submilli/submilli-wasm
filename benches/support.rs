@@ -38,7 +38,7 @@ pub fn now_ms() -> i64 {
 /// and wasmi diverge (`instantiate` vs `instantiate_and_start`, `&store` vs
 /// `&mut store` on typed-func lookup).
 macro_rules! engine_ops {
-    ($name:ident, $krate:ident, $instantiate:ident, $typed_store:tt) => {
+    ($name:ident, $krate:ident, $instantiate:ident, $typed_store:tt, $engine:expr) => {
         pub mod $name {
             use $krate as w;
             pub type Engine = w::Engine;
@@ -48,7 +48,7 @@ macro_rules! engine_ops {
             pub type Instance = w::Instance;
 
             pub fn engine() -> Engine {
-                w::Engine::default()
+                $engine
             }
             pub fn compile(e: &Engine, bytes: &[u8]) -> Module {
                 w::Module::new(e, bytes).unwrap()
@@ -79,7 +79,25 @@ macro_rules! engine_ops {
 }
 
 // wasmtime-compatible API: `Linker::instantiate`, typed-func lookup takes `&mut`.
-engine_ops!(submilli, submilli_wasm, instantiate, mut);
-engine_ops!(wt, wasmtime, instantiate, mut);
+engine_ops!(
+    submilli,
+    submilli_wasm,
+    instantiate,
+    mut,
+    submilli_wasm::Engine::default()
+);
+// wasmtime runs Cranelift with **no optimization** (`OptLevel::None`) — the fair floor for a
+// startup comparison, since optimization is exactly the compile-time cost this project skips.
+engine_ops!(wt, wasmtime, instantiate, mut, {
+    let mut c = wasmtime::Config::new();
+    c.cranelift_opt_level(wasmtime::OptLevel::None);
+    wasmtime::Engine::new(&c).unwrap()
+});
 // wasmi: folds `start` into instantiation; typed-func lookup takes `&store`.
-engine_ops!(wi, wasmi, instantiate_and_start, shared);
+engine_ops!(
+    wi,
+    wasmi,
+    instantiate_and_start,
+    shared,
+    wasmi::Engine::default()
+);
