@@ -2,9 +2,17 @@
 
 A record of a spike into `submilli-wasm`'s compile/startup speed: the goal, every
 optimization tried and its measured result, and the profiling methodology behind the
-conclusions. **The code changes from this spike were reverted** — only the benchmark
-harness (`benches/`, `examples/bench_table.rs`, `scripts/fetch-bench-wasm.sh`) was kept.
-This doc is the takeaway.
+conclusions. The spike itself was reverted; this doc is the takeaway.
+
+> **Update — landed.** The two levers that mattered (**fused validation** #1 and **inline
+> lowering** #3) plus the **write-once op buffer** were subsequently implemented on `main`
+> (a `wasmparser::VisitOperator`-driven single pass in `src/module/compile/{visit,visit_simd,
+> core,numeric,memory,table,ref_,gc}.rs` + `control/visit.rs`; `CompiledFunc.ops` pre-sized
+> `Vec<Op>`, no `into_boxed_slice`). Measured result, same methodology:
+> `spidermonkey Module::new` **~45 → 31.9 ms (1.73× wasmi, from ~2.4×)**;
+> `pulldown-cmark` **1.95 → 1.33 ms (1.58×)**; `coremark` **94.8 → 77.6 µs**. The interpreter
+> core and `Op` layout are unchanged, so runtime/cold-start don't regress. Everything below is
+> the original spike write-up.
 
 ---
 

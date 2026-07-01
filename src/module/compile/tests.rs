@@ -28,12 +28,7 @@ fn ir(tys: &[ValType]) -> Vec<IrVal> {
 /// Validates `wat`, then translates its first function body using the given
 /// type section (`sigs`), function-index→type map (`func_types`), and the
 /// compiled function's own type index.
-fn compile_one(
-    wat: &str,
-    sigs: &[Sig<'_>],
-    func_types: &[u32],
-    type_idx: u32,
-) -> Result<Box<[Op]>> {
+fn compile_one(wat: &str, sigs: &[Sig<'_>], func_types: &[u32], type_idx: u32) -> Result<Vec<Op>> {
     let _engine = Engine::default();
     let bytes = wat::parse_str(wat).expect("valid wat");
     let types: Vec<ModuleType> = sigs
@@ -84,7 +79,7 @@ fn straight_line_add() {
     )
     .unwrap();
     assert!(matches!(
-        ops.as_ref(),
+        ops.as_slice(),
         [Op::LocalGet(0), Op::LocalGet(1), Op::I32Add]
     ));
 }
@@ -100,7 +95,7 @@ fn memory_load_store() {
     )
     .unwrap();
     assert!(matches!(
-        ops.as_ref(),
+        ops.as_slice(),
         [Op::I32Const(0), Op::LocalGet(0), Op::I32Store(_)]
     ));
 }
@@ -194,7 +189,7 @@ fn call_stack_effect() {
     )
     .unwrap();
     assert!(matches!(
-        ops.as_ref(),
+        ops.as_slice(),
         [Op::LocalGet(0), Op::LocalGet(1), Op::Call(1)]
     ));
 }

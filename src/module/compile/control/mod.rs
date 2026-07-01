@@ -10,6 +10,7 @@ use crate::Result;
 
 mod calls;
 mod try_table;
+mod visit;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum BlockKind {

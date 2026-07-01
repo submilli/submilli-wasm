@@ -38,19 +38,21 @@ absolutes. Lower = faster, except the CoreMark score (higher = faster).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark         226.50 us  855.00 us   31.42 us
-Module::new  pulldown-cmark     1.89 ms   23.57 ms  808.88 us
-Module::new  spidermonkey      42.90 ms  216.29 ms   18.03 ms
-Store::new                         ~0 ns      ~0 ns      ~0 ns
-Cold start   coremark          86.71 us  869.04 us   35.38 us
+Module::new  coremark         172.17 us  891.04 us   30.83 us
+Module::new  pulldown-cmark     1.28 ms   23.20 ms  792.12 us
+Module::new  spidermonkey      28.19 ms  226.44 ms   17.62 ms
+Store::new                         0 ns     125 ns       0 ns
+Cold start   coremark          56.04 us  799.58 us   32.67 us
 -------------------------------------------------------------
-CoreMark score (higher=fast)        197      40401       3184
+CoreMark score (higher=fast)        193      40667       3138
 ```
 
-The story: submilli's `Module::new`/cold-start beats wasmtime **~5–9×** (it
+The story: submilli's `Module::new`/cold-start beats wasmtime **~5–18×** (it
 skips the Cranelift JIT), while wasmtime wins execution **~200×** — exactly the
-trade this project makes on purpose. wasmi (also non-JIT) compiles faster than
-us today and executes faster; closing the compile gap is a fair target.
+trade this project makes on purpose. wasmi (also non-JIT) still compiles a bit
+faster and executes faster, but on large modules the `Module::new` gap is down
+to **~1.6×** (from ~2.4×) after fusing validation into lowering and writing the
+op buffer once — see `PERF-NOTES.md`.
 
 ## Methodology & fairness
 

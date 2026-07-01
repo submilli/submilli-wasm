@@ -381,8 +381,8 @@ pub(crate) enum Op {
 /// A function compiled to internal bytecode.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompiledFunc {
-    /// The lowered instruction stream.
-    pub ops: Box<[Op]>,
+    /// Lowered instruction stream — a pre-sized `Vec` moved straight in (each `Op` written once).
+    pub ops: Vec<Op>,
     /// Index into the module's type section (gives param/result types).
     pub type_idx: TypeIdx,
     /// Number of parameters (cached from the function type).
