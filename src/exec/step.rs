@@ -73,18 +73,18 @@ impl Execution {
                 inner.global_mut(handle).value = v;
             }
             Op::Br(t) => {
-                self.take_branch(t);
+                self.take_branch(*t);
                 return Ok(StepOutcome::Advance(t.ip));
             }
             Op::BrIf(t) => {
                 if self.pop_i32() != 0 {
-                    self.take_branch(t);
+                    self.take_branch(*t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
             }
             Op::BrIfNot(t) => {
                 if self.pop_i32() == 0 {
-                    self.take_branch(t);
+                    self.take_branch(*t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
             }
@@ -101,7 +101,7 @@ impl Execution {
                 self.values.truncate(n - 2);
                 self.shadow.truncate(n - 2);
                 if cmp_i32(*kind, a, b) != *negate {
-                    self.take_branch(target);
+                    self.take_branch(*target);
                     return Ok(StepOutcome::Advance(target.ip));
                 }
             }
@@ -111,7 +111,7 @@ impl Execution {
                 let default = &code.br_tables[(range.base + range.len) as usize];
                 let i = self.pop_i32() as u32 as usize;
                 let t = cases.get(i).unwrap_or(default);
-                self.take_branch(t);
+                self.take_branch(*t);
                 return Ok(StepOutcome::Advance(t.ip));
             }
             call_op @ (Op::Call(f) | Op::ReturnCall(f)) => {
@@ -141,7 +141,7 @@ impl Execution {
             Op::BrOnNull(t) => {
                 let (r, tag) = self.pop_tagged();
                 if r.is_null() {
-                    self.take_branch(t);
+                    self.take_branch(*t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
                 self.push_cell(r, tag); // non-null: keep it, fall through
@@ -150,7 +150,7 @@ impl Execution {
                 let (r, tag) = self.pop_tagged();
                 if !r.is_null() {
                     self.push_cell(r, tag); // non-null: keep it on the branch target
-                    self.take_branch(t);
+                    self.take_branch(*t);
                     return Ok(StepOutcome::Advance(t.ip));
                 }
                 // null: reference dropped, fall through
@@ -208,7 +208,7 @@ impl Execution {
             | Op::MemoryFill(_)
             | Op::MemoryInit(..)
             | Op::DataDrop(_)) => {
-                self.exec_memory(inner, op, instance)?;
+                self.exec_memory(inner, code, op, instance)?;
             }
             op @ (Op::RefNull(_) | Op::RefFunc(_) | Op::RefIsNull | Op::RefAsNonNull) => {
                 self.exec_ref(inner, op, instance)?;
@@ -223,17 +223,17 @@ impl Execution {
             Op::Throw(tag) => return self.throw(inner, instance, *tag, next - 1),
             Op::ThrowRef => return self.throw_ref(),
             op @ Op::BrOnCast { .. } => {
-                if let Some(ip) = self.br_on_cast(inner, instance, op, false) {
+                if let Some(ip) = self.br_on_cast(inner, code, instance, op, false) {
                     return Ok(StepOutcome::Advance(ip));
                 }
             }
             op @ Op::BrOnCastFail { .. } => {
-                if let Some(ip) = self.br_on_cast(inner, instance, op, true) {
+                if let Some(ip) = self.br_on_cast(inner, code, instance, op, true) {
                     return Ok(StepOutcome::Advance(ip));
                 }
             }
             #[cfg(feature = "simd")]
-            Op::Simd(s) => self.exec_simd(inner, s, instance)?,
+            Op::Simd(s) => self.exec_simd(inner, code, s, instance)?,
             // GC aggregate allocation: ensure the limiter-granted reservation covers it first (with
             // operands still on the stack as roots); a reservation grow suspends and re-executes.
             // `array.new_data`/`array.new_elem` route through here too — their charge is clamped to

@@ -9,13 +9,27 @@
 use super::Execution;
 use crate::extern_::Memory;
 use crate::instance::Instance;
-use crate::module::op::{MemArg, Op};
+use crate::module::op::{CompiledFunc, MemArg, Op, BIG_MEMARG};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::{Error, Result};
 
 fn oob() -> Error {
     Trap::MemoryOutOfBounds.into()
+}
+
+/// Resolves a compact memarg to `(memory index, byte offset)` — a demoted wide immediate (the
+/// [`BIG_MEMARG`] sentinel; memory64 offsets past `u32`, or the literal `u32::MAX`) reads the
+/// function's out-of-line pool instead.
+#[inline(always)]
+#[allow(clippy::inline_always)] // one hot caller per load/store inside the fused dispatch
+fn resolve(code: &CompiledFunc, m: &MemArg) -> (u32, u64) {
+    if m.offset == BIG_MEMARG {
+        let big = &code.big_memargs[m.memory as usize];
+        (big.memory, big.offset)
+    } else {
+        (m.memory, u64::from(m.offset))
+    }
 }
 
 /// The instance's memory at index `idx` (imported memories first, then defined â the wasm index
@@ -34,6 +48,7 @@ impl Execution {
     pub(super) fn exec_memory(
         &mut self,
         inner: &mut StoreInner,
+        code: &CompiledFunc,
         op: &Op,
         instance: Instance,
     ) -> Result<()> {
@@ -42,96 +57,96 @@ impl Execution {
             // common in GC modules using `array.new_data`).
             Op::DataDrop(seg) => inner.instance_mut(instance).dropped_data[*seg as usize] = true,
             Op::I32Load(m) => {
-                let b = self.load_n::<4>(inner, instance, m)?;
+                let b = self.load_n::<4>(inner, code, instance, m)?;
                 self.push_i32(i32::from_le_bytes(b));
             }
             Op::I64Load(m) => {
-                let b = self.load_n::<8>(inner, instance, m)?;
+                let b = self.load_n::<8>(inner, code, instance, m)?;
                 self.push_i64(i64::from_le_bytes(b));
             }
             Op::F32Load(m) => {
-                let b = self.load_n::<4>(inner, instance, m)?;
+                let b = self.load_n::<4>(inner, code, instance, m)?;
                 self.push_f32_bits(u32::from_le_bytes(b));
             }
             Op::F64Load(m) => {
-                let b = self.load_n::<8>(inner, instance, m)?;
+                let b = self.load_n::<8>(inner, code, instance, m)?;
                 self.push_f64_bits(u64::from_le_bytes(b));
             }
             Op::I32Load8S(m) => {
-                let b = self.load_n::<1>(inner, instance, m)?;
+                let b = self.load_n::<1>(inner, code, instance, m)?;
                 self.push_i32(i32::from(b[0] as i8));
             }
             Op::I32Load8U(m) => {
-                let b = self.load_n::<1>(inner, instance, m)?;
+                let b = self.load_n::<1>(inner, code, instance, m)?;
                 self.push_i32(i32::from(b[0]));
             }
             Op::I32Load16S(m) => {
-                let b = self.load_n::<2>(inner, instance, m)?;
+                let b = self.load_n::<2>(inner, code, instance, m)?;
                 self.push_i32(i32::from(i16::from_le_bytes(b)));
             }
             Op::I32Load16U(m) => {
-                let b = self.load_n::<2>(inner, instance, m)?;
+                let b = self.load_n::<2>(inner, code, instance, m)?;
                 self.push_i32(i32::from(u16::from_le_bytes(b)));
             }
             Op::I64Load8S(m) => {
-                let b = self.load_n::<1>(inner, instance, m)?;
+                let b = self.load_n::<1>(inner, code, instance, m)?;
                 self.push_i64(i64::from(b[0] as i8));
             }
             Op::I64Load8U(m) => {
-                let b = self.load_n::<1>(inner, instance, m)?;
+                let b = self.load_n::<1>(inner, code, instance, m)?;
                 self.push_i64(i64::from(b[0]));
             }
             Op::I64Load16S(m) => {
-                let b = self.load_n::<2>(inner, instance, m)?;
+                let b = self.load_n::<2>(inner, code, instance, m)?;
                 self.push_i64(i64::from(i16::from_le_bytes(b)));
             }
             Op::I64Load16U(m) => {
-                let b = self.load_n::<2>(inner, instance, m)?;
+                let b = self.load_n::<2>(inner, code, instance, m)?;
                 self.push_i64(i64::from(u16::from_le_bytes(b)));
             }
             Op::I64Load32S(m) => {
-                let b = self.load_n::<4>(inner, instance, m)?;
+                let b = self.load_n::<4>(inner, code, instance, m)?;
                 self.push_i64(i64::from(i32::from_le_bytes(b)));
             }
             Op::I64Load32U(m) => {
-                let b = self.load_n::<4>(inner, instance, m)?;
+                let b = self.load_n::<4>(inner, code, instance, m)?;
                 self.push_i64(i64::from(u32::from_le_bytes(b)));
             }
             Op::I32Store(m) => {
                 let v = self.pop().unwrap_i32();
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store(m) => {
                 let v = self.pop().unwrap_i64();
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::F32Store(m) => {
                 let v = self.pop().unwrap_f32().to_bits();
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::F64Store(m) => {
                 let v = self.pop().unwrap_f64().to_bits();
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I32Store8(m) => {
                 let v = self.pop().unwrap_i32() as u8;
-                self.store_n(inner, instance, m, [v])?;
+                self.store_n(inner, code, instance, m, [v])?;
             }
             Op::I32Store16(m) => {
                 let v = self.pop().unwrap_i32() as u16;
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store8(m) => {
                 let v = self.pop().unwrap_i64() as u8;
-                self.store_n(inner, instance, m, [v])?;
+                self.store_n(inner, code, instance, m, [v])?;
             }
             Op::I64Store16(m) => {
                 let v = self.pop().unwrap_i64() as u16;
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store32(m) => {
                 let v = self.pop().unwrap_i64() as u32;
-                self.store_n(inner, instance, m, v.to_le_bytes())?;
+                self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::MemorySize(i) => {
                 let memory = mem(inner, instance, *i);
@@ -218,10 +233,10 @@ impl Execution {
     fn mem_ea<const N: usize>(
         &mut self,
         entity: &crate::store::MemoryEntity,
-        m: &MemArg,
+        offset: u64,
     ) -> Result<usize> {
         let addr = self.pop_index(entity.ty.is_64());
-        let ea = addr.checked_add(m.offset).ok_or_else(oob)?;
+        let ea = addr.checked_add(offset).ok_or_else(oob)?;
         let end = ea.checked_add(N as u64).ok_or_else(oob)?;
         if end > entity.bytes.len() as u64 {
             return Err(oob());
@@ -232,11 +247,13 @@ impl Execution {
     pub(super) fn load_n<const N: usize>(
         &mut self,
         inner: &StoreInner,
+        code: &CompiledFunc,
         instance: Instance,
         m: &MemArg,
     ) -> Result<[u8; N]> {
-        let entity = inner.memory(mem(inner, instance, m.memory));
-        let ea = self.mem_ea::<N>(entity, m)?;
+        let (memory, offset) = resolve(code, m);
+        let entity = inner.memory(mem(inner, instance, memory));
+        let ea = self.mem_ea::<N>(entity, offset)?;
         let mut buf = [0u8; N];
         buf.copy_from_slice(&entity.bytes[ea..ea + N]);
         Ok(buf)
@@ -245,13 +262,15 @@ impl Execution {
     pub(super) fn store_n<const N: usize>(
         &mut self,
         inner: &mut StoreInner,
+        code: &CompiledFunc,
         instance: Instance,
         m: &MemArg,
         data: [u8; N],
     ) -> Result<()> {
-        let memory = mem(inner, instance, m.memory);
+        let (memory, offset) = resolve(code, m);
+        let memory = mem(inner, instance, memory);
         let entity = inner.memory_mut(memory);
-        let ea = self.mem_ea::<N>(entity, m)?;
+        let ea = self.mem_ea::<N>(entity, offset)?;
         entity.bytes[ea..ea + N].copy_from_slice(&data);
         Ok(())
     }

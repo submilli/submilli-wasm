@@ -609,3 +609,34 @@ gap to wasmi (~3200) now **≈4.8×**, from ~17×.
    e.g. bounce through a trampoline after a fixed native-stack budget rather than trusting
    unbounded sibling-call chains. This is now the main lever left for execution: the profile
    is ~50% dispatch blob + ~30% loop scaffolding, exactly what tail-call dispatch attacks.
+
+---
+
+## 13. Session 4 — 16-byte `Op` (arena density lever, part 1)
+
+Motivated by multi-tenant memory density (see the byte-encoding discussion): keep the
+fixed-width enum (all its CPU properties — merged aligned stores, one capacity check, one
+bounds check, `ip` as index) and shrink the slot instead. `Op` 24 → **16 B**:
+
+- `MemArg.offset` u64 → u32 inline; wide offsets (memory64-only, plus the literal
+  `u32::MAX` which collides with the sentinel) demote to a per-function `BigMemArg` pool
+  behind `offset == u32::MAX` (`resolve()` = one predictable branch per load/store).
+- `BranchTarget.keep/pop` u32 → u16 (`keep` is a label arity, spec-capped at 1000; a
+  function whose operand stack outgrows u16 gets a compile *error* — a resource bound,
+  never a panic).
+- `BrOnCast`/`BrOnCastFail` edges move into the existing `br_tables` pool (packed index,
+  bit 31 = nullable), like `br_table` cases.
+- Static asserts pin `size_of::<Op>() == 16` (sans `simd`) and `!needs_drop::<Op>()`.
+
+Measured (interleaved, though on a thermally saturated machine):
+
+| metric | 24 B | 16 B |
+|---|---:|---:|
+| spidermonkey `Module::new` | 27.8 ms | 27.9 ms (flat) |
+| **peak RSS, compile+hold spidermonkey** | **161.8 MB** | **127.8 MB (−21%)** |
+| steady op stream (1.84 M ops) | 44.2 MB | 29.5 MB (−33%) |
+| CoreMark / sieve | — | flat to ~−3% (within throttle noise; re-verify cool) |
+
+Consistent with §9's earlier "24→16 is speed-flat" probe. The remaining density levers,
+in order: the §10a module arena + spans + de-`Arc` (kills per-function boxes + `Vec`
+slack; ~2.5 ms compile win when spiked), then 8–12 B ops (pool i64/f64 consts, wasmi-style).

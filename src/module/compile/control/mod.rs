@@ -5,7 +5,8 @@ use wasmparser::BlockType;
 
 use super::Translator;
 use crate::canon::IrHeap;
-use crate::module::op::{BranchTarget, Op};
+use crate::module::op::{BranchTarget, Op, NULLABLE_BIT};
+use crate::Result;
 
 mod branch;
 mod calls;
@@ -163,7 +164,7 @@ impl Translator<'_> {
         });
     }
 
-    pub(super) fn do_else(&mut self) {
+    pub(super) fn do_else(&mut self) -> Result<()> {
         self.fusable_cmp = None;
         let f = self.ctrl.last().expect("else without if");
         let (base, param_count, result_count, roe, else_patch) = (
@@ -175,9 +176,10 @@ impl Translator<'_> {
         );
         if self.reachable {
             let idx = self.ops.len() as u32;
+            let (keep, _) = branch::fixup(result_count, 0)?;
             self.emit(Op::Br(BranchTarget {
                 ip: 0,
-                keep: result_count,
+                keep,
                 pop: 0,
             }));
             let frame = self.ctrl.last_mut().expect("if frame");
@@ -194,9 +196,10 @@ impl Translator<'_> {
         self.ctrl.last_mut().expect("if frame").else_patch = None;
         self.reachable = roe;
         self.height = base + param_count;
+        Ok(())
     }
 
-    pub(super) fn do_end(&mut self) {
+    pub(super) fn do_end(&mut self) -> Result<()> {
         self.fusable_cmp = None;
         // A reachable `try_table` emits landing pads + an exception-table span; a dead one (and
         // every other block) falls through to the plain block path below.
@@ -219,6 +222,7 @@ impl Translator<'_> {
             self.reachable || frame.end_targeted || frame.else_patch.is_some()
         };
         self.height = frame.base_height + frame.result_count;
+        Ok(())
     }
 
     /// `throw $tag` / `throw_ref`: stack-polymorphic terminators (like `unreachable`/`ret`). No
@@ -237,46 +241,51 @@ impl Translator<'_> {
     /// `br_on_null`: on the (null) branch the reference is consumed and the target
     /// receives only its label values; on fall-through the non-null reference stays.
     /// So the branch target is computed with the reference already popped.
-    pub(super) fn br_on_null(&mut self, depth: u32) {
+    pub(super) fn br_on_null(&mut self, depth: u32) -> Result<()> {
         self.pop(1); // reference (excluded from the branch target's operands)
-        let (target, patch_frame) = self.branch_target(depth);
+        let (target, patch_frame) = self.branch_target(depth)?;
         let idx = self.ops.len() as u32;
         self.emit(Op::BrOnNull(target));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.push(1); // fall-through keeps the (non-null) reference
+        Ok(())
     }
 
     /// `br_on_non_null`: on the (non-null) branch the reference is kept and the target's
     /// label arity includes it; on fall-through (null) the reference is dropped. So the
     /// branch target is computed with the reference still on the stack.
-    pub(super) fn br_on_non_null(&mut self, depth: u32) {
-        let (target, patch_frame) = self.branch_target(depth);
+    pub(super) fn br_on_non_null(&mut self, depth: u32) -> Result<()> {
+        let (target, patch_frame) = self.branch_target(depth)?;
         let idx = self.ops.len() as u32;
         self.emit(Op::BrOnNonNull(target));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.pop(1); // fall-through drops the reference
+        Ok(())
     }
 
     /// `br_on_cast`/`br_on_cast_fail`: the reference stays on the stack on *both* edges (cast to
     /// the to-type on the matching edge, kept as the from-type on the other), so this is
     /// height-neutral — only the runtime predicate decides which way it goes.
-    pub(super) fn br_on_cast(&mut self, depth: u32, ty: IrHeap, nullable: bool, on_fail: bool) {
-        let (target, patch_frame) = self.branch_target(depth);
+    pub(super) fn br_on_cast(
+        &mut self,
+        depth: u32,
+        ty: IrHeap,
+        nullable: bool,
+        on_fail: bool,
+    ) -> Result<()> {
+        let (bt, patch_frame) = self.branch_target(depth)?;
+        // The edge is pooled (shared with `br_table` cases); the op carries the packed index.
+        let pool = self.br_table_targets.len() as u32;
+        self.br_table_targets.push(bt);
+        let target = pool | if nullable { NULLABLE_BIT } else { 0 };
         let idx = self.ops.len() as u32;
         self.emit(if on_fail {
-            Op::BrOnCastFail {
-                ty,
-                nullable,
-                target,
-            }
+            Op::BrOnCastFail { ty, target }
         } else {
-            Op::BrOnCast {
-                ty,
-                nullable,
-                target,
-            }
+            Op::BrOnCast { ty, target }
         });
         self.register_branch(patch_frame, idx, PatchSlot::Single);
+        Ok(())
     }
 
     fn signature(&self, type_index: u32) -> (u32, u32) {

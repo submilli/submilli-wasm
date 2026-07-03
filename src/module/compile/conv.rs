@@ -2,7 +2,6 @@
 //! the type-section reader, and the per-category compile submodules.
 
 use crate::canon::{AggKind, IrGlobalType, IrHeap, IrRef, IrTableType, IrVal};
-use crate::module::op::MemArg;
 use crate::value::MemoryType;
 use crate::{Error, Result};
 
@@ -64,13 +63,6 @@ pub(crate) fn conv_heaptype(kinds: &[AggKind], hty: wasmparser::HeapType) -> Res
             return Err(Error::msg("shared heap types unsupported"))
         }
     })
-}
-
-pub(super) fn memarg(m: wasmparser::MemArg) -> MemArg {
-    MemArg {
-        memory: m.memory,
-        offset: m.offset,
-    }
 }
 
 pub(crate) fn conv_memtype(mt: wasmparser::MemoryType) -> MemoryType {

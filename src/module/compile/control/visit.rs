@@ -32,12 +32,12 @@ impl Translator<'_> {
     }
 
     pub(in crate::module::compile) fn visit_else(&mut self) -> Result<()> {
-        self.do_else();
+        self.do_else()?;
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_end(&mut self) -> Result<()> {
-        self.do_end();
+        self.do_end()?;
         Ok(())
     }
 
@@ -52,14 +52,14 @@ impl Translator<'_> {
     // --- branches / calls / throws: skipped while unreachable ---
     pub(in crate::module::compile) fn visit_br(&mut self, relative_depth: u32) -> Result<()> {
         if self.reachable {
-            self.br(relative_depth);
+            self.br(relative_depth)?;
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_br_if(&mut self, relative_depth: u32) -> Result<()> {
         if self.reachable {
-            self.br_if(relative_depth);
+            self.br_if(relative_depth)?;
         }
         Ok(())
     }
@@ -76,7 +76,7 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_return(&mut self) -> Result<()> {
         if self.reachable {
-            self.ret();
+            self.ret()?;
         }
         Ok(())
     }
@@ -142,7 +142,7 @@ impl Translator<'_> {
         relative_depth: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.br_on_null(relative_depth);
+            self.br_on_null(relative_depth)?;
         }
         Ok(())
     }
@@ -152,7 +152,7 @@ impl Translator<'_> {
         relative_depth: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.br_on_non_null(relative_depth);
+            self.br_on_non_null(relative_depth)?;
         }
         Ok(())
     }
@@ -165,7 +165,7 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let (ty, nullable) = ref_target(self.ctx.kinds, to_ref_type)?;
-            self.br_on_cast(relative_depth, ty, nullable, false);
+            self.br_on_cast(relative_depth, ty, nullable, false)?;
         }
         Ok(())
     }
@@ -178,7 +178,7 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let (ty, nullable) = ref_target(self.ctx.kinds, to_ref_type)?;
-            self.br_on_cast(relative_depth, ty, nullable, true);
+            self.br_on_cast(relative_depth, ty, nullable, true)?;
         }
         Ok(())
     }

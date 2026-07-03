@@ -10,6 +10,7 @@ use super::{BlockKind, CtrlFrame, HandlerClause, PatchSlot};
 use crate::module::compile::Translator;
 use crate::module::handler::{HandlerRec, HandlerSpan};
 use crate::module::op::{BranchTarget, Op};
+use crate::Result;
 
 fn conv_catch(c: &Catch) -> HandlerClause {
     let (tag, label, payload_args, payload_ref) = match *c {
@@ -51,15 +52,16 @@ impl Translator<'_> {
     /// pads), then a landing pad per catch clause, and record the exception-table span. Catch labels
     /// resolve in the **outer** context (the try_table's own label is excluded), so the frame is
     /// popped first.
-    pub(in crate::module::compile) fn end_try_table(&mut self) {
+    pub(in crate::module::compile) fn end_try_table(&mut self) -> Result<()> {
         let frame = self.ctrl.pop().expect("try_table frame");
         let base_height = frame.base_height;
         let body_end = self.ops.len() as u32;
 
         let skip_idx = self.ops.len() as u32;
+        let (keep, _) = super::branch::fixup(frame.result_count, 0)?;
         self.emit(Op::Br(BranchTarget {
             ip: 0,
-            keep: frame.result_count,
+            keep,
             pop: 0,
         }));
 
@@ -67,7 +69,7 @@ impl Translator<'_> {
         for c in &frame.clauses {
             // The landing pad branches with the operand stack at restore-height + payload.
             self.height = base_height + self.payload_count(c);
-            let (target, patch_frame) = self.branch_target(c.label);
+            let (target, patch_frame) = self.branch_target(c.label)?;
             let landing_ip = self.ops.len() as u32;
             self.emit(Op::Br(target));
             self.register_branch(patch_frame, landing_ip, PatchSlot::Single);
@@ -91,6 +93,7 @@ impl Translator<'_> {
         });
         self.reachable = self.reachable || frame.end_targeted;
         self.height = base_height + frame.result_count;
+        Ok(())
     }
 
     /// The number of values a catch clause pushes: the tag's params (`catch`/`catch_ref`) plus one

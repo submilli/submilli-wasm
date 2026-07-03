@@ -31,11 +31,12 @@ impl Execution {
     pub(super) fn exec_simd(
         &mut self,
         inner: &mut StoreInner,
+        code: &crate::module::op::CompiledFunc,
         s: &SimdOp,
         instance: Instance,
     ) -> Result<()> {
         // Memory ops (load/store/lane/splat/extend/zero) consult the store; the rest are pure.
-        if self.exec_simd_mem(inner, s, instance)? {
+        if self.exec_simd_mem(inner, code, s, instance)? {
             return Ok(());
         }
         self.exec_simd_compute(s)

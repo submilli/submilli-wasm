@@ -9,10 +9,11 @@ use crate::canon::IrHeap;
 
 pub(crate) use super::op_types::*;
 
-/// One internal instruction. 24 bytes and **not** a drop type (`br_table` targets are side-tabled,
-/// so nothing inline is `Box`ed): a `Vec<Op>` frees in one shot at teardown instead of a
-/// discriminant-checked drop walk over every op, and the smaller payload cuts compile-time write
-/// traffic (each `Op` is written once at compile and read by-reference in the hot loop).
+/// One internal instruction. 16 bytes (without `simd`) and **not** a drop type: wide immediates
+/// live out of line (`br_table`/`br_on_cast` edges and rare 64-bit memarg offsets in per-function
+/// pools), `BranchTarget` packs its stack fixup into two `u16`s, and nothing inline is `Box`ed —
+/// a `Vec<Op>` frees in one shot at teardown, and the op stream is 33% smaller resident than the
+/// previous 24-byte layout at unchanged decode shape (fixed width, aligned fields).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Op {
     // --- control ---
@@ -350,15 +351,16 @@ pub(crate) enum Op {
     /// `any.convert_extern` / `extern.convert_any`: externref ↔ anyref.
     AnyConvertExtern,
     ExternConvertAny,
+    /// `br_on_cast` / `br_on_cast_fail`: the branch edge lives out of line in
+    /// `CompiledFunc::br_tables` (shared with `br_table` cases) — `target`'s bit 31 carries the
+    /// cast's `nullable` flag, the low 31 bits index the pool. Keeps the variant inside 16 bytes.
     BrOnCast {
         ty: IrHeap,
-        nullable: bool,
-        target: BranchTarget,
+        target: u32,
     },
     BrOnCastFail {
         ty: IrHeap,
-        nullable: bool,
-        target: BranchTarget,
+        target: u32,
     },
     /// Fixed-width SIMD (`v128`, #37); the ~236 vector ops live in [`SimdOp`](super::op_simd::SimdOp).
     #[cfg(feature = "simd")]
@@ -368,3 +370,9 @@ pub(crate) enum Op {
 /// The compiled-function record lives in [`super::code`]; re-exported here so the long-standing
 /// `module::op::CompiledFunc` path keeps resolving.
 pub(crate) use super::code::CompiledFunc;
+
+// The two load-bearing layout properties (see the enum doc). 16 bytes holds only without the
+// `simd` feature — `SimdOp`'s lane/memarg immediates widen the enum.
+#[cfg(not(feature = "simd"))]
+const _: () = assert!(std::mem::size_of::<Op>() == 16);
+const _: () = assert!(!std::mem::needs_drop::<Op>());

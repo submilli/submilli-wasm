@@ -6,7 +6,7 @@
 use super::{cell, Execution};
 use crate::canon::{AggKind, CanonicalTypeId, IrHeap, RefKind};
 use crate::instance::Instance;
-use crate::module::op::Op;
+use crate::module::op::{CompiledFunc, Op, NULLABLE_BIT};
 use crate::store::{decode_anyref_handle, AnyRefHandle, FuncEntity, ObjKind, StoreInner};
 use crate::trap::Trap;
 use crate::value::Val;
@@ -68,23 +68,20 @@ impl Execution {
     pub(super) fn br_on_cast(
         &mut self,
         inner: &StoreInner,
+        code: &CompiledFunc,
         instance: Instance,
         op: &Op,
         on_fail: bool,
     ) -> Option<u32> {
-        let (ty, nullable, target) = match op {
-            Op::BrOnCast {
-                ty,
-                nullable,
-                target,
-            }
-            | Op::BrOnCastFail {
-                ty,
-                nullable,
-                target,
-            } => (ty, *nullable, target),
+        let (ty, packed) = match op {
+            Op::BrOnCast { ty, target } | Op::BrOnCastFail { ty, target } => (ty, *target),
             _ => unreachable!("not a br_on_cast op"),
         };
+        // The edge is pooled (bit 31 of the packed index is the cast's nullable flag). The
+        // index is emitted by our own compile pass, in-bounds by construction (#33 carve-out).
+        let nullable = packed & NULLABLE_BIT != 0;
+        #[allow(clippy::indexing_slicing)]
+        let target = code.br_tables[(packed & !NULLABLE_BIT) as usize];
         let r = self.pop_ref(cell::refkind_of_irheap(ty));
         let matched = matches_heaptype(inner, instance, &r, ty, nullable);
         self.push(r);

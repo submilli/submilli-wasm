@@ -4,7 +4,7 @@
 //! paths stay valid.
 
 use crate::canon::IrVal;
-use crate::module::op::{BranchTarget, Op, TypeIdx};
+use crate::module::op::{BigMemArg, BranchTarget, Op, TypeIdx};
 
 /// A function compiled to internal bytecode.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -26,6 +26,10 @@ pub(crate) struct CompiledFunc {
     /// Flattened `br_table` target lists (see [`BrTableRange`](super::op::BrTableRange)); indexed by
     /// `Op::BrTable`. Empty when the function has no `br_table`.
     pub br_tables: Box<[BranchTarget]>,
+    /// Pooled wide memory immediates (64-bit offsets, or the literal offset `u32::MAX`) that
+    /// don't fit `MemArg`'s inline `u32`; indexed via the [`BIG_MEMARG`](super::op::BIG_MEMARG)
+    /// sentinel. Empty for virtually every real module.
+    pub big_memargs: Box<[BigMemArg]>,
     /// Per-`Op` source wasm byte offset for backtraces (#29a); `None` without debug retention.
     pub offsets: Option<Box<[u32]>>,
 }

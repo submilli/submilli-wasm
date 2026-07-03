@@ -76,14 +76,14 @@ impl super::Execution {
     }
 
     /// Moves the top `keep` operands down over `pop` discarded ones, then jumps.
-    pub(super) fn take_branch(&mut self, t: &BranchTarget) {
+    pub(super) fn take_branch(&mut self, t: BranchTarget) {
         if t.pop == 0 {
             return; // nothing discarded — the kept operands are already in place
         }
         let len = self.values.len();
-        let keep = t.keep as usize;
+        let keep = usize::from(t.keep);
         let src = len - keep;
-        let dst = src - t.pop as usize;
+        let dst = src - usize::from(t.pop);
         self.values.copy_within(src..len, dst);
         self.values.truncate(dst + keep);
         // The root shadow moves in lockstep with the cell stack (same offsets/length).

@@ -37,7 +37,7 @@ macro_rules! simd_memarg {
     ($($visit:ident => $helper:ident $variant:ident;)*) => {$(
         pub(in crate::module::compile) fn $visit(&mut self, memarg: wasmparser::MemArg) -> Result<()> {
             if self.reachable {
-                let m = super::conv::memarg(memarg);
+                let m = self.memarg(memarg);
                 self.$helper(Op::Simd(SimdOp::$variant(m)));
             }
             Ok(())
@@ -50,7 +50,7 @@ macro_rules! simd_memarg_lane {
     ($($visit:ident => $helper:ident $variant:ident;)*) => {$(
         pub(in crate::module::compile) fn $visit(&mut self, memarg: wasmparser::MemArg, lane: u8) -> Result<()> {
             if self.reachable {
-                let mem = super::conv::memarg(memarg);
+                let mem = self.memarg(memarg);
                 self.$helper(Op::Simd(SimdOp::$variant { mem, lane }));
             }
             Ok(())

@@ -49,7 +49,7 @@ macro_rules! lower_memarg {
                 memarg: wasmparser::MemArg,
             ) -> $crate::Result<()> {
                 if self.reachable {
-                    let m = $crate::module::compile::conv::memarg(memarg);
+                    let m = self.memarg(memarg);
                     self.$helper($crate::module::op::Op::$variant(m));
                 }
                 Ok(())

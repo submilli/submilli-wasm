@@ -24,7 +24,7 @@ use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, ValidatorResour
 
 use crate::canon::{AggKind, IrVal, ModuleType};
 use crate::module::handler::HandlerSpan;
-use crate::module::op::{BranchTarget, CmpKind, CompiledFunc, Op};
+use crate::module::op::{BigMemArg, BranchTarget, CmpKind, CompiledFunc, MemArg, Op, BIG_MEMARG};
 use crate::{Error, Result};
 
 use self::control::CtrlFrame;
@@ -125,6 +125,7 @@ pub(crate) fn translate_function(
         max_operands: t.max_operands,
         handlers: t.handlers.into_boxed_slice(),
         br_tables: t.br_table_targets.into_boxed_slice(),
+        big_memargs: t.big_memargs.into_boxed_slice(),
         offsets: t.offsets.map(Vec::into_boxed_slice),
     })
 }
@@ -137,9 +138,12 @@ struct Translator<'a> {
     ctrl: Vec<CtrlFrame>,
     reachable: bool,
     handlers: Vec<HandlerSpan>,
-    /// Flattened `br_table` target lists, accumulated across the body; moved into
-    /// [`CompiledFunc::br_tables`]. `Op::BrTable` carries only a `{base, len}` range into this.
+    /// Flattened `br_table` target lists (plus `br_on_cast` edges), accumulated across the body;
+    /// moved into [`CompiledFunc::br_tables`]. `Op::BrTable` carries a `{base, len}` range into
+    /// this; `Op::BrOnCast`/`BrOnCastFail` a packed index.
     br_table_targets: Vec<BranchTarget>,
+    /// Pooled wide memory immediates (see [`MemArg`]); almost always stays empty.
+    big_memargs: Vec<BigMemArg>,
     /// Byte offset of the operator currently being translated; recorded per emitted `Op` into
     /// `offsets` (when present) so a frame's `ip` can be mapped back to source via DWARF (#29a).
     cur_offset: u32,
@@ -168,9 +172,31 @@ impl<'a> Translator<'a> {
             reachable: true,
             handlers: Vec::new(),
             br_table_targets: Vec::new(),
+            big_memargs: Vec::new(),
             cur_offset: 0,
             offsets: retain_offsets.then(|| Vec::with_capacity(op_hint)),
             fusable_cmp: None,
+        }
+    }
+
+    /// Converts a wasmparser memarg to the compact form, demoting a wide offset (memory64, or
+    /// the literal `u32::MAX`) to the per-function pool behind the [`BIG_MEMARG`] sentinel.
+    fn memarg(&mut self, m: wasmparser::MemArg) -> MemArg {
+        if m.offset < u64::from(BIG_MEMARG) {
+            MemArg {
+                memory: m.memory,
+                offset: m.offset as u32,
+            }
+        } else {
+            let idx = self.big_memargs.len() as u32;
+            self.big_memargs.push(BigMemArg {
+                memory: m.memory,
+                offset: m.offset,
+            });
+            MemArg {
+                memory: idx,
+                offset: BIG_MEMARG,
+            }
         }
     }
 
