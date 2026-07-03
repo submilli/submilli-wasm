@@ -14,6 +14,30 @@
 use super::cell::{
     decode, encode, refkind_of_irheap, stack_slot_for_field, Cell, RefTag, SLOT_BYTES,
 };
+
+/// Direct cell → `Val` for the host boundary: one match on the type instead of the layered
+/// GC-slot codec (three nested matches), which was measurable at per-call frequency.
+/// Non-scalars fall back to the generic [`decode`].
+fn decode_val(c: Cell, t: &ValType) -> Val {
+    match t {
+        ValType::I32 => Val::I32(c.unwrap_i32()),
+        ValType::I64 => Val::I64(c.unwrap_i64()),
+        ValType::F32 => Val::F32(c.unwrap_f32().to_bits()),
+        ValType::F64 => Val::F64(c.unwrap_f64().to_bits()),
+        _ => decode(c, t),
+    }
+}
+
+/// Direct `Val` → cell (see [`decode_val`]); non-scalars fall back to the generic [`encode`].
+fn encode_val(v: Val) -> Cell {
+    match v {
+        Val::I32(x) => Cell::from_i32(x),
+        Val::I64(x) => Cell::from_i64(x),
+        Val::F32(bits) => Cell::of_bytes(bits.to_le_bytes()),
+        Val::F64(bits) => Cell::of_bytes(bits.to_le_bytes()),
+        _ => encode(v),
+    }
+}
 use super::Execution;
 use crate::canon::{IrVal, RefKind, Slot};
 use crate::store::{read_slot, NULL_REF};
@@ -219,7 +243,7 @@ impl Execution {
         self.values.reserve(results.len());
         for v in results {
             self.shadow.push(RefTag::of_val(v));
-            self.values.push(encode(*v));
+            self.values.push(encode_val(*v));
         }
     }
 

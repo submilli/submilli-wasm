@@ -695,10 +695,23 @@ Landed (each A/B-measured):
 - **Hand-rolled the 1-element decode/encode loops + inlined the scratch accessors**
   (iterator-adaptor overhead was ~9% at per-call frequency): 61 → **~54 ns/call**.
 
-Net: **ping ×100k 18.9 → 5.4 ms (3.5×)**. What's left per call, in profile order: the
-dispatch-loop exit/re-entry through `Outcome::HostCall` (~36% — the loop prologue and
-frame re-derivation run per crossing), the driver match (~10%), park/unpark `Option`
-churn (~6%), `catch_unwind` + `Caller` construction. Next tiers if the boundary stays
-hot: a typed host-call fast path that skips the `Val` layer entirely (wasmtime-style
-`IntoFunc` specialization reading operand cells directly), and keeping the dispatch
-loop resident across host calls instead of exiting through `Outcome`.
+Round 2 (line-level re-profile ranked: `Val` codec 8.6%, park/unpark drops 5.6%,
+`sig` `Arc` bump):
+- **Direct boundary codec** — `decode_val`/`encode_val` do one match on the type for
+  scalars instead of the layered GC-slot codec (three nested matches each way);
+  non-scalars fall back to the generic path. 54 → **~42 ns/call**.
+- **Swap-based parking** — `exec_slot` is now a plain `Execution` (empty outside a
+  host call); the crossing does two `mem::swap`s instead of `Option` take/park with
+  placeholder writes and drops.
+- **No `sig` `Arc` clone** — the scratch buffers are taken *first*, so the signature
+  borrow can fill them and end before the store is mutably borrowed for the call.
+
+Net: **ping ×100k 18.9 → 4.3 ms (4.4×, 189 → ~42 ns/call)** vs wasmi ~13 ns /
+wasmtime ~4 ns. The profile now shows the guest's own loop (~48%) with the host-side
+remainder diffuse; the residual gap is structural — the dispatch loop exits and
+re-enters through `Outcome::HostCall` every crossing (loop prologue, frame
+re-derivation, two enum matches, `catch_unwind`, `Caller`). Next tiers if the boundary
+must go lower: a typed host-call fast path that skips the `Val` layer entirely
+(wasmtime-style `IntoFunc` specialization reading operand cells directly), and keeping
+the dispatch loop resident across host calls — both are architecture conversations
+(typed-store access from the untyped loop; async parking interplay).

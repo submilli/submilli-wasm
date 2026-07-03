@@ -95,11 +95,12 @@ The **host-call row** measures the guest→host→guest boundary — 100k
 data-dependent calls to a trivial imported function, execution only. For
 IO-heavy orchestration guests (the product workload: thin glue around host
 stdlib calls) this, not compute throughput, is the runtime number that
-matters. A first optimization pass (cache each host fn's signature at
-registration, reuse arg/result buffers across calls — the boundary is now
-allocation-free in steady state) took submilli from 189 → ~59 ns/call; the
-remaining gap to wasmi (~13 ns) and wasmtime (~4 ns) is the dispatch-loop
-exit/re-entry and panic-containment per call.
+matters. Two optimization passes (cache each host fn's signature at
+registration; reuse arg/result buffers so the boundary is allocation-free in
+steady state; a direct scalar codec; swap-based execution parking) took
+submilli from 189 → ~42 ns/call; the remaining gap to wasmi (~13 ns) and
+wasmtime (~4 ns) is the dispatch-loop exit/re-entry and panic-containment
+per crossing.
 
 The **Module RAM rows** are the density axis: heap bytes a compiled module
 keeps resident, which bounds how many tenants fit on a host. Both non-JIT

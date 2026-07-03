@@ -50,7 +50,7 @@ fn enter<T>(
     code: Code,
     args: Vec<Val>,
 ) -> (Execution, Boundary) {
-    let mut exec = store.inner.take_exec().unwrap_or_default();
+    let mut exec = store.inner.take_exec();
     let value_base = exec.values.len();
     let stop_depth = exec.frames.len();
     let delim = if stop_depth == 0 {
@@ -210,37 +210,40 @@ impl Execution {
         instance: Instance,
         stop_depth: usize,
     ) -> Result<()> {
-        let (sig, host_index) = match store.inner.func(func) {
+        // Reused arg/result buffers (returned below): with the cached signature, the whole
+        // boundary is allocation-free in steady state. A re-entrant host call takes a fresh
+        // (empty) pair — only nesting allocates. Taken *first* so the signature borrow below
+        // needs no `Arc` bump.
+        let (mut params, mut results) = store.inner.take_host_scratch();
+        let host_index = match store.inner.func(func) {
             FuncEntity::Host {
                 sig, host_index, ..
-            } => (sig.clone(), *host_index),
+            } => {
+                results.clear();
+                results.extend_from_slice(&sig.result_defaults);
+                params.clear();
+                self.pop_params_into(&sig.params, &mut params);
+                *host_index
+            }
             FuncEntity::Wasm { .. } => unreachable!("HostCall only suspends on sync host funcs"),
             #[cfg(feature = "async")]
             FuncEntity::HostAsync { .. } => {
                 unreachable!("HostCall only suspends on sync host funcs")
             }
         };
-        // Reused arg/result buffers (returned below): with the cached signature, the whole
-        // boundary is allocation-free in steady state. A re-entrant host call takes a fresh
-        // (empty) pair — only nesting allocates.
-        let (mut params, mut results) = store.inner.take_host_scratch();
-        results.clear();
-        results.extend_from_slice(&sig.result_defaults);
         // Scope the host roots created during the call (the GC host API registers a root per
         // `StructRef`/`ArrayRef`/`ExternRef` it builds). Without this they accumulate for the
         // store's life — a host fn that builds a GC object per call (e.g. one string per line) would
         // pin every one, defeating collection. Returned values survive via `push_results` (operand
         // roots); anything the host stored into a global/table/pending-exception is rooted there.
         let roots_mark = store.inner.gc_roots_mark();
-        params.clear();
-        self.pop_params_into(&sig.params, &mut params);
         let cb = store.host_funcs[host_index as usize].clone();
         // Park the shared execution so a host fn that re-enters wasm (`Func::call`) runs on these
         // same stacks; reclaim it after the call (a re-entrant call re-parks it on its way out). The
         // guest's live operands stay reachable for GC while parked — the collector seeds from the
         // slot (`StoreInner::exec_roots`) on a host-triggered collection.
-        store.inner.park_exec(std::mem::take(self));
-        // Contain a host-fn panic (#33): catch, restore store state, re-raise. See `guard`.
+        store.inner.swap_exec(self); // park (self becomes the slot's empty execution)
+                                     // Contain a host-fn panic (#33): catch, restore store state, re-raise. See `guard`.
         let result = match super::guard::catch_host(|| {
             cb(
                 Caller::new(store.as_context_mut(), Some(instance)),
@@ -254,10 +257,7 @@ impl Execution {
                 super::guard::reraise(payload);
             }
         };
-        *self = store
-            .inner
-            .take_exec()
-            .expect("re-entrant call must re-park the shared execution");
+        store.inner.swap_exec(self); // reclaim (re-entrant calls re-parked through the slot)
         if let Err(e) = result {
             store.inner.gc_roots_truncate(roots_mark);
             return self.host_call_error(&mut store.inner, e, stop_depth);
@@ -332,10 +332,7 @@ impl Execution {
                 super::guard::reraise(payload);
             }
         };
-        *self = store
-            .inner
-            .take_exec()
-            .expect("re-entrant call must re-park the shared execution");
+        *self = store.inner.take_exec();
         if let Err(e) = outcome {
             store.inner.gc_roots_truncate(roots_mark);
             return self.host_call_error(&mut store.inner, e, stop_depth);

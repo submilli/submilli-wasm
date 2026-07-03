@@ -56,10 +56,8 @@ fn build(inner: &StoreInner, frames: &[Frame], top_ip: Option<u32>) -> WasmBackt
 /// Builds a backtrace from the parked execution (for `WasmBacktrace::capture` inside a host fn):
 /// every frame is at a call site, so all use `frame.ip - 1`. Empty when nothing is parked.
 pub(crate) fn from_parked(inner: &StoreInner) -> WasmBacktrace {
-    match inner.parked_exec() {
-        Some(exec) => build(inner, exec.frames(), None),
-        None => WasmBacktrace::from_frames(Vec::new()),
-    }
+    // An empty parked execution (no host call in progress) yields an empty trace.
+    build(inner, inner.parked_exec().frames(), None)
 }
 
 impl Execution {

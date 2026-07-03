@@ -49,9 +49,8 @@ pub(crate) struct StoreInner {
     pub(super) tables: Arena<TableEntity>,
     pub(super) globals: Arena<GlobalEntity>,
     tags: Arena<TagEntity>,
-    /// Reused host-call arg/result buffers (see `exec::host::invoke_host`): taken per call,
-    /// returned after, so the steady-state boundary is allocation-free. A re-entrant host
-    /// call takes a fresh (empty) pair — only nesting allocates.
+    /// Reused host-call arg/result buffers: taken per call and returned after, so the
+    /// steady-state boundary is allocation-free (`exec::host::invoke_host`).
     host_scratch: (Vec<crate::value::Val>, Vec<crate::value::Val>),
     /// Exception instances backing `exnref` values; `Rooted<ExnRef>` indexes here. Grow-only
     /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) enumerates
@@ -83,11 +82,10 @@ pub(crate) struct StoreInner {
     epoch_deadline: u64,
     /// Exception surfaced from the last call / a host `throw`; taken via `take_pending_exception`.
     pub(super) pending_exception: Option<Rooted<ExnRef>>,
-    /// The shared interpreter execution, parked here for the duration of a host call so a host fn
-    /// that re-enters wasm (`Func::call`) runs on the *same* operand/frame stacks (separated by a
-    /// [`Delimiter`](crate::exec::Delimiter)). `Some` exactly while a host callback is running; the
-    /// driver takes it out before each `run` and parks it back before invoking the callback.
-    exec_slot: Option<crate::exec::Execution>,
+    /// The shared interpreter execution, parked for the duration of a host call so a host fn
+    /// that re-enters wasm (`Func::call`) runs on the *same* operand/frame stacks (separated
+    /// by a [`Delimiter`](crate::exec::Delimiter)); empty (default) outside a host call.
+    exec_slot: crate::exec::Execution,
     /// This store's GC-request mailbox (the engine holds a `Weak`). The engine posts to it under
     /// engine-wide GC pressure; the run loop reads-and-clears it at a back-edge and self-collects.
     pub(super) gc_request: Arc<AtomicBool>,
@@ -117,7 +115,7 @@ impl StoreInner {
             fuel_yield_interval: None,
             epoch_deadline: u64::MAX,
             pending_exception: None,
-            exec_slot: None,
+            exec_slot: crate::exec::Execution::default(),
             gc_request,
         }
     }
@@ -126,30 +124,34 @@ impl StoreInner {
     // (`set`/`take_pending_exception`) live in `managed` with the rest of the GC machinery; their
     // fields (`gc_request`, `pending_exception`) stay on the struct above.
 
-    /// Takes the parked shared execution out of its slot (the driver owns it while `run`ning).
-    pub(crate) fn take_exec(&mut self) -> Option<crate::exec::Execution> {
-        self.exec_slot.take()
+    /// Takes the parked execution (empty at a top-level entry = fresh stacks).
+    pub(crate) fn take_exec(&mut self) -> crate::exec::Execution {
+        std::mem::take(&mut self.exec_slot)
     }
 
-    /// Parks the shared execution back in its slot for the duration of a host call.
+    /// Parks the shared execution back in its slot (see `exec_slot`).
     pub(crate) fn park_exec(&mut self, exec: crate::exec::Execution) {
-        debug_assert!(self.exec_slot.is_none(), "exec slot already occupied");
-        self.exec_slot = Some(exec);
+        self.exec_slot = exec;
     }
 
-    /// The parked execution, if a host call is in progress — its frames back `WasmBacktrace::capture`.
-    pub(crate) fn parked_exec(&self) -> Option<&crate::exec::Execution> {
-        self.exec_slot.as_ref()
+    /// Swap-based park/unpark for the per-host-call crossing (no placeholder writes/drops).
+    /// Used symmetrically; a re-entrant `Func::call` takes/re-parks through the same slot,
+    /// so the second swap always reclaims the (possibly updated) shared execution.
+    #[inline]
+    pub(crate) fn swap_exec(&mut self, exec: &mut crate::exec::Execution) {
+        std::mem::swap(&mut self.exec_slot, exec);
+    }
+
+    /// The parked execution (frames back `WasmBacktrace::capture`); empty outside a host call.
+    pub(crate) fn parked_exec(&self) -> &crate::exec::Execution {
+        &self.exec_slot
     }
 
     /// The operand/local GC roots of the parked execution (empty when none is parked). Seeds a
     /// collection triggered from a host call (`gc_reserve_host`/`Store::gc`), where the guest's
     /// operands live on the parked execution rather than a running one.
     pub(crate) fn exec_roots(&self) -> Vec<(u32, crate::canon::RefKind)> {
-        self.exec_slot
-            .as_ref()
-            .map(|e| e.operand_roots().collect())
-            .unwrap_or_default()
+        self.exec_slot.operand_roots().collect()
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -242,8 +244,7 @@ impl StoreInner {
         }
     }
 
-    /// Takes the reused host-call buffers (cleared by the caller before use); a nested
-    /// (re-entrant) host call sees empty defaults and allocates its own pair.
+    /// Takes the reused host-call buffers (a nested call sees empty defaults).
     #[inline]
     pub(crate) fn take_host_scratch(&mut self) -> (Vec<crate::value::Val>, Vec<crate::value::Val>) {
         std::mem::take(&mut self.host_scratch)
