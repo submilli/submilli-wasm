@@ -29,6 +29,7 @@ fn ir(tys: &[ValType]) -> Vec<IrVal> {
 }
 
 /// Compiles `wat`'s single function and runs it with `args`, returning the results.
+#[allow(clippy::too_many_lines)] // linear test harness: compile, wrap in a module shell, execute
 fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -> Result<Vec<Val>> {
     let engine = Engine::default();
     let bytes = wat::parse_str(wat).unwrap();
@@ -48,15 +49,17 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         func_types: &[0],
         tag_types: &[],
     };
-    let mut code = None;
+    let mut arenas = crate::module::code::CodeArenas::default();
+    let mut func = None;
     let mut validator = Validator::new_with_features(crate::module::enabled_features());
     for payload in Parser::new(0).parse_all(&bytes) {
         let payload = payload.unwrap();
         if let ValidPayload::Func(to_validate, body) = validator.payload(&payload).unwrap() {
             let mut fv = to_validate.into_validator(FuncValidatorAllocations::default());
             let mut scratch = crate::module::compile::Scratch::default();
-            code = Some(translate_function(
+            func = Some(translate_function(
                 &ctx,
+                &mut arenas,
                 0,
                 &body,
                 &mut fv,
@@ -65,12 +68,24 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
             )?);
         }
     }
+    // A minimal module shell around the one compiled function (the executor reads code only
+    // through the `Code` handle's arenas). Built field-by-field: `ModuleInner` is `Drop`, so
+    // functional-update syntax can't be used.
+    let mut inner = crate::module::inner::ModuleInner::default();
+    inner.types = types.to_vec();
+    inner.func_types = vec![0];
+    inner.functions = vec![func.unwrap()];
+    inner.code = arenas;
+    let code = crate::module::code::Code {
+        module: Arc::new(inner),
+        index: 0,
+    };
     let mut store = Store::new(&engine, ());
     host::execute(
         &mut store,
         Instance { index: 0, store: 0 },
         0,
-        Arc::new(code.unwrap()),
+        code,
         args,
         results,
     )

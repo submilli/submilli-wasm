@@ -2,14 +2,16 @@
 //! `Arc<CompiledFunc>` so the run loop can read ops without borrowing the store
 //! or the value/frame stacks.
 
-use std::sync::Arc;
-
 use crate::instance::Instance;
+use crate::module::code::Code;
 use crate::module::op::{BranchTarget, CompiledFunc};
 
 #[derive(Debug)]
 pub(crate) struct Frame {
-    pub code: Arc<CompiledFunc>,
+    pub code: Code,
+    /// Cached copy of the function record (spans + scalar facts) so the run loop and call
+    /// paths never re-resolve `functions[index]` on frame switches.
+    pub func: CompiledFunc,
     /// Resume point in `code.ops` (saved when this frame makes a call).
     pub ip: u32,
     /// Index into `Execution.values` where this frame's locals begin.
@@ -35,18 +37,15 @@ pub(crate) enum Delimiter {
 }
 
 impl super::Execution {
-    pub(super) fn push_call(
-        &mut self,
-        instance: Instance,
-        func_index: u32,
-        code: Arc<CompiledFunc>,
-    ) {
-        let locals_base = self.values.len() as u32 - code.n_params;
-        for ty in &code.local_types {
+    pub(super) fn push_call(&mut self, instance: Instance, func_index: u32, code: Code) {
+        let func = code.func(); // resolved once; the frame caches the record
+        let locals_base = self.values.len() as u32 - func.n_params;
+        for ty in code.local_types_of(&func) {
             self.push_default(ty);
         }
         self.frames.push(Frame {
             code,
+            func,
             ip: 0,
             locals_base,
             instance,
@@ -58,15 +57,12 @@ impl super::Execution {
     /// Pushes a [`Delimiter`] boundary marker (no operands, inert `code`/`instance` filler). The
     /// next `push_call` lays the entered function's frame directly above it; `run`/`unwind` stop at
     /// this frame's depth so the call below it stays parked and untouched.
-    pub(super) fn push_delimiter(
-        &mut self,
-        kind: Delimiter,
-        instance: Instance,
-        code: Arc<CompiledFunc>,
-    ) {
+    pub(super) fn push_delimiter(&mut self, kind: Delimiter, instance: Instance, code: Code) {
         let locals_base = self.values.len() as u32;
+        let func = code.func();
         self.frames.push(Frame {
             code,
+            func,
             ip: 0,
             locals_base,
             instance,
@@ -91,9 +87,9 @@ impl super::Execution {
         self.shadow.truncate(dst + keep);
     }
 
-    pub(super) fn top(&self) -> (Arc<CompiledFunc>, u32, u32, Instance) {
+    pub(super) fn top(&self) -> (Code, CompiledFunc, u32, u32, Instance) {
         let f = self.frames.last().expect("current frame");
-        (f.code.clone(), f.ip, f.locals_base, f.instance)
+        (f.code.clone(), f.func, f.ip, f.locals_base, f.instance)
     }
 
     /// Pops the current frame, moving its top `n_results` operands down to the

@@ -112,7 +112,7 @@ impl Translator<'_> {
             base_height,
             param_count,
             result_count,
-            start_ip: self.ops.len() as u32,
+            start_ip: self.next_ip(),
             end_patches: Vec::new(),
             else_patch: None,
             reachable_on_entry: self.reachable,
@@ -128,8 +128,8 @@ impl Translator<'_> {
             self.pop(1); // condition
                          // Fuse `relop; if` into one negated compare-and-branch (see `br_if`).
             if let Some(kind) = self.fusable_cmp.take() {
-                let idx = self.ops.len() as u32 - 1;
-                self.ops[idx as usize] = Op::BrIfCmp {
+                let idx = self.next_ip() - 1;
+                *self.op_mut(idx) = Op::BrIfCmp {
                     kind,
                     negate: true,
                     target: BranchTarget {
@@ -140,7 +140,7 @@ impl Translator<'_> {
                 };
                 else_patch = Some(idx);
             } else {
-                else_patch = Some(self.ops.len() as u32);
+                else_patch = Some(self.next_ip());
                 self.emit(Op::BrIfNot(BranchTarget {
                     ip: 0,
                     keep: 0,
@@ -155,7 +155,7 @@ impl Translator<'_> {
             base_height,
             param_count,
             result_count,
-            start_ip: self.ops.len() as u32,
+            start_ip: self.next_ip(),
             end_patches: Vec::new(),
             else_patch,
             reachable_on_entry: self.reachable,
@@ -175,7 +175,7 @@ impl Translator<'_> {
             f.else_patch,
         );
         if self.reachable {
-            let idx = self.ops.len() as u32;
+            let idx = self.next_ip();
             let (keep, _) = branch::fixup(result_count, 0)?;
             self.emit(Op::Br(BranchTarget {
                 ip: 0,
@@ -190,7 +190,7 @@ impl Translator<'_> {
             frame.end_targeted = true;
         }
         if let Some(idx) = else_patch {
-            let else_start = self.ops.len() as u32;
+            let else_start = self.next_ip();
             self.patch_ip(idx, PatchSlot::Single, else_start);
         }
         self.ctrl.last_mut().expect("if frame").else_patch = None;
@@ -208,7 +208,7 @@ impl Translator<'_> {
             return self.end_try_table();
         }
         let frame = self.ctrl.pop().expect("end without frame");
-        let end_ip = self.ops.len() as u32;
+        let end_ip = self.next_ip();
         if let Some(idx) = frame.else_patch {
             // else-less `if`: the cond-false path falls through to end.
             self.patch_ip(idx, PatchSlot::Single, end_ip);
@@ -244,7 +244,7 @@ impl Translator<'_> {
     pub(super) fn br_on_null(&mut self, depth: u32) -> Result<()> {
         self.pop(1); // reference (excluded from the branch target's operands)
         let (target, patch_frame) = self.branch_target(depth)?;
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(Op::BrOnNull(target));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.push(1); // fall-through keeps the (non-null) reference
@@ -256,7 +256,7 @@ impl Translator<'_> {
     /// branch target is computed with the reference still on the stack.
     pub(super) fn br_on_non_null(&mut self, depth: u32) -> Result<()> {
         let (target, patch_frame) = self.branch_target(depth)?;
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(Op::BrOnNonNull(target));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.pop(1); // fall-through drops the reference
@@ -275,10 +275,9 @@ impl Translator<'_> {
     ) -> Result<()> {
         let (bt, patch_frame) = self.branch_target(depth)?;
         // The edge is pooled (shared with `br_table` cases); the op carries the packed index.
-        let pool = self.br_table_targets.len() as u32;
-        self.br_table_targets.push(bt);
+        let pool = self.push_edge(bt);
         let target = pool | if nullable { NULLABLE_BIT } else { 0 };
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(if on_fail {
             Op::BrOnCastFail { ty, target }
         } else {

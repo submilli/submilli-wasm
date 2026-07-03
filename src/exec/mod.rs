@@ -46,10 +46,8 @@ mod step;
 mod table;
 pub(crate) mod trace;
 
-use std::sync::Arc;
-
 use crate::instance::Instance;
-use crate::module::op::CompiledFunc;
+use crate::module::code::Code;
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::value::Val;
@@ -117,7 +115,7 @@ impl Execution {
         delim: Delimiter,
         instance: Instance,
         func_index: u32,
-        code: Arc<CompiledFunc>,
+        code: Code,
         args: Vec<Val>,
     ) {
         if delim == Delimiter::HostReentry {
@@ -212,19 +210,19 @@ impl Execution {
         gates: (bool, bool, bool),
     ) -> Result<Outcome> {
         let stack_limit = inner.engine().max_wasm_stack();
-        let (mut code, mut ip, mut base, mut instance) = self.top();
+        let (mut code, mut func, mut ip, mut base, mut instance) = self.top();
         // Two-level loop: the outer level re-derives the current frame's `ops` slice whenever the
         // frame changes; the inner level then fetches each op with a single `.get` — no per-op
         // `Arc`→`Vec`→len pointer chase, and the `None` case doubles as the end-of-function return
         // (so there is no separate bounds check anywhere on the hot path).
         'frame: loop {
-            let ops = code.ops.as_slice();
+            let ops = code.ops_of(&func);
             loop {
                 let Some(op) = ops.get(ip as usize) else {
-                    if self.do_return(code.n_results, stop_depth) {
+                    if self.do_return(func.n_results, stop_depth) {
                         return Ok(Outcome::Finished);
                     }
-                    (code, ip, base, instance) = self.top();
+                    (code, func, ip, base, instance) = self.top();
                     continue 'frame;
                 };
                 if GATED {
@@ -235,7 +233,7 @@ impl Execution {
                 match self.step(inner, &code, op, ip + 1, base, instance) {
                     Err(e) => match self.unwind(inner, e, ip, stop_depth) {
                         Ok(()) => {
-                            (code, ip, base, instance) = self.top();
+                            (code, func, ip, base, instance) = self.top();
                             continue 'frame;
                         }
                         Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
@@ -252,6 +250,7 @@ impl Execution {
                         self.frames.last_mut().expect("caller frame").ip = req.return_ip;
                         self.push_call(req.instance, req.func_index, req.code.clone());
                         code = req.code;
+                        func = self.frames.last().expect("callee frame").func;
                         ip = 0;
                         base = self.frames.last().expect("callee frame").locals_base;
                         instance = req.instance;
@@ -261,9 +260,10 @@ impl Execution {
                     // the args to the frame's base and pops it, then `push_call` lays the callee
                     // there.
                     Ok(StepOutcome::DoTailCall(req)) => {
-                        self.do_return(req.code.n_params, stop_depth);
+                        self.do_return(req.code.n_params(), stop_depth);
                         self.push_call(req.instance, req.func_index, req.code.clone());
                         code = req.code;
+                        func = self.frames.last().expect("callee frame").func;
                         ip = 0;
                         base = self.frames.last().expect("callee frame").locals_base;
                         instance = req.instance;

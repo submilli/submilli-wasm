@@ -5,8 +5,6 @@
 // Memory/table limits are validated to fit u32 for 32-bit memories/tables.
 #![allow(clippy::cast_possible_truncation)]
 
-use std::sync::Arc;
-
 use wasmparser::{
     BinaryReaderError, DataKind, ElementItems, ElementKind, ExternalKind, FuncToValidate,
     FunctionBody, GlobalSectionReader, ImportSectionReader, Parser, Payload, TypeRef, ValidPayload,
@@ -15,6 +13,7 @@ use wasmparser::{
 
 use crate::canon::{AggKind, ModuleType};
 use crate::engine::Engine;
+use crate::module::code::CodeArenas;
 use crate::module::compile::{
     conv_globaltype, conv_memtype, conv_tabletype, translate_function, CompileCtx,
 };
@@ -71,7 +70,7 @@ pub(crate) fn parse_module(
         }
     }
 
-    m.functions = compile_bodies(&m, funcs, &bodies, keep_offsets)?;
+    (m.functions, m.code) = compile_bodies(&m, funcs, &bodies, keep_offsets)?;
     // Register the module's rec groups in the engine, baking canonical type ids.
     m.intern(engine);
     Ok(m)
@@ -161,6 +160,7 @@ fn empty_inner() -> ModuleInner {
         func_types: Vec::new(),
         num_imported_funcs: 0,
         functions: Vec::new(),
+        code: CodeArenas::default(),
         imports: Vec::new(),
         exports: Vec::new(),
         memories: Vec::new(),
@@ -344,7 +344,7 @@ fn compile_bodies(
     funcs: Vec<FuncToValidate<ValidatorResources>>,
     bodies: &[FunctionBody<'_>],
     retain_offsets: bool,
-) -> Result<Vec<Arc<CompiledFunc>>> {
+) -> Result<(Vec<CompiledFunc>, CodeArenas)> {
     let kinds: Vec<AggKind> = m.types.iter().map(ModuleType::kind).collect();
     let tag_types = tag_type_indices(m);
     let ctx = CompileCtx {
@@ -353,23 +353,36 @@ fn compile_bodies(
         func_types: &m.func_types,
         tag_types: &tag_types,
     };
+    // One set of module-wide arenas, pre-reserved once at half the total body bytes — real
+    // code averages ~0.5 ops per encoded byte, so this almost never regrows (worst case: one
+    // doubling), and any over-reserve is untouched pages (capacity is virtual until written).
+    // No `shrink_to_fit`: reallocation churn across size classes is what balloons peak RSS
+    // (freed chunks linger in RSS accounting until memory pressure); steady-size allocations
+    // recycle cleanly across compiles instead.
+    let mut code = CodeArenas::default();
+    let op_estimate: usize = bodies.iter().map(|b| b.range().len()).sum::<usize>() / 2;
+    code.ops.reserve(op_estimate);
+    if retain_offsets {
+        code.offsets.reserve(op_estimate);
+    }
     // Recycled across bodies so per-function validation reuses one scratch arena.
     let mut allocs = wasmparser::FuncValidatorAllocations::default();
-    // Recycled across bodies so per-function `ctrl`/`local_types` reuse one allocation.
+    // Recycled across bodies so per-function `ctrl` reuses one allocation.
     let mut scratch = super::compile::Scratch::default();
     let mut out = Vec::with_capacity(bodies.len());
     for (i, (to_validate, body)) in funcs.into_iter().zip(bodies).enumerate() {
         let type_idx = m.func_types[m.num_imported_funcs as usize + i];
         let mut validator = to_validate.into_validator(allocs);
-        out.push(Arc::new(translate_function(
+        out.push(translate_function(
             &ctx,
+            &mut code,
             type_idx,
             body,
             &mut validator,
             retain_offsets,
             &mut scratch,
-        )?));
+        )?);
         allocs = validator.into_allocations();
     }
-    Ok(out)
+    Ok((out, code))
 }

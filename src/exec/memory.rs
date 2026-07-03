@@ -9,7 +9,8 @@
 use super::Execution;
 use crate::extern_::Memory;
 use crate::instance::Instance;
-use crate::module::op::{CompiledFunc, MemArg, Op, BIG_MEMARG};
+use crate::module::code::Code;
+use crate::module::op::{MemArg, Op, BIG_MEMARG};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::{Error, Result};
@@ -23,9 +24,9 @@ fn oob() -> Error {
 /// function's out-of-line pool instead.
 #[inline(always)]
 #[allow(clippy::inline_always)] // one hot caller per load/store inside the fused dispatch
-fn resolve(code: &CompiledFunc, m: &MemArg) -> (u32, u64) {
+fn resolve(code: &Code, m: &MemArg) -> (u32, u64) {
     if m.offset == BIG_MEMARG {
-        let big = &code.big_memargs[m.memory as usize];
+        let big = &code.big_memargs()[m.memory as usize];
         (big.memory, big.offset)
     } else {
         (m.memory, u64::from(m.offset))
@@ -48,7 +49,7 @@ impl Execution {
     pub(super) fn exec_memory(
         &mut self,
         inner: &mut StoreInner,
-        code: &CompiledFunc,
+        code: &Code,
         op: &Op,
         instance: Instance,
     ) -> Result<()> {
@@ -247,7 +248,7 @@ impl Execution {
     pub(super) fn load_n<const N: usize>(
         &mut self,
         inner: &StoreInner,
-        code: &CompiledFunc,
+        code: &Code,
         instance: Instance,
         m: &MemArg,
     ) -> Result<[u8; N]> {
@@ -262,7 +263,7 @@ impl Execution {
     pub(super) fn store_n<const N: usize>(
         &mut self,
         inner: &mut StoreInner,
-        code: &CompiledFunc,
+        code: &Code,
         instance: Instance,
         m: &MemArg,
         data: [u8; N],

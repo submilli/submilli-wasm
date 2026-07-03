@@ -1,11 +1,9 @@
 //! Backtrace capture (#29d): build a [`WasmBacktrace`] from the live frame stack at a trap/throw,
 //! or from the host-call snapshot for `WasmBacktrace::capture`. Frames are most-recent first.
 
-use std::sync::Arc;
-
 use crate::backtrace::{FrameInfo, WasmBacktrace};
 use crate::instance::Instance;
-use crate::module::op::CompiledFunc;
+use crate::module::code::Code;
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::Error;
@@ -20,14 +18,11 @@ pub(crate) fn frame_info(
     inner: &StoreInner,
     instance: Instance,
     func_index: u32,
-    code: &Arc<CompiledFunc>,
+    code: &Code,
     ip: u32,
 ) -> Option<FrameInfo> {
     let module = inner.try_instance(instance)?.module.clone();
-    let code_offset = code
-        .offsets
-        .as_deref()
-        .and_then(|o| o.get(ip as usize).copied());
+    let code_offset = code.offsets().and_then(|o| o.get(ip as usize).copied());
     Some(FrameInfo::new(module, func_index, code_offset))
 }
 

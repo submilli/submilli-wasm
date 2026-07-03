@@ -151,11 +151,14 @@ impl FrameInfo {
 
     /// The module-relative offset of this function's first instruction, from the offset table.
     fn func_start(&self) -> Option<u32> {
-        let defined = self
-            .func_index
+        // Imported functions have no compiled body (`code()` expects a defined index).
+        self.func_index
             .checked_sub(self.module.inner().num_imported_funcs)?;
-        let func = self.module.inner().functions.get(defined as usize)?;
-        func.offsets.as_deref()?.first().copied()
+        self.module
+            .code(self.func_index)
+            .offsets()?
+            .first()
+            .copied()
     }
 
     fn build_symbols(&self) -> Box<[FrameSymbol]> {
@@ -242,7 +245,7 @@ mod tests {
         // The default engine no longer retains DWARF (#29c); opt in for file/line.
         let engine = Engine::new(Config::new().debug_info(true)).unwrap();
         let module = Module::new(&engine, FIXTURE).unwrap();
-        let offset = module.inner().functions[0].offsets.as_deref().unwrap()[0];
+        let offset = module.code(0).offsets().unwrap()[0];
 
         let frame = FrameInfo::new(module.clone(), 0, Some(offset));
         assert_eq!(frame.func_index(), 0);
@@ -266,7 +269,7 @@ mod tests {
     fn symbolication_is_lazy() {
         let engine = Engine::new(Config::new().debug_info(true)).unwrap();
         let module = Module::new(&engine, FIXTURE).unwrap();
-        let offset = module.inner().functions[0].offsets.as_deref().unwrap()[0];
+        let offset = module.code(0).offsets().unwrap()[0];
 
         let frame = FrameInfo::new(module.clone(), 0, Some(offset));
         assert!(

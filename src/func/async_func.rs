@@ -92,8 +92,7 @@ impl Func {
                     .inner()
                     .instance(instance)
                     .module
-                    .inner()
-                    .compiled(func_index);
+                    .code(func_index);
                 let result_tys: Vec<crate::value::ValType> = ty.results().collect();
                 let args = crate::extern_::coerce_args(
                     &mut store.as_context_mut().store_mut().inner,

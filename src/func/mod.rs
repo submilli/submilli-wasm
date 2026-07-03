@@ -109,12 +109,7 @@ impl Func {
         let out = match kind {
             Callee::Wasm(instance, func_index) => {
                 let mut ctx = store.as_context_mut();
-                let code = ctx
-                    .inner()
-                    .instance(instance)
-                    .module
-                    .inner()
-                    .compiled(func_index);
+                let code = ctx.inner().instance(instance).module.code(func_index);
                 let result_tys: Vec<crate::value::ValType> = ty.results().collect();
                 let args = crate::extern_::coerce_args(&mut ctx.store_mut().inner, params, &ty)?;
                 crate::exec::host::execute(

@@ -22,8 +22,8 @@ fn dwarf_fixture_resolves_source_line() {
     let module = Module::new(&engine, FIXTURE).unwrap();
     let inner = module.inner();
 
-    let boom = &inner.functions[0];
-    let offsets = boom.offsets.as_deref().expect("debug retention is on");
+    let boom = module.code(0);
+    let offsets = boom.offsets().expect("debug retention is on");
     let entry = inner
         .debug
         .lookup(offsets[0])
@@ -54,7 +54,8 @@ fn debug_info_survives_serialize_round_trip() {
 
     let restored = unsafe { Module::deserialize(&engine, &artifact) }.unwrap();
     let inner = restored.inner();
-    let offsets = inner.functions[0].offsets.as_deref().expect("offsets kept");
+    let boom = module.code(0);
+    let offsets = boom.offsets().expect("offsets kept");
     let entry = inner.debug.lookup(offsets[0]).expect("line still resolves");
     assert!(entry.file.ends_with("fixture.rs"));
     assert_eq!(entry.line, 13);
@@ -101,10 +102,8 @@ fn default_engine_keeps_offsets_and_names_not_dwarf() {
     let engine = Engine::default();
     let module = Module::new(&engine, FIXTURE).unwrap();
     let inner = module.inner();
-    let offsets = inner.functions[0]
-        .offsets
-        .as_deref()
-        .expect("offsets kept by default");
+    let boom = module.code(0);
+    let offsets = boom.offsets().expect("offsets kept by default");
     assert_eq!(inner.debug.func_name(0), Some("boom"));
     assert!(
         inner.debug.lookup(offsets[0]).is_none(),
@@ -118,6 +117,6 @@ fn wasm_backtrace_off_drops_offsets_and_names() {
     let engine = Engine::new(Config::new().wasm_backtrace(false)).unwrap();
     let module = Module::new(&engine, FIXTURE).unwrap();
     let inner = module.inner();
-    assert!(inner.functions[0].offsets.is_none());
+    assert!(module.code(0).offsets().is_none());
     assert_eq!(inner.debug.func_name(0), None);
 }

@@ -225,4 +225,12 @@ impl Module {
     pub(crate) fn inner(&self) -> &ModuleInner {
         &self.0
     }
+
+    /// Runtime handle to the compiled body of a *defined* module-space function index.
+    pub(crate) fn code(&self, module_func_idx: u32) -> code::Code {
+        code::Code {
+            module: self.0.clone(),
+            index: module_func_idx - self.0.num_imported_funcs,
+        }
+    }
 }

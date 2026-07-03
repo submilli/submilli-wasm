@@ -39,7 +39,7 @@ impl Translator<'_> {
             base_height,
             param_count,
             result_count,
-            start_ip: self.ops.len() as u32,
+            start_ip: self.next_ip(),
             end_patches: Vec::new(),
             else_patch: None,
             reachable_on_entry: self.reachable,
@@ -55,9 +55,9 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn end_try_table(&mut self) -> Result<()> {
         let frame = self.ctrl.pop().expect("try_table frame");
         let base_height = frame.base_height;
-        let body_end = self.ops.len() as u32;
+        let body_end = self.next_ip();
 
-        let skip_idx = self.ops.len() as u32;
+        let skip_idx = self.next_ip();
         let (keep, _) = super::branch::fixup(frame.result_count, 0)?;
         self.emit(Op::Br(BranchTarget {
             ip: 0,
@@ -70,7 +70,7 @@ impl Translator<'_> {
             // The landing pad branches with the operand stack at restore-height + payload.
             self.height = base_height + self.payload_count(c);
             let (target, patch_frame) = self.branch_target(c.label)?;
-            let landing_ip = self.ops.len() as u32;
+            let landing_ip = self.next_ip();
             self.emit(Op::Br(target));
             self.register_branch(patch_frame, landing_ip, PatchSlot::Single);
             recs.push(HandlerRec {
@@ -81,12 +81,12 @@ impl Translator<'_> {
                 landing_ip,
             });
         }
-        let cont = self.ops.len() as u32;
+        let cont = self.next_ip();
         self.patch_ip(skip_idx, PatchSlot::Single, cont);
         for patch in &frame.end_patches {
             self.patch_ip(patch.op, patch.slot, cont);
         }
-        self.handlers.push(HandlerSpan {
+        self.code.handlers.push(HandlerSpan {
             start_ip: frame.start_ip,
             end_ip: body_end,
             clauses: recs.into_boxed_slice(),

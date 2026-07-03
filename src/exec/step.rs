@@ -7,7 +7,8 @@
 use super::call::{self, CallKind};
 use super::{cell, Execution, StepOutcome};
 use crate::instance::Instance;
-use crate::module::op::{CmpKind, CompiledFunc, Op};
+use crate::module::code::Code;
+use crate::module::op::{CmpKind, Op};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::Result;
@@ -27,7 +28,7 @@ impl Execution {
     pub(super) fn step(
         &mut self,
         inner: &mut StoreInner,
-        code: &CompiledFunc,
+        code: &Code,
         op: &Op,
         next: u32,
         base: u32,
@@ -107,8 +108,9 @@ impl Execution {
             }
             Op::BrTable(range) => {
                 // Targets live out-of-line in `code.br_tables`: `len` cases then the default.
-                let cases = &code.br_tables[range.base as usize..(range.base + range.len) as usize];
-                let default = &code.br_tables[(range.base + range.len) as usize];
+                let pool = code.br_tables();
+                let cases = &pool[range.base as usize..(range.base + range.len) as usize];
+                let default = &pool[(range.base + range.len) as usize];
                 let i = self.pop_i32() as u32 as usize;
                 let t = cases.get(i).unwrap_or(default);
                 self.take_branch(*t);

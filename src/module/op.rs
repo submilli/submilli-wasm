@@ -14,7 +14,7 @@ pub(crate) use super::op_types::*;
 /// pools), `BranchTarget` packs its stack fixup into two `u16`s, and nothing inline is `Box`ed —
 /// a `Vec<Op>` frees in one shot at teardown, and the op stream is 33% smaller resident than the
 /// previous 24-byte layout at unchanged decode shape (fixed width, aligned fields).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Op {
     // --- control ---
     Unreachable,

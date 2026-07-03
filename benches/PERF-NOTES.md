@@ -640,3 +640,33 @@ Measured (interleaved, though on a thermally saturated machine):
 Consistent with §9's earlier "24→16 is speed-flat" probe. The remaining density levers,
 in order: the §10a module arena + spans + de-`Arc` (kills per-function boxes + `Vec`
 slack; ~2.5 ms compile win when spiked), then 8–12 B ops (pool i64/f64 consts, wasmi-style).
+
+### Part 2 — §10a re-landed: module arenas + spans + de-`Arc`
+
+`CodeArenas` on `ModuleInner` (ops / local_types / handlers / br_tables / big_memargs /
+offsets — one allocation per stream for the whole module), `CompiledFunc` reduced to a
+`Copy` record of `Span`s, `functions: Vec<CompiledFunc>` (one allocation, no per-function
+`Arc`/`Box`es), and a `Code { Arc<ModuleInner>, index }` runtime handle. The translator
+writes straight into the arenas (per-function bases; zero allocation in the per-body loop).
+
+Two lessons re-learned along the way:
+- **Reserve the statistical size, not the upper bound, and never `shrink_to_fit`.** The
+  first cut reserved total-body-bytes ops (62 MB) then shrank — reallocation churn across
+  size classes ballooned peak RSS to 549 MB over 21 compiles (freed chunks linger in RSS
+  accounting until memory pressure). Reserving bytes/2 (~94% accurate; over-reserve is
+  untouched pages, i.e. free) with no shrink made allocations steady-size and recyclable.
+- **Cache the `Copy` record in the `Frame`.** First cut re-resolved `functions[index]`
+  through the `Code` handle on every call/return — a consistent ~4% CoreMark dip. Frames
+  now carry the 64-byte record; the dispatch loop reads spans/arity from it directly.
+
+Measured (interleaved vs the 16-B baseline, same window):
+
+| metric | 16 B per-func | + arenas |
+|---|---:|---:|
+| spidermonkey `Module::new` | 26.5 ms | **24.7 ms (−7%)** |
+| **peak RSS, compile+hold spidermonkey** | 115 MB | **44.5 MB (−61%)** |
+| CoreMark / sieve | — | flat |
+
+**Session 4 combined (24-B start → 16-B ops + arenas): peak RSS 162 → 44.5 MB (−73%),
+compile 27.8 → 24.7 ms, runtime flat.** The density ladder's next rung (8–12 B ops via
+const pooling) is now the only encoding lever left, and much less pressing.

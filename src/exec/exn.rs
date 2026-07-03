@@ -10,8 +10,8 @@ use crate::canon::RefKind;
 use crate::exception::ThrownException;
 use crate::extern_::Tag;
 use crate::instance::Instance;
+use crate::module::code::Code;
 use crate::module::handler::HandlerRec;
-use crate::module::op::CompiledFunc;
 use crate::store::{ExnEntity, StoreInner};
 use crate::trap::Trap;
 use crate::value::{ExnRef, Rooted, Val, ValType};
@@ -123,7 +123,7 @@ impl Execution {
             let frame = self.frames.last().expect("unwind: empty frame stack");
             let (code, base, instance) = (frame.code.clone(), frame.locals_base, frame.instance);
             if let Some(rec) = find_clause(&code, fault_ip, inner, instance, thrown) {
-                let floor = base + code.n_params + code.local_types.len() as u32;
+                let floor = base + code.n_params() + code.local_types().len() as u32;
                 let restore = (floor + rec.restore_height) as usize;
                 self.values.truncate(restore);
                 self.shadow.truncate(restore);
@@ -182,13 +182,13 @@ impl Execution {
 
 /// The first catch clause (innermost span, source order) whose tag matches the thrown exception.
 fn find_clause(
-    code: &CompiledFunc,
+    code: &Code,
     ip: u32,
     inner: &StoreInner,
     instance: Instance,
     thrown: Tag,
 ) -> Option<HandlerRec> {
-    for span in &code.handlers {
+    for span in code.handlers() {
         if ip >= span.start_ip && ip < span.end_ip {
             for rec in &span.clauses {
                 let matches = match rec.tag {

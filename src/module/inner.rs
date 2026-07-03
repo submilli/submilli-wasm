@@ -3,8 +3,6 @@
 //! shared behind an `Arc` inside [`Module`](super::Module), and consumed by
 //! `instance::init` at instantiation time.
 
-use std::sync::Arc;
-
 use crate::canon::{
     self, AggKind, CanonicalTypeId, GroupId, IrGlobalType, IrHeap, IrTableType, Layout, ModuleType,
 };
@@ -19,15 +17,18 @@ use crate::value::{ExternType, FuncType, GlobalType, MemoryType, TableType, TagT
 /// `type_ids` (module type index → engine-canonical id) and `group_handles` (for release on
 /// drop). Runtime type identity compares the canonical ids; the structure stays for func
 /// signatures and (later) field layout.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ModuleInner {
     pub types: Vec<ModuleType>,
     /// Type index for every function — imported functions first, then defined.
     pub func_types: Vec<u32>,
     pub num_imported_funcs: u32,
     /// Compiled bodies for *defined* functions (index = module func idx
-    /// minus [`num_imported_funcs`](Self::num_imported_funcs)).
-    pub functions: Vec<Arc<CompiledFunc>>,
+    /// minus [`num_imported_funcs`](Self::num_imported_funcs)) — `Copy` span records into
+    /// [`code`](Self::code).
+    pub functions: Vec<CompiledFunc>,
+    /// Module-wide arenas holding every function's op stream and side tables contiguously.
+    pub code: crate::module::code::CodeArenas,
     pub imports: Vec<Import>,
     pub exports: Vec<Export>,
     /// *Defined* memory/table/global descriptors (imported ones live in `imports`).
@@ -245,11 +246,6 @@ pub(crate) enum ConstOp {
 }
 
 impl ModuleInner {
-    /// The compiled body for a *defined* module-space function index.
-    pub(crate) fn compiled(&self, module_func_idx: u32) -> Arc<CompiledFunc> {
-        self.functions[(module_func_idx - self.num_imported_funcs) as usize].clone()
-    }
-
     /// The signature handle of any module-space function index (imported or defined).
     pub(crate) fn func_type(&self, module_func_idx: u32) -> FuncType {
         canon::func_handle(

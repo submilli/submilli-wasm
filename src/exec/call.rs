@@ -28,7 +28,7 @@ pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
         } => {
             let def_inst = *instance;
             let module = inner.instance(def_inst).module.clone();
-            ResolvedCall::Wasm(def_inst, *func_index, module.inner().compiled(*func_index))
+            ResolvedCall::Wasm(def_inst, *func_index, module.code(*func_index))
         }
         FuncEntity::Host { .. } => ResolvedCall::Host(f),
         #[cfg(feature = "async")]
@@ -69,7 +69,7 @@ impl Execution {
                     .instance(*def_inst)
                     .module
                     .inner()
-                    .canonical_type_id(code.type_idx);
+                    .canonical_type_id(code.type_idx());
                 if !inner.engine().is_subtype(actual_id, expected_id) {
                     return Err(Trap::BadSignature.into());
                 }

@@ -23,7 +23,7 @@ mod visit_simd;
 use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, ValidatorResources};
 
 use crate::canon::{AggKind, IrVal, ModuleType};
-use crate::module::handler::HandlerSpan;
+use crate::module::code::{CodeArenas, Span};
 use crate::module::op::{BigMemArg, BranchTarget, CmpKind, CompiledFunc, MemArg, Op, BIG_MEMARG};
 use crate::{Error, Result};
 
@@ -59,8 +59,10 @@ pub(crate) struct Scratch {
 /// Validates and translates a single function body into a [`CompiledFunc`] in one pass: each
 /// operator is validated (via `fv`) and lowered to internal bytecode as it is decoded, so the
 /// body's bytes are read exactly once. Module-level validation has already run in `parse_module`.
+#[allow(clippy::too_many_arguments)] // the compile pipeline's one fan-in point
 pub(crate) fn translate_function(
     ctx: &CompileCtx<'_>,
+    code: &mut CodeArenas,
     type_idx: u32,
     body: &FunctionBody<'_>,
     fv: &mut FuncValidator<ValidatorResources>,
@@ -76,27 +78,19 @@ pub(crate) fn translate_function(
     // is negligible (the operator body, which dominates, is still walked exactly once below).
     fv.read_locals(&mut body.get_binary_reader())
         .map_err(wp_err)?;
-    scratch.local_types.clear();
+    let locals_start = code.local_types.len() as u32;
     for entry in body.get_locals_reader().map_err(wp_err)? {
         let (count, ty) = entry.map_err(wp_err)?;
         let vt = conv_valtype(ctx.kinds, ty)?;
         for _ in 0..count {
-            scratch.local_types.push(vt.clone());
+            code.local_types.push(vt.clone());
         }
     }
-    let local_types: Box<[IrVal]> = scratch.local_types.as_slice().into();
 
-    // Pre-size the op buffer from the body byte length so each `Op` is written exactly once (no
-    // regrowth copies). Op count is always < body bytes (every op is ≥1 byte), so this never
-    // under-reserves for real code; a modest over-reserve is freed when the `Vec` moves into the
-    // `CompiledFunc`. `ctrl` is handed the recycled buffer (empty, capacity preserved).
-    let op_hint = body.range().len();
-    let mut t = Translator::with_capacity(
-        ctx,
-        retain_offsets,
-        op_hint,
-        std::mem::take(&mut scratch.ctrl),
-    );
+    // The function's streams append to the module-wide arenas (pre-reserved once in
+    // `compile_bodies` — each `Op` is written exactly once, no regrowth, no per-function
+    // allocation). `ctrl` is handed the recycled buffer (empty, capacity preserved).
+    let mut t = Translator::new(ctx, code, retain_offsets, std::mem::take(&mut scratch.ctrl));
     t.push_func_frame(n_results);
     // Drive `BinaryReader::visit_operator` directly (the same pattern `FuncValidator::validate`
     // uses): `ValidateThenLower` doubles as the reader's `FrameStack`, so no `OperatorsReader` —
@@ -116,71 +110,112 @@ pub(crate) fn translate_function(
 
     // Return the (now-empty) `ctrl` buffer to the scratch so the next body reuses its capacity.
     scratch.ctrl = std::mem::take(&mut t.ctrl);
+    let max_operands = t.max_operands;
+    let base = t.base;
+    let span = |start: u32, end: usize| Span {
+        start,
+        len: end as u32 - start,
+    };
     Ok(CompiledFunc {
-        ops: t.ops,
+        ops: span(base.ops, code.ops.len()),
         type_idx,
         n_params,
         n_results,
-        local_types,
-        max_operands: t.max_operands,
-        handlers: t.handlers.into_boxed_slice(),
-        br_tables: t.br_table_targets.into_boxed_slice(),
-        big_memargs: t.big_memargs.into_boxed_slice(),
-        offsets: t.offsets.map(Vec::into_boxed_slice),
+        local_types: span(locals_start, code.local_types.len()),
+        max_operands,
+        handlers: span(base.handlers, code.handlers.len()),
+        br_tables: span(base.br_tables, code.br_tables.len()),
+        big_memargs: span(base.big_memargs, code.big_memargs.len()),
+        offsets: span(base.offsets, code.offsets.len()),
     })
+}
+
+/// The arena lengths at function entry — the function's span starts. Every in-function index
+/// (branch `ip`s, pool indices) is relative to these.
+#[derive(Copy, Clone)]
+struct Bases {
+    ops: u32,
+    br_tables: u32,
+    big_memargs: u32,
+    handlers: u32,
+    offsets: u32,
 }
 
 struct Translator<'a> {
     ctx: &'a CompileCtx<'a>,
-    ops: Vec<Op>,
+    /// The module-wide arenas this function appends to (no per-function buffers at all).
+    code: &'a mut CodeArenas,
+    base: Bases,
+    retain_offsets: bool,
     height: u32,
     max_operands: u32,
     ctrl: Vec<CtrlFrame>,
     reachable: bool,
-    handlers: Vec<HandlerSpan>,
-    /// Flattened `br_table` target lists (plus `br_on_cast` edges), accumulated across the body;
-    /// moved into [`CompiledFunc::br_tables`]. `Op::BrTable` carries a `{base, len}` range into
-    /// this; `Op::BrOnCast`/`BrOnCastFail` a packed index.
-    br_table_targets: Vec<BranchTarget>,
-    /// Pooled wide memory immediates (see [`MemArg`]); almost always stays empty.
-    big_memargs: Vec<BigMemArg>,
     /// Byte offset of the operator currently being translated; recorded per emitted `Op` into
-    /// `offsets` (when present) so a frame's `ip` can be mapped back to source via DWARF (#29a).
+    /// the offsets arena (when retained) so a frame's `ip` maps back to source via DWARF (#29a).
     cur_offset: u32,
-    /// Parallel to `ops`: one source offset per `Op`. `None` when debug retention is off.
-    offsets: Option<Vec<u32>>,
-    /// `Some(kind)` while `ops.last()` is a fusable i32 relop that an immediately following
-    /// `br_if`/`br_if_not` may collapse into an [`Op::BrIfCmp`]. Set by [`Translator::emit`]
-    /// per emitted op; cleared at every control boundary where a branch label could land
-    /// between the pair (see `control`).
+    /// `Some(kind)` while the last emitted op is a fusable i32 relop that an immediately
+    /// following `br_if`/`br_if_not` may collapse into an [`Op::BrIfCmp`]. Set by
+    /// [`Translator::emit`] per op; cleared at every control boundary where a branch label
+    /// could land between the pair (see `control`).
     fusable_cmp: Option<CmpKind>,
 }
 
 impl<'a> Translator<'a> {
-    fn with_capacity(
+    fn new(
         ctx: &'a CompileCtx<'a>,
+        code: &'a mut CodeArenas,
         retain_offsets: bool,
-        op_hint: usize,
         ctrl: Vec<CtrlFrame>,
     ) -> Self {
+        let base = Bases {
+            ops: code.ops.len() as u32,
+            br_tables: code.br_tables.len() as u32,
+            big_memargs: code.big_memargs.len() as u32,
+            handlers: code.handlers.len() as u32,
+            offsets: code.offsets.len() as u32,
+        };
         Translator {
             ctx,
-            ops: Vec::with_capacity(op_hint),
+            code,
+            base,
+            retain_offsets,
             height: 0,
             max_operands: 0,
             ctrl,
             reachable: true,
-            handlers: Vec::new(),
-            br_table_targets: Vec::new(),
-            big_memargs: Vec::new(),
             cur_offset: 0,
-            offsets: retain_offsets.then(|| Vec::with_capacity(op_hint)),
             fusable_cmp: None,
         }
     }
 
+    /// The function-relative ip the *next* emitted op will get.
+    fn next_ip(&self) -> u32 {
+        self.code.ops.len() as u32 - self.base.ops
+    }
+
+    /// The already-emitted op at function-relative ip `idx` (branch patching / fusion).
+    fn op_mut(&mut self, idx: u32) -> &mut Op {
+        &mut self.code.ops[(self.base.ops + idx) as usize]
+    }
+
+    fn op_ref(&self, idx: u32) -> &Op {
+        &self.code.ops[(self.base.ops + idx) as usize]
+    }
+
+    /// Appends a branch edge to the shared pool, returning its function-relative index.
+    fn push_edge(&mut self, t: BranchTarget) -> u32 {
+        let rel = self.code.br_tables.len() as u32 - self.base.br_tables;
+        self.code.br_tables.push(t);
+        rel
+    }
+
+    fn edge_mut(&mut self, rel: u32) -> &mut BranchTarget {
+        &mut self.code.br_tables[(self.base.br_tables + rel) as usize]
+    }
+
     /// Converts a wasmparser memarg to the compact form, demoting a wide offset (memory64, or
-    /// the literal `u32::MAX`) to the per-function pool behind the [`BIG_MEMARG`] sentinel.
+    /// the literal `u32::MAX`) to the function's pool behind the [`BIG_MEMARG`] sentinel.
     fn memarg(&mut self, m: wasmparser::MemArg) -> MemArg {
         if m.offset < u64::from(BIG_MEMARG) {
             MemArg {
@@ -188,8 +223,8 @@ impl<'a> Translator<'a> {
                 offset: m.offset as u32,
             }
         } else {
-            let idx = self.big_memargs.len() as u32;
-            self.big_memargs.push(BigMemArg {
+            let idx = self.code.big_memargs.len() as u32 - self.base.big_memargs;
+            self.code.big_memargs.push(BigMemArg {
                 memory: m.memory,
                 offset: m.offset,
             });
@@ -201,11 +236,11 @@ impl<'a> Translator<'a> {
     }
 
     fn emit(&mut self, op: Op) {
-        if let Some(offsets) = &mut self.offsets {
-            offsets.push(self.cur_offset);
+        if self.retain_offsets {
+            self.code.offsets.push(self.cur_offset);
         }
         self.fusable_cmp = fusable_cmp_of(&op);
-        self.ops.push(op);
+        self.code.ops.push(op);
     }
 
     fn push(&mut self, n: u32) {

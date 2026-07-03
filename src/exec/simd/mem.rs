@@ -19,7 +19,7 @@ impl Execution {
     pub(super) fn exec_simd_mem(
         &mut self,
         inner: &mut StoreInner,
-        code: &crate::module::op::CompiledFunc,
+        code: &crate::module::code::Code,
         s: &SimdOp,
         instance: Instance,
     ) -> Result<bool> {

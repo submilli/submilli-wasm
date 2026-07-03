@@ -2,12 +2,10 @@
 //! suspended ([`Outcome`]), what one [`step`](super::Execution::step) decided
 //! ([`StepOutcome`]), and a resolved call target ([`ResolvedCall`]/[`CallReq`]).
 
-use std::sync::Arc;
-
 use crate::extern_::{Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
-use crate::module::op::CompiledFunc;
+use crate::module::code::Code;
 use crate::value::Ref;
 
 /// Why [`Execution::run`](super::Execution::run) returned: either the call finished or it
@@ -103,7 +101,7 @@ pub(super) enum StepOutcome {
 /// A resolved callee: a wasm body (defining instance + func index + code) to push a frame for,
 /// or a host func to suspend on.
 pub(super) enum ResolvedCall {
-    Wasm(Instance, u32, Arc<CompiledFunc>),
+    Wasm(Instance, u32, Code),
     Host(Func),
     #[cfg(feature = "async")]
     HostAsync(Func),
@@ -114,5 +112,5 @@ pub(super) struct CallReq {
     pub return_ip: u32,
     pub instance: Instance,
     pub func_index: u32,
-    pub code: Arc<CompiledFunc>,
+    pub code: Code,
 }

@@ -6,8 +6,6 @@
 // Indexing is `{async_,}host_funcs[host_index]` with `host_index` from a validated entity (#33).
 #![allow(clippy::indexing_slicing)]
 
-use std::sync::Arc;
-
 use super::epoch::apply_epoch_deadline;
 #[cfg(feature = "async")]
 use super::epoch::{apply_epoch_deadline_async, yield_now};
@@ -18,7 +16,7 @@ use crate::exception::ThrownException;
 use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
 use crate::instance::Instance;
-use crate::module::op::CompiledFunc;
+use crate::module::code::Code;
 use crate::store::{FuncEntity, Store};
 use crate::value::{Ref, Val, ValType};
 use crate::Result;
@@ -49,7 +47,7 @@ fn enter<T>(
     store: &mut Store<T>,
     instance: Instance,
     func_index: u32,
-    code: Arc<CompiledFunc>,
+    code: Code,
     args: Vec<Val>,
 ) -> (Execution, Boundary) {
     let mut exec = store.inner.take_exec().unwrap_or_default();
@@ -102,7 +100,7 @@ pub(crate) fn execute<T>(
     store: &mut Store<T>,
     instance: Instance,
     func_index: u32,
-    code: Arc<CompiledFunc>,
+    code: Code,
     args: Vec<Val>,
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
@@ -156,7 +154,7 @@ pub(crate) async fn execute_async<T>(
     store: &mut Store<T>,
     instance: Instance,
     func_index: u32,
-    code: Arc<CompiledFunc>,
+    code: Code,
     args: Vec<Val>,
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {

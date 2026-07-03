@@ -22,7 +22,7 @@ pub(super) fn fixup(keep: u32, pop: u32) -> Result<(u16, u16)> {
 impl Translator<'_> {
     pub(in crate::module::compile) fn br(&mut self, depth: u32) -> Result<()> {
         let (target, patch_frame) = self.branch_target(depth)?;
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(Op::Br(target));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.reachable = false;
@@ -35,8 +35,8 @@ impl Translator<'_> {
         // Fuse with an immediately preceding i32 relop: replace it in place (offsets stay
         // aligned — nothing is pushed) so compare-and-branch is one dispatch at runtime.
         if let Some(kind) = self.fusable_cmp.take() {
-            let idx = self.ops.len() as u32 - 1;
-            self.ops[idx as usize] = Op::BrIfCmp {
+            let idx = self.next_ip() - 1;
+            *self.op_mut(idx) = Op::BrIfCmp {
                 kind,
                 negate: false,
                 target,
@@ -44,7 +44,7 @@ impl Translator<'_> {
             self.register_branch(patch_frame, idx, PatchSlot::Single);
             return Ok(());
         }
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(Op::BrIf(target));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         // conditional: fall-through stays reachable with the operands intact
@@ -56,22 +56,22 @@ impl Translator<'_> {
         let cases: Vec<u32> = table.targets().collect::<Result<_, _>>().map_err(wp_err)?;
         // Append this table's targets (cases then default) contiguously to the side-table; the
         // `Op` carries only the `{base, len}` range into it.
-        let base = self.br_table_targets.len() as u32;
+        let base = self.code.br_tables.len() as u32 - self.base.br_tables;
         let len = cases.len() as u32;
         let mut patches: Vec<(usize, PatchSlot)> = Vec::new();
         for (k, &depth) in cases.iter().enumerate() {
             let (bt, frame) = self.branch_target(depth)?;
-            self.br_table_targets.push(bt);
+            self.push_edge(bt);
             if let Some(i) = frame {
                 patches.push((i, PatchSlot::TableCase(k as u32)));
             }
         }
         let (default, default_frame) = self.branch_target(table.default())?;
-        self.br_table_targets.push(default);
+        self.push_edge(default);
         if let Some(i) = default_frame {
             patches.push((i, PatchSlot::TableDefault));
         }
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(Op::BrTable(BrTableRange { base, len }));
         for (i, slot) in patches {
             let frame = &mut self.ctrl[i];
@@ -85,7 +85,7 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn ret(&mut self) -> Result<()> {
         let arity = self.ctrl[0].result_count;
         let (keep, pop) = fixup(arity, self.height.saturating_sub(arity))?;
-        let idx = self.ops.len() as u32;
+        let idx = self.next_ip();
         self.emit(Op::Br(BranchTarget { ip: 0, keep, pop }));
         self.ctrl[0].end_patches.push(Patch {
             op: idx,
@@ -128,26 +128,24 @@ impl Translator<'_> {
     pub(super) fn patch_ip(&mut self, op: u32, slot: PatchSlot, ip: u32) {
         // `br_table` targets are out-of-line: resolve the flat side-table index, then patch there
         // (kept separate to avoid aliasing `self.ops` and `self.br_table_targets`).
-        if let Op::BrTable(range) = &self.ops[op as usize] {
+        if let Op::BrTable(range) = self.op_ref(op) {
             let range = *range;
             let flat = match slot {
                 PatchSlot::TableCase(k) => range.base + k,
                 PatchSlot::TableDefault => range.base + range.len,
                 PatchSlot::Single => unreachable!("single slot on br_table"),
             };
-            self.br_table_targets[flat as usize].ip = ip;
+            self.edge_mut(flat).ip = ip;
             return;
         }
         // `br_on_cast` edges are pooled like `br_table` cases (bit 31 of the packed index is
         // the cast's nullable flag).
-        if let Op::BrOnCast { target, .. } | Op::BrOnCastFail { target, .. } =
-            &self.ops[op as usize]
-        {
+        if let Op::BrOnCast { target, .. } | Op::BrOnCastFail { target, .. } = self.op_ref(op) {
             let flat = target & !NULLABLE_BIT;
-            self.br_table_targets[flat as usize].ip = ip;
+            self.edge_mut(flat).ip = ip;
             return;
         }
-        match &mut self.ops[op as usize] {
+        match self.op_mut(op) {
             Op::Br(t)
             | Op::BrIf(t)
             | Op::BrIfNot(t)
