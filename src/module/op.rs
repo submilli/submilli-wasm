@@ -7,40 +7,7 @@
 
 use crate::canon::IrHeap;
 
-pub(crate) type TypeIdx = u32;
-pub(crate) type FuncIdx = u32;
-pub(crate) type TableIdx = u32;
-pub(crate) type GlobalIdx = u32;
-pub(crate) type LocalIdx = u32;
-pub(crate) type DataIdx = u32;
-pub(crate) type ElemIdx = u32;
-
-/// A memory-access immediate: target memory index (#41) + static offset (`align` is validation-only).
-#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MemArg {
-    pub memory: u32,
-    pub offset: u64,
-}
-
-/// A resolved branch edge: on a taken branch the top `keep` operands are moved down over
-/// `pop` discarded ones, then execution jumps to `ip`.
-#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct BranchTarget {
-    pub ip: u32,
-    pub keep: u32,
-    pub pop: u32,
-}
-
-/// A `br_table`'s target list, stored out-of-line in [`CompiledFunc::br_tables`]: the `len` case
-/// targets occupy `[base .. base + len]` and the default sits at `base + len`. Keeping the targets
-/// out of the `Op` enum is what makes `Op` non-drop (the `Box` here was its only drop field) — so a
-/// `Vec<Op>` frees in one shot. (Size is separately pinned at 24 bytes by the `MemArg` loads/stores
-/// and the `BrOnCast`/`BrOnCastFail` variants, not by this.)
-#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct BrTableRange {
-    pub base: u32,
-    pub len: u32,
-}
+pub(crate) use super::op_types::*;
 
 /// One internal instruction. 24 bytes and **not** a drop type (`br_table` targets are side-tabled,
 /// so nothing inline is `Box`ed): a `Vec<Op>` frees in one shot at teardown instead of a
@@ -55,6 +22,14 @@ pub(crate) enum Op {
     BrIf(BranchTarget),
     /// Branch when the popped i32 condition is zero (used to lower `if`).
     BrIfNot(BranchTarget),
+    /// Fused i32 compare-and-branch: pops two i32s, branches when `cmp(a, b) != negate` — an
+    /// adjacent relop + `br_if`/`br_if_not` pair collapsed at compile time (one dispatch, no
+    /// intermediate bool). Fused only when nothing can jump between the pair (see `control`).
+    BrIfCmp {
+        kind: CmpKind,
+        negate: bool,
+        target: BranchTarget,
+    },
     /// Targets live in [`CompiledFunc::br_tables`]; see [`BrTableRange`].
     BrTable(BrTableRange),
     Call(FuncIdx),

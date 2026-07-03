@@ -55,8 +55,10 @@ impl Execution {
                 self.push(e);
                 Ok(())
             }
-            // Not a cast op — the remaining straight-line ops are numeric (chain's end).
-            _ => self.exec_numeric(inner, op, instance),
+            // End of the dispatch chain — every straight-line op belongs to a prior category.
+            other => Err(crate::Error::msg(format!(
+                "unexpected op in exec dispatch: {other:?}"
+            ))),
         }
     }
 

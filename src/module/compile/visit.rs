@@ -7,8 +7,12 @@
 //! feature target still need a method for the trait to type-check; [`unsupported_lowering`] emits a
 //! trapping stub for them (never reached — validation rejects them first).
 
-use wasmparser::{for_each_visit_operator, FuncValidator, ValidatorResources, VisitOperator};
+use wasmparser::{
+    for_each_visit_operator, FrameKind, FrameStack, FuncValidator, ValidatorResources,
+    VisitOperator,
+};
 
+use super::control::BlockKind;
 use super::{wp_err, Translator};
 use crate::Result;
 
@@ -71,6 +75,23 @@ macro_rules! validate_then_lower {
             }
         )*
     };
+}
+
+/// Lets the fused driver hand `ValidateThenLower` straight to `BinaryReader::visit_operator`,
+/// skipping `OperatorsReader`'s duplicate syntactic control stack (and its per-body allocation +
+/// per-op `FrameStackAdapter` bookkeeping). The translator's `ctrl` stack is structurally complete
+/// (frames are pushed/popped even in unreachable code), so it can answer the reader's only
+/// questions: "is a frame open?" and "is the top an `if`?". `If` is reported even after `else` —
+/// the validator (which runs on every operator before lowering) rejects a duplicate `else` anyway.
+impl FrameStack for ValidateThenLower<'_, '_> {
+    fn current_frame(&self) -> Option<FrameKind> {
+        Some(match self.translator.open_frame_kind()? {
+            BlockKind::Block => FrameKind::Block,
+            BlockKind::Loop => FrameKind::Loop,
+            BlockKind::If => FrameKind::If,
+            BlockKind::TryTable => FrameKind::TryTable,
+        })
+    }
 }
 
 impl<'a> VisitOperator<'a> for ValidateThenLower<'a, '_> {

@@ -1,13 +1,13 @@
 //! Structured control-flow lowering: blocks/branches → relative-IP `Op`s with the
 //! operand-stack fixup (`keep`/`pop`) folded inline.
 
-use wasmparser::{BlockType, BrTable};
+use wasmparser::BlockType;
 
-use super::{wp_err, Translator};
+use super::Translator;
 use crate::canon::IrHeap;
-use crate::module::op::{BrTableRange, BranchTarget, Op};
-use crate::Result;
+use crate::module::op::{BranchTarget, Op};
 
+mod branch;
 mod calls;
 mod try_table;
 mod visit;
@@ -66,6 +66,14 @@ impl CtrlFrame {
 }
 
 impl Translator<'_> {
+    /// Kind of the innermost open frame, or `None` once the implicit function frame is closed.
+    /// Backs the decode-level [`wasmparser::FrameStack`] the fused driver hands to
+    /// `BinaryReader::visit_operator` — the validator remains the authority on syntax; this only
+    /// steers the reader's `else`/`end` decode and its end-of-expression detection.
+    pub(super) fn open_frame_kind(&self) -> Option<BlockKind> {
+        self.ctrl.last().map(|f| f.kind)
+    }
+
     pub(super) fn push_func_frame(&mut self, n_results: u32) {
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::Block,
@@ -93,6 +101,9 @@ impl Translator<'_> {
     }
 
     pub(super) fn push_block(&mut self, bt: BlockType, kind: BlockKind) {
+        // A `loop` start is a back-edge target (and `block`/`try_table` starts delimit frames):
+        // nothing emitted before this boundary may fuse with a branch after it.
+        self.fusable_cmp = None;
         let (param_count, result_count) = self.block_arity(bt);
         let base_height = self.height.saturating_sub(param_count);
         self.ctrl.push(CtrlFrame {
@@ -114,13 +125,29 @@ impl Translator<'_> {
         let mut else_patch = None;
         if self.reachable {
             self.pop(1); // condition
-            else_patch = Some(self.ops.len() as u32);
-            self.emit(Op::BrIfNot(BranchTarget {
-                ip: 0,
-                keep: 0,
-                pop: 0,
-            }));
+                         // Fuse `relop; if` into one negated compare-and-branch (see `br_if`).
+            if let Some(kind) = self.fusable_cmp.take() {
+                let idx = self.ops.len() as u32 - 1;
+                self.ops[idx as usize] = Op::BrIfCmp {
+                    kind,
+                    negate: true,
+                    target: BranchTarget {
+                        ip: 0,
+                        keep: 0,
+                        pop: 0,
+                    },
+                };
+                else_patch = Some(idx);
+            } else {
+                else_patch = Some(self.ops.len() as u32);
+                self.emit(Op::BrIfNot(BranchTarget {
+                    ip: 0,
+                    keep: 0,
+                    pop: 0,
+                }));
+            }
         }
+        self.fusable_cmp = None;
         let base_height = self.height.saturating_sub(param_count);
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::If,
@@ -137,6 +164,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn do_else(&mut self) {
+        self.fusable_cmp = None;
         let f = self.ctrl.last().expect("else without if");
         let (base, param_count, result_count, roe, else_patch) = (
             f.base_height,
@@ -169,6 +197,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn do_end(&mut self) {
+        self.fusable_cmp = None;
         // A reachable `try_table` emits landing pads + an exception-table span; a dead one (and
         // every other block) falls through to the plain block path below.
         let top = self.ctrl.last().expect("end without frame");
@@ -190,67 +219,6 @@ impl Translator<'_> {
             self.reachable || frame.end_targeted || frame.else_patch.is_some()
         };
         self.height = frame.base_height + frame.result_count;
-    }
-
-    pub(super) fn br(&mut self, depth: u32) {
-        let (target, patch_frame) = self.branch_target(depth);
-        let idx = self.ops.len() as u32;
-        self.emit(Op::Br(target));
-        self.register_branch(patch_frame, idx, PatchSlot::Single);
-        self.reachable = false;
-    }
-
-    pub(super) fn br_if(&mut self, depth: u32) {
-        self.pop(1); // condition
-        let (target, patch_frame) = self.branch_target(depth);
-        let idx = self.ops.len() as u32;
-        self.emit(Op::BrIf(target));
-        self.register_branch(patch_frame, idx, PatchSlot::Single);
-        // conditional: fall-through stays reachable with the operands intact
-    }
-
-    pub(super) fn br_table(&mut self, table: &BrTable<'_>) -> Result<()> {
-        self.pop(1); // index
-        let cases: Vec<u32> = table.targets().collect::<Result<_, _>>().map_err(wp_err)?;
-        // Append this table's targets (cases then default) contiguously to the side-table; the
-        // `Op` carries only the `{base, len}` range into it.
-        let base = self.br_table_targets.len() as u32;
-        let len = cases.len() as u32;
-        let mut patches: Vec<(usize, PatchSlot)> = Vec::new();
-        for (k, &depth) in cases.iter().enumerate() {
-            let (bt, frame) = self.branch_target(depth);
-            self.br_table_targets.push(bt);
-            if let Some(i) = frame {
-                patches.push((i, PatchSlot::TableCase(k as u32)));
-            }
-        }
-        let (default, default_frame) = self.branch_target(table.default());
-        self.br_table_targets.push(default);
-        if let Some(i) = default_frame {
-            patches.push((i, PatchSlot::TableDefault));
-        }
-        let idx = self.ops.len() as u32;
-        self.emit(Op::BrTable(BrTableRange { base, len }));
-        for (i, slot) in patches {
-            let frame = &mut self.ctrl[i];
-            frame.end_patches.push(Patch { op: idx, slot });
-            frame.end_targeted = true;
-        }
-        self.reachable = false;
-        Ok(())
-    }
-
-    pub(super) fn ret(&mut self) {
-        let keep = self.ctrl[0].result_count;
-        let pop = self.height.saturating_sub(keep);
-        let idx = self.ops.len() as u32;
-        self.emit(Op::Br(BranchTarget { ip: 0, keep, pop }));
-        self.ctrl[0].end_patches.push(Patch {
-            op: idx,
-            slot: PatchSlot::Single,
-        });
-        self.ctrl[0].end_targeted = true;
-        self.reachable = false;
     }
 
     /// `throw $tag` / `throw_ref`: stack-polymorphic terminators (like `unreachable`/`ret`). No
@@ -314,61 +282,5 @@ impl Translator<'_> {
     fn signature(&self, type_index: u32) -> (u32, u32) {
         let (params, results) = self.ctx.types[type_index as usize].func_sig();
         (params.len() as u32, results.len() as u32)
-    }
-
-    /// Computes a branch's `BranchTarget`; returns the control-frame index to
-    /// patch later (forward targets), or `None` for an already-resolved loop.
-    fn branch_target(&self, depth: u32) -> (BranchTarget, Option<usize>) {
-        let i = self.ctrl.len() - 1 - depth as usize;
-        let frame = &self.ctrl[i];
-        let keep = frame.label_arity();
-        let pop = self.height.saturating_sub(frame.base_height + keep);
-        if frame.kind == BlockKind::Loop {
-            (
-                BranchTarget {
-                    ip: frame.start_ip,
-                    keep,
-                    pop,
-                },
-                None,
-            )
-        } else {
-            (BranchTarget { ip: 0, keep, pop }, Some(i))
-        }
-    }
-
-    fn register_branch(&mut self, frame: Option<usize>, op: u32, slot: PatchSlot) {
-        if let Some(i) = frame {
-            let f = &mut self.ctrl[i];
-            f.end_patches.push(Patch { op, slot });
-            f.end_targeted = true;
-        }
-    }
-
-    fn patch_ip(&mut self, op: u32, slot: PatchSlot, ip: u32) {
-        // `br_table` targets are out-of-line: resolve the flat side-table index, then patch there
-        // (kept separate to avoid aliasing `self.ops` and `self.br_table_targets`).
-        if let Op::BrTable(range) = &self.ops[op as usize] {
-            let range = *range;
-            let flat = match slot {
-                PatchSlot::TableCase(k) => range.base + k,
-                PatchSlot::TableDefault => range.base + range.len,
-                PatchSlot::Single => unreachable!("single slot on br_table"),
-            };
-            self.br_table_targets[flat as usize].ip = ip;
-            return;
-        }
-        match &mut self.ops[op as usize] {
-            Op::Br(t)
-            | Op::BrIf(t)
-            | Op::BrIfNot(t)
-            | Op::BrOnNull(t)
-            | Op::BrOnNonNull(t)
-            | Op::BrOnCast { target: t, .. }
-            | Op::BrOnCastFail { target: t, .. } => {
-                t.ip = ip;
-            }
-            _ => unreachable!("patch on non-branch op"),
-        }
     }
 }

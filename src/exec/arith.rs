@@ -4,9 +4,9 @@
 // `min`/`max` compare for exact equality to resolve the ±0 case, per the spec.
 #![allow(clippy::float_cmp)]
 
+use super::cell::Cell;
 use super::Execution;
 use crate::trap::Trap;
-use crate::value::Val;
 use crate::Result;
 
 const CANON_F32: u32 = 0x7fc0_0000;
@@ -106,150 +106,126 @@ pub(super) fn div_s_i64(a: i64, b: i64) -> Result<i64> {
 
 impl Execution {
     pub(super) fn i32_binop(&mut self, f: impl Fn(i32, i32) -> i32) {
-        let b = self.pop().unwrap_i32();
-        let a = self.pop().unwrap_i32();
-        self.push(Val::I32(f(a, b)));
+        self.binop_cells(|a, b| Cell::from_i32(f(a.unwrap_i32(), b.unwrap_i32())));
     }
 
     pub(super) fn i32_unop(&mut self, f: impl Fn(i32) -> i32) {
-        let a = self.pop().unwrap_i32();
-        self.push(Val::I32(f(a)));
+        self.unop_cell(|a| Cell::from_i32(f(a.unwrap_i32())));
     }
 
     pub(super) fn i32_relop(&mut self, f: impl Fn(i32, i32) -> bool) {
-        let b = self.pop().unwrap_i32();
-        let a = self.pop().unwrap_i32();
-        self.push(Val::I32(i32::from(f(a, b))));
+        self.binop_cells(|a, b| Cell::from_i32(i32::from(f(a.unwrap_i32(), b.unwrap_i32()))));
     }
 
     pub(super) fn u32_binop(&mut self, f: impl Fn(u32, u32) -> u32) {
-        let b = self.pop().unwrap_i32() as u32;
-        let a = self.pop().unwrap_i32() as u32;
-        self.push(Val::I32(f(a, b) as i32));
+        self.binop_cells(|a, b| {
+            Cell::from_i32(f(a.unwrap_i32() as u32, b.unwrap_i32() as u32) as i32)
+        });
     }
 
     pub(super) fn u32_relop(&mut self, f: impl Fn(u32, u32) -> bool) {
-        let b = self.pop().unwrap_i32() as u32;
-        let a = self.pop().unwrap_i32() as u32;
-        self.push(Val::I32(i32::from(f(a, b))));
+        self.binop_cells(|a, b| {
+            Cell::from_i32(i32::from(f(a.unwrap_i32() as u32, b.unwrap_i32() as u32)))
+        });
     }
 
     pub(super) fn i32_try_binop(&mut self, f: impl Fn(i32, i32) -> Result<i32>) -> Result<()> {
-        let b = self.pop().unwrap_i32();
-        let a = self.pop().unwrap_i32();
-        let r = f(a, b)?;
-        self.push(Val::I32(r));
-        Ok(())
+        self.binop_cells_try(|a, b| Ok(Cell::from_i32(f(a.unwrap_i32(), b.unwrap_i32())?)))
     }
 
     pub(super) fn u32_try_binop(&mut self, f: impl Fn(u32, u32) -> Result<u32>) -> Result<()> {
-        let b = self.pop().unwrap_i32() as u32;
-        let a = self.pop().unwrap_i32() as u32;
-        let r = f(a, b)?;
-        self.push(Val::I32(r as i32));
-        Ok(())
+        self.binop_cells_try(|a, b| {
+            Ok(Cell::from_i32(
+                f(a.unwrap_i32() as u32, b.unwrap_i32() as u32)? as i32,
+            ))
+        })
     }
 
     pub(super) fn i64_binop(&mut self, f: impl Fn(i64, i64) -> i64) {
-        let b = self.pop().unwrap_i64();
-        let a = self.pop().unwrap_i64();
-        self.push(Val::I64(f(a, b)));
+        self.binop_cells(|a, b| Cell::from_i64(f(a.unwrap_i64(), b.unwrap_i64())));
     }
 
     pub(super) fn i64_unop(&mut self, f: impl Fn(i64) -> i64) {
-        let a = self.pop().unwrap_i64();
-        self.push(Val::I64(f(a)));
+        self.unop_cell(|a| Cell::from_i64(f(a.unwrap_i64())));
     }
 
     pub(super) fn i64_relop(&mut self, f: impl Fn(i64, i64) -> bool) {
-        let b = self.pop().unwrap_i64();
-        let a = self.pop().unwrap_i64();
-        self.push(Val::I32(i32::from(f(a, b))));
+        self.binop_cells(|a, b| Cell::from_i32(i32::from(f(a.unwrap_i64(), b.unwrap_i64()))));
     }
 
     pub(super) fn u64_binop(&mut self, f: impl Fn(u64, u64) -> u64) {
-        let b = self.pop().unwrap_i64() as u64;
-        let a = self.pop().unwrap_i64() as u64;
-        self.push(Val::I64(f(a, b) as i64));
+        self.binop_cells(|a, b| {
+            Cell::from_i64(f(a.unwrap_i64() as u64, b.unwrap_i64() as u64) as i64)
+        });
     }
 
     pub(super) fn u64_relop(&mut self, f: impl Fn(u64, u64) -> bool) {
-        let b = self.pop().unwrap_i64() as u64;
-        let a = self.pop().unwrap_i64() as u64;
-        self.push(Val::I32(i32::from(f(a, b))));
+        self.binop_cells(|a, b| {
+            Cell::from_i32(i32::from(f(a.unwrap_i64() as u64, b.unwrap_i64() as u64)))
+        });
     }
 
     pub(super) fn i64_try_binop(&mut self, f: impl Fn(i64, i64) -> Result<i64>) -> Result<()> {
-        let b = self.pop().unwrap_i64();
-        let a = self.pop().unwrap_i64();
-        let r = f(a, b)?;
-        self.push(Val::I64(r));
-        Ok(())
+        self.binop_cells_try(|a, b| Ok(Cell::from_i64(f(a.unwrap_i64(), b.unwrap_i64())?)))
     }
 
     pub(super) fn u64_try_binop(&mut self, f: impl Fn(u64, u64) -> Result<u64>) -> Result<()> {
-        let b = self.pop().unwrap_i64() as u64;
-        let a = self.pop().unwrap_i64() as u64;
-        let r = f(a, b)?;
-        self.push(Val::I64(r as i64));
-        Ok(())
+        self.binop_cells_try(|a, b| {
+            Ok(Cell::from_i64(
+                f(a.unwrap_i64() as u64, b.unwrap_i64() as u64)? as i64,
+            ))
+        })
     }
 
     pub(super) fn f32_arith(&mut self, f: impl Fn(f32, f32) -> f32) {
-        let b = self.pop().unwrap_f32();
-        let a = self.pop().unwrap_f32();
-        let r = canon_f32(f(a, b), a.is_nan() || b.is_nan());
-        self.push(Val::F32(r.to_bits()));
+        self.binop_cells(|ac, bc| {
+            let (a, b) = (ac.unwrap_f32(), bc.unwrap_f32());
+            Cell::from_f32(canon_f32(f(a, b), a.is_nan() || b.is_nan()))
+        });
     }
 
     pub(super) fn f32_binop(&mut self, f: impl Fn(f32, f32) -> f32) {
-        let b = self.pop().unwrap_f32();
-        let a = self.pop().unwrap_f32();
-        self.push(Val::F32(f(a, b).to_bits()));
+        self.binop_cells(|a, b| Cell::from_f32(f(a.unwrap_f32(), b.unwrap_f32())));
     }
 
     pub(super) fn f32_unop(&mut self, f: impl Fn(f32) -> f32) {
-        let a = self.pop().unwrap_f32();
-        self.push(Val::F32(f(a).to_bits()));
+        self.unop_cell(|a| Cell::from_f32(f(a.unwrap_f32())));
     }
 
     pub(super) fn f32_unop_canon(&mut self, f: impl Fn(f32) -> f32) {
-        let a = self.pop().unwrap_f32();
-        self.push(Val::F32(canon_f32(f(a), a.is_nan()).to_bits()));
+        self.unop_cell(|ac| {
+            let a = ac.unwrap_f32();
+            Cell::from_f32(canon_f32(f(a), a.is_nan()))
+        });
     }
 
     pub(super) fn f32_relop(&mut self, f: impl Fn(f32, f32) -> bool) {
-        let b = self.pop().unwrap_f32();
-        let a = self.pop().unwrap_f32();
-        self.push(Val::I32(i32::from(f(a, b))));
+        self.binop_cells(|a, b| Cell::from_i32(i32::from(f(a.unwrap_f32(), b.unwrap_f32()))));
     }
 
     pub(super) fn f64_arith(&mut self, f: impl Fn(f64, f64) -> f64) {
-        let b = self.pop().unwrap_f64();
-        let a = self.pop().unwrap_f64();
-        let r = canon_f64(f(a, b), a.is_nan() || b.is_nan());
-        self.push(Val::F64(r.to_bits()));
+        self.binop_cells(|ac, bc| {
+            let (a, b) = (ac.unwrap_f64(), bc.unwrap_f64());
+            Cell::from_f64(canon_f64(f(a, b), a.is_nan() || b.is_nan()))
+        });
     }
 
     pub(super) fn f64_binop(&mut self, f: impl Fn(f64, f64) -> f64) {
-        let b = self.pop().unwrap_f64();
-        let a = self.pop().unwrap_f64();
-        self.push(Val::F64(f(a, b).to_bits()));
+        self.binop_cells(|a, b| Cell::from_f64(f(a.unwrap_f64(), b.unwrap_f64())));
     }
 
     pub(super) fn f64_unop(&mut self, f: impl Fn(f64) -> f64) {
-        let a = self.pop().unwrap_f64();
-        self.push(Val::F64(f(a).to_bits()));
+        self.unop_cell(|a| Cell::from_f64(f(a.unwrap_f64())));
     }
 
     pub(super) fn f64_unop_canon(&mut self, f: impl Fn(f64) -> f64) {
-        let a = self.pop().unwrap_f64();
-        self.push(Val::F64(canon_f64(f(a), a.is_nan()).to_bits()));
+        self.unop_cell(|ac| {
+            let a = ac.unwrap_f64();
+            Cell::from_f64(canon_f64(f(a), a.is_nan()))
+        });
     }
 
     pub(super) fn f64_relop(&mut self, f: impl Fn(f64, f64) -> bool) {
-        let b = self.pop().unwrap_f64();
-        let a = self.pop().unwrap_f64();
-        self.push(Val::I32(i32::from(f(a, b))));
+        self.binop_cells(|a, b| Cell::from_i32(i32::from(f(a.unwrap_f64(), b.unwrap_f64()))));
     }
 }

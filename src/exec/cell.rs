@@ -14,7 +14,6 @@
     clippy::indexing_slicing
 )]
 
-use super::Execution;
 use crate::canon::{AggKind, IrHeap, RefKind, ScalarKind, Slot};
 use crate::store::{read_slot, write_slot, NULL_REF};
 #[cfg(feature = "simd")]
@@ -57,6 +56,16 @@ impl RefTag {
         }
     }
 
+    /// The shadow tag for a reference of a known hierarchy (inverse of [`RefTag::refkind`]).
+    pub(super) fn of_refkind(kind: RefKind) -> RefTag {
+        match kind {
+            RefKind::Func => RefTag::FUNC,
+            RefKind::Extern => RefTag::EXTERN,
+            RefKind::Any => RefTag::ANY,
+            RefKind::Exn => RefTag::EXN,
+        }
+    }
+
     /// The `RefKind` this tag denotes (for decoding the slot's handle), or `None` for a non-ref.
     pub(super) fn refkind(self) -> Option<RefKind> {
         match self {
@@ -95,6 +104,27 @@ impl Cell {
     #[cfg(feature = "simd")]
     pub(super) fn unwrap_v128(self) -> V128 {
         V128::from(u128::from_le_bytes(self.lo()))
+    }
+
+    /// The raw slot bytes (for `read_slot` decoding outside this module).
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub(super) fn from_i32(v: i32) -> Cell {
+        Cell::of_bytes(v.to_le_bytes())
+    }
+
+    pub(super) fn from_i64(v: i64) -> Cell {
+        Cell::of_bytes(v.to_le_bytes())
+    }
+
+    pub(super) fn from_f32(v: f32) -> Cell {
+        Cell::of_bytes(v.to_bits().to_le_bytes())
+    }
+
+    pub(super) fn from_f64(v: f64) -> Cell {
+        Cell::of_bytes(v.to_bits().to_le_bytes())
     }
 
     /// The 4-byte reference handle (the cell is a reference by validation).
@@ -201,7 +231,7 @@ fn slot_for_valtype(ty: &ValType) -> Slot {
 
 /// The cell kind for a GC field/element popped off the stack: the field's offset/packing is
 /// irrelevant (the stack holds the unpacked `i32`/`i64`/â¦ value), only its hierarchy matters.
-fn stack_slot_for_field(field: Slot) -> Slot {
+pub(super) fn stack_slot_for_field(field: Slot) -> Slot {
     match field {
         Slot::Scalar { kind, .. } => {
             let kind = match kind {
@@ -236,122 +266,12 @@ pub(super) fn refkind_of_irheap(heap: &IrHeap) -> RefKind {
     }
 }
 
-impl Execution {
-    pub(super) fn pop(&mut self) -> Cell {
-        self.shadow.pop();
-        self.values.pop().expect("operand stack underflow")
-    }
-
-    /// Pops a cell together with its root-shadow tag (for type-agnostic moves that must carry the
-    /// reference hierarchy: `select`, `br_on_null`/`br_on_non_null`).
-    pub(super) fn pop_tagged(&mut self) -> (Cell, RefTag) {
-        let tag = self.shadow.pop().expect("shadow underflow");
-        (self.values.pop().expect("operand stack underflow"), tag)
-    }
-
-    pub(super) fn push(&mut self, v: Val) {
-        self.shadow.push(RefTag::of_val(&v));
-        self.values.push(encode(v));
-    }
-
-    /// Pushes an already-encoded cell with its known shadow tag (type-agnostic moves:
-    /// `local.get`, `select`, `br_on_null`).
-    pub(super) fn push_cell(&mut self, cell: Cell, tag: RefTag) {
-        self.shadow.push(tag);
-        self.values.push(cell);
-    }
-
-    /// The cell + shadow tag at operand index `i` (a `local.get` source).
-    pub(super) fn cell_at(&self, i: usize) -> (Cell, RefTag) {
-        (self.values[i], self.shadow[i])
-    }
-
-    /// Writes a cell + shadow tag at operand index `i` (a `local.set`/`local.tee` target).
-    pub(super) fn set_cell(&mut self, i: usize, cell: Cell, tag: RefTag) {
-        self.values[i] = cell;
-        self.shadow[i] = tag;
-    }
-
-    /// The top operand as an `i32` without popping (an `array.new*` count peek).
-    pub(super) fn top_i32(&self) -> i32 {
-        self.values
-            .last()
-            .expect("operand stack underflow")
-            .unwrap_i32()
-    }
-
-    /// The top cell + shadow tag without popping (a `local.tee` source).
-    pub(super) fn top_cell(&self) -> (Cell, RefTag) {
-        (
-            *self.values.last().expect("operand stack underflow"),
-            *self.shadow.last().expect("shadow underflow"),
-        )
-    }
-
-    pub(super) fn pop_i32(&mut self) -> i32 {
-        self.pop().unwrap_i32()
-    }
-
-    /// Pops an index/length/address operand, widening to `u64`. `is_64` (from the target
-    /// memory/table's type) selects the width â there is no runtime tag to read (#42).
-    pub(super) fn pop_index(&mut self, is_64: bool) -> u64 {
-        let cell = self.pop();
-        if is_64 {
-            cell.unwrap_i64() as u64
-        } else {
-            u64::from(cell.unwrap_i32() as u32)
-        }
-    }
-
-    /// Pushes a size/grow result as i64 for a 64-bit memory/table, else i32 (#42).
-    pub(super) fn push_index(&mut self, is_64: bool, v: u64) {
-        self.push(if is_64 {
-            Val::I64(v as i64)
-        } else {
-            Val::I32(v as u32 as i32)
-        });
-    }
-
-    /// Pops a reference operand of a statically-known hierarchy (null â the typed null `Val`).
-    pub(super) fn pop_ref(&mut self, kind: RefKind) -> Val {
-        let cell = self.pop();
-        read_slot(Slot::Ref { offset: 0, kind }, &cell.0)
-    }
-
-    pub(super) fn pop_anyref(&mut self) -> Val {
-        self.pop_ref(RefKind::Any)
-    }
-
-    /// Pops the value for a GC field/element write: decoded to the field's hierarchy/scalar kind
-    /// (the caller's `write_slot` re-narrows packed `i8`/`i16` into the body).
-    pub(super) fn pop_val_for(&mut self, field: Slot) -> Val {
-        let cell = self.pop();
-        read_slot(stack_slot_for_field(field), &cell.0)
-    }
-
-    /// Splits off the top `tys.len()` operand cells and decodes them to `Val`s (host-call args).
-    pub(super) fn pop_params(&mut self, tys: &[ValType]) -> Vec<Val> {
-        let cells = self.values.split_off(self.values.len() - tys.len());
-        self.shadow.truncate(self.shadow.len() - tys.len());
-        cells.iter().zip(tys).map(|(&c, t)| decode(c, t)).collect()
-    }
-
-    /// Encodes and pushes host-call results back onto the operand stack.
-    pub(super) fn push_results(&mut self, results: Vec<Val>) {
-        self.shadow.extend(results.iter().map(RefTag::of_val));
-        self.values.extend(results.into_iter().map(encode));
-    }
-
-    /// Iterates the live operand/local roots: each `(handle, RefKind)` for a non-null reference
-    /// slot, recovered from the root shadow. Drives the tracing collector's stack-root scan (#27g).
-    pub(crate) fn operand_roots(&self) -> impl Iterator<Item = (u32, RefKind)> + '_ {
-        self.values
-            .iter()
-            .zip(&self.shadow)
-            .filter_map(|(cell, tag)| {
-                let kind = tag.refkind()?;
-                (!cell.is_null()).then(|| (cell.handle(), kind))
-            })
+impl Cell {
+    /// A cell holding `bytes` little-endian in its low lanes (rest zero).
+    pub(super) fn of_bytes<const N: usize>(bytes: [u8; N]) -> Cell {
+        let mut b = [0u8; SLOT_BYTES];
+        b[..N].copy_from_slice(&bytes);
+        Cell(b)
     }
 }
 

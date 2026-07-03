@@ -24,7 +24,7 @@ use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, ValidatorResour
 
 use crate::canon::{AggKind, IrVal, ModuleType};
 use crate::module::handler::HandlerSpan;
-use crate::module::op::{BranchTarget, CompiledFunc, Op};
+use crate::module::op::{BranchTarget, CmpKind, CompiledFunc, Op};
 use crate::{Error, Result};
 
 use self::control::CtrlFrame;
@@ -98,7 +98,10 @@ pub(crate) fn translate_function(
         std::mem::take(&mut scratch.ctrl),
     );
     t.push_func_frame(n_results);
-    let mut reader = body.get_operators_reader().map_err(wp_err)?;
+    // Drive `BinaryReader::visit_operator` directly (the same pattern `FuncValidator::validate`
+    // uses): `ValidateThenLower` doubles as the reader's `FrameStack`, so no `OperatorsReader` —
+    // and none of its duplicate per-op control-stack bookkeeping — sits between decode and us.
+    let mut reader = body.get_binary_reader_for_operators().map_err(wp_err)?;
     let mut vl = ValidateThenLower {
         validator: fv,
         translator: &mut t,
@@ -109,7 +112,7 @@ pub(crate) fn translate_function(
         // Outer `?`: decode error. Inner `?`: validation/lowering error.
         reader.visit_operator(&mut vl).map_err(wp_err)??;
     }
-    reader.finish().map_err(wp_err)?;
+    reader.finish_expression(&vl).map_err(wp_err)?;
 
     // Return the (now-empty) `ctrl` buffer to the scratch so the next body reuses its capacity.
     scratch.ctrl = std::mem::take(&mut t.ctrl);
@@ -142,6 +145,11 @@ struct Translator<'a> {
     cur_offset: u32,
     /// Parallel to `ops`: one source offset per `Op`. `None` when debug retention is off.
     offsets: Option<Vec<u32>>,
+    /// `Some(kind)` while `ops.last()` is a fusable i32 relop that an immediately following
+    /// `br_if`/`br_if_not` may collapse into an [`Op::BrIfCmp`]. Set by [`Translator::emit`]
+    /// per emitted op; cleared at every control boundary where a branch label could land
+    /// between the pair (see `control`).
+    fusable_cmp: Option<CmpKind>,
 }
 
 impl<'a> Translator<'a> {
@@ -162,6 +170,7 @@ impl<'a> Translator<'a> {
             br_table_targets: Vec::new(),
             cur_offset: 0,
             offsets: retain_offsets.then(|| Vec::with_capacity(op_hint)),
+            fusable_cmp: None,
         }
     }
 
@@ -169,6 +178,7 @@ impl<'a> Translator<'a> {
         if let Some(offsets) = &mut self.offsets {
             offsets.push(self.cur_offset);
         }
+        self.fusable_cmp = fusable_cmp_of(&op);
         self.ops.push(op);
     }
 
@@ -214,4 +224,21 @@ impl<'a> Translator<'a> {
         self.push(1);
         self.emit(op);
     }
+}
+
+/// The comparison kind if `op` is a fusable i32 relop (the [`Op::BrIfCmp`] candidates).
+fn fusable_cmp_of(op: &Op) -> Option<CmpKind> {
+    Some(match op {
+        Op::I32Eq => CmpKind::Eq,
+        Op::I32Ne => CmpKind::Ne,
+        Op::I32LtS => CmpKind::LtS,
+        Op::I32LtU => CmpKind::LtU,
+        Op::I32GtS => CmpKind::GtS,
+        Op::I32GtU => CmpKind::GtU,
+        Op::I32LeS => CmpKind::LeS,
+        Op::I32LeU => CmpKind::LeU,
+        Op::I32GeS => CmpKind::GeS,
+        Op::I32GeU => CmpKind::GeU,
+        _ => return None,
+    })
 }

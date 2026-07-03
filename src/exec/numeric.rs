@@ -8,12 +8,15 @@ use super::{arith, convert, Execution};
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::StoreInner;
-use crate::value::Val;
-use crate::{Error, Result};
+use crate::Result;
 
 impl Execution {
-    /// Executes a numeric/comparison/conversion op. `step` routes only these ops here.
-    #[allow(clippy::too_many_lines)] // flat opcode dispatch; arms are one-liners
+    /// Executes a numeric/comparison/conversion op — the head of the straight-line fall-through
+    /// chain (`step` routes every uncategorized op here first; non-numeric falls to `exec_gc`).
+    // Single call site inside the fused dispatch: inlining threads this secondary match into
+    // the primary one (measured +19% CoreMark with numeric+memory inlined).
+    #[allow(clippy::too_many_lines, clippy::inline_always)] // flat opcode dispatch; arms are one-liners
+    #[inline(always)]
     pub(super) fn exec_numeric(
         &mut self,
         inner: &mut StoreInner,
@@ -56,7 +59,7 @@ impl Execution {
             // --- i64 ---
             O::I64Eqz => {
                 let a = self.pop().unwrap_i64();
-                self.push(Val::I32(i32::from(a == 0)));
+                self.push_i32(i32::from(a == 0));
             }
             O::I64Eq => self.i64_relop(|a, b| a == b),
             O::I64Ne => self.i64_relop(|a, b| a != b),
@@ -134,15 +137,15 @@ impl Execution {
             // --- conversions ---
             O::I32WrapI64 => {
                 let x = self.pop().unwrap_i64();
-                self.push(Val::I32(convert::i32_wrap_i64(x)));
+                self.push_i32(convert::i32_wrap_i64(x));
             }
             O::I64ExtendI32S => {
                 let x = self.pop().unwrap_i32();
-                self.push(Val::I64(convert::i64_extend_i32_s(x)));
+                self.push_i64(convert::i64_extend_i32_s(x));
             }
             O::I64ExtendI32U => {
                 let x = self.pop().unwrap_i32();
-                self.push(Val::I64(convert::i64_extend_i32_u(x)));
+                self.push_i64(convert::i64_extend_i32_u(x));
             }
             O::I32TruncF32S => self.trunc_to_i32(convert::i32_trunc_f32_s)?,
             O::I32TruncF32U => self.trunc_to_i32(convert::i32_trunc_f32_u)?,
@@ -174,11 +177,11 @@ impl Execution {
             O::I64ReinterpretF64 => self.map_f64_i64(|x| x.to_bits() as i64),
             O::F32ReinterpretI32 => {
                 let x = self.pop().unwrap_i32();
-                self.push(Val::F32(x as u32));
+                self.push_f32_bits(x as u32);
             }
             O::F64ReinterpretI64 => {
                 let x = self.pop().unwrap_i64();
-                self.push(Val::F64(x as u64));
+                self.push_f64_bits(x as u64);
             }
 
             // --- sign-extension ---
@@ -188,11 +191,8 @@ impl Execution {
             O::I64Extend16S => self.i64_unop(|a| i64::from(a as i16)),
             O::I64Extend32S => self.i64_unop(|a| i64::from(a as i32)),
 
-            other => {
-                return Err(Error::msg(format!(
-                    "unexpected op in exec_numeric: {other:?}"
-                )))
-            }
+            // Not numeric — the colder GC/cast categories continue the fall-through chain.
+            other => return self.exec_gc(inner, other, instance),
         }
         Ok(())
     }
@@ -200,62 +200,62 @@ impl Execution {
     // Conversion plumbing (pop one operand, push the converted result).
     fn trunc_to_i32(&mut self, f: impl Fn(f32) -> Result<i32>) -> Result<()> {
         let x = self.pop().unwrap_f32();
-        self.push(Val::I32(f(x)?));
+        self.push_i32(f(x)?);
         Ok(())
     }
     fn trunc64_to_i32(&mut self, f: impl Fn(f64) -> Result<i32>) -> Result<()> {
         let x = self.pop().unwrap_f64();
-        self.push(Val::I32(f(x)?));
+        self.push_i32(f(x)?);
         Ok(())
     }
     fn trunc_to_i64(&mut self, f: impl Fn(f32) -> Result<i64>) -> Result<()> {
         let x = self.pop().unwrap_f32();
-        self.push(Val::I64(f(x)?));
+        self.push_i64(f(x)?);
         Ok(())
     }
     fn trunc64_to_i64(&mut self, f: impl Fn(f64) -> Result<i64>) -> Result<()> {
         let x = self.pop().unwrap_f64();
-        self.push(Val::I64(f(x)?));
+        self.push_i64(f(x)?);
         Ok(())
     }
     fn map_f32_i32(&mut self, f: impl Fn(f32) -> i32) {
         let x = self.pop().unwrap_f32();
-        self.push(Val::I32(f(x)));
+        self.push_i32(f(x));
     }
     fn map_f64_i32(&mut self, f: impl Fn(f64) -> i32) {
         let x = self.pop().unwrap_f64();
-        self.push(Val::I32(f(x)));
+        self.push_i32(f(x));
     }
     fn map_f32_i64(&mut self, f: impl Fn(f32) -> i64) {
         let x = self.pop().unwrap_f32();
-        self.push(Val::I64(f(x)));
+        self.push_i64(f(x));
     }
     fn map_f64_i64(&mut self, f: impl Fn(f64) -> i64) {
         let x = self.pop().unwrap_f64();
-        self.push(Val::I64(f(x)));
+        self.push_i64(f(x));
     }
     fn map_i32_f32(&mut self, f: impl Fn(i32) -> f32) {
         let x = self.pop().unwrap_i32();
-        self.push(Val::F32(f(x).to_bits()));
+        self.push_f32(f(x));
     }
     fn map_i64_f32(&mut self, f: impl Fn(i64) -> f32) {
         let x = self.pop().unwrap_i64();
-        self.push(Val::F32(f(x).to_bits()));
+        self.push_f32(f(x));
     }
     fn map_f64_f32(&mut self, f: impl Fn(f64) -> f32) {
         let x = self.pop().unwrap_f64();
-        self.push(Val::F32(f(x).to_bits()));
+        self.push_f32(f(x));
     }
     fn map_i32_f64(&mut self, f: impl Fn(i32) -> f64) {
         let x = self.pop().unwrap_i32();
-        self.push(Val::F64(f(x).to_bits()));
+        self.push_f64(f(x));
     }
     fn map_i64_f64(&mut self, f: impl Fn(i64) -> f64) {
         let x = self.pop().unwrap_i64();
-        self.push(Val::F64(f(x).to_bits()));
+        self.push_f64(f(x));
     }
     fn map_f32_f64(&mut self, f: impl Fn(f32) -> f64) {
         let x = self.pop().unwrap_f32();
-        self.push(Val::F64(f(x).to_bits()));
+        self.push_f64(f(x));
     }
 }

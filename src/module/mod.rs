@@ -9,6 +9,7 @@ pub(crate) mod inner;
 pub(crate) mod op;
 #[cfg(feature = "simd")]
 pub(crate) mod op_simd;
+mod op_types;
 pub(crate) mod parse;
 mod serialize;
 mod typesec;

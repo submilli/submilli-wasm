@@ -7,30 +7,39 @@
 use super::call::{self, CallKind};
 use super::{cell, Execution, StepOutcome};
 use crate::instance::Instance;
-use crate::module::op::{CompiledFunc, Op};
+use crate::module::op::{CmpKind, CompiledFunc, Op};
 use crate::store::StoreInner;
 use crate::trap::Trap;
-use crate::value::Val;
 use crate::Result;
 
 impl Execution {
-    #[allow(clippy::too_many_lines)] // flat opcode dispatch; arms are short
+    // Flat opcode dispatch; arms are short. `inline(always)` is deliberate: `step` has a single
+    // call site (the `run` loop), and inlining it there removes the per-op call/return and the
+    // `Result<StepOutcome>` stack round-trip, keeping `ip`/`base` in registers across ops —
+    // measured ~1.8× on CoreMark. The op arrives already fetched (`run` gets it via `ops.get`, so
+    // there is exactly one bounds check per op); `next` is the fall-through ip.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::inline_always,
+        clippy::too_many_arguments
+    )]
+    #[inline(always)]
     pub(super) fn step(
         &mut self,
         inner: &mut StoreInner,
         code: &CompiledFunc,
-        ip: u32,
+        op: &Op,
+        next: u32,
         base: u32,
         instance: Instance,
     ) -> Result<StepOutcome> {
-        let next = ip + 1;
-        match &code.ops[ip as usize] {
+        match op {
             Op::Nop => {}
             Op::Unreachable => return Err(Trap::UnreachableCodeReached.into()),
-            Op::I32Const(v) => self.push(Val::I32(*v)),
-            Op::I64Const(v) => self.push(Val::I64(*v)),
-            Op::F32Const(v) => self.push(Val::F32(*v)),
-            Op::F64Const(v) => self.push(Val::F64(*v)),
+            Op::I32Const(v) => self.push_i32(*v),
+            Op::I64Const(v) => self.push_i64(*v),
+            Op::F32Const(v) => self.push_f32_bits(*v),
+            Op::F64Const(v) => self.push_f64_bits(*v),
             Op::Drop => {
                 self.pop();
             }
@@ -77,6 +86,23 @@ impl Execution {
                 if self.pop_i32() == 0 {
                     self.take_branch(t);
                     return Ok(StepOutcome::Advance(t.ip));
+                }
+            }
+            Op::BrIfCmp {
+                kind,
+                negate,
+                target,
+            } => {
+                let n = self.values.len();
+                let (a, b) = (
+                    self.values[n - 2].unwrap_i32(),
+                    self.values[n - 1].unwrap_i32(),
+                );
+                self.values.truncate(n - 2);
+                self.shadow.truncate(n - 2);
+                if cmp_i32(*kind, a, b) != *negate {
+                    self.take_branch(target);
+                    return Ok(StepOutcome::Advance(target.ip));
                 }
             }
             Op::BrTable(range) => {
@@ -194,7 +220,7 @@ impl Execution {
             | Op::TableSet(_)
             | Op::TableSize(_)
             | Op::TableFill(_)) => self.exec_table(inner, op, instance)?,
-            Op::Throw(tag) => return self.throw(inner, instance, *tag, ip),
+            Op::Throw(tag) => return self.throw(inner, instance, *tag, next - 1),
             Op::ThrowRef => return self.throw_ref(),
             op @ Op::BrOnCast { .. } => {
                 if let Some(ip) = self.br_on_cast(inner, instance, op, false) {
@@ -221,16 +247,36 @@ impl Execution {
             | Op::ArrayNewData { .. }
             | Op::ArrayNewElem { .. }) => {
                 if let Some(charge) = self.gc_alloc_charge(inner, instance, alloc)? {
-                    if let Some(out) = self.gc_reserve(inner, charge, ip) {
+                    if let Some(out) = self.gc_reserve(inner, charge, next - 1) {
                         return Ok(out);
                     }
                 }
                 self.exec_gc(inner, alloc, instance)?;
             }
-            // Straight-line GC + numerics: exec_gc → exec_gc_array → exec_cast → exec_numeric.
-            other => self.exec_gc(inner, other, instance)?,
+            // Straight-line numerics + GC, hottest category first:
+            // exec_numeric → exec_gc → exec_gc_array → exec_cast.
+            other => self.exec_numeric(inner, other, instance)?,
         }
         Ok(StepOutcome::Advance(next))
+    }
+}
+
+/// Evaluates a fused compare-and-branch comparison ([`Op::BrIfCmp`]).
+#[allow(clippy::inline_always)] // one hot call site, inside the dispatch arm
+#[inline(always)]
+#[allow(clippy::cast_sign_loss)] // `_U` kinds reinterpret the operand bits as unsigned, per spec
+fn cmp_i32(kind: CmpKind, a: i32, b: i32) -> bool {
+    match kind {
+        CmpKind::Eq => a == b,
+        CmpKind::Ne => a != b,
+        CmpKind::LtS => a < b,
+        CmpKind::LtU => (a as u32) < (b as u32),
+        CmpKind::GtS => a > b,
+        CmpKind::GtU => (a as u32) > (b as u32),
+        CmpKind::LeS => a <= b,
+        CmpKind::LeU => (a as u32) <= (b as u32),
+        CmpKind::GeS => a >= b,
+        CmpKind::GeU => (a as u32) >= (b as u32),
     }
 }
 
