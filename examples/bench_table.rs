@@ -15,7 +15,12 @@ use std::time::{Duration, Instant};
 
 #[path = "../benches/support.rs"]
 mod support;
-use support::{submilli, wi, wt, COREMARK, MODULES, RUN_ONCE};
+use support::{retained_ram, submilli, wi, wt, COREMARK, MODULES, RUN_ONCE};
+
+/// Count every heap allocation so the table can report retained module RAM (see
+/// `support::mem`; wasmtime's mmap'd JIT code is outside this — README caveat).
+#[global_allocator]
+static ALLOC: support::mem::Tracking = support::mem::Tracking;
 
 /// Best-of-`iters` wall clock (three warmups discarded — one is not enough: the
 /// process-global first use of an engine still pays dyld/allocator/page-fault
@@ -93,10 +98,40 @@ fn main() {
     let run_once_wasm = support::run_once_wasm();
     print_header(run_once_wasm.len());
     module_new_rows();
+    module_ram_rows(&run_once_wasm);
     store_new_row();
     cold_start_row();
     run_once_rows(&run_once_wasm);
     execution_row();
+}
+
+/// A row of three per-engine byte figures. The wasmtime cell is starred: its JIT code
+/// lives in mmap'd regions the counting allocator can't see, so it shows metadata only.
+fn row_bytes(label: &str, s: usize, t: usize, i: usize) {
+    let t = format!("{}*", kib(t));
+    println!("{label:<28}{:>11}{t:>11}{:>11}", kib(s), kib(i));
+}
+
+/// Heap bytes retained by one compiled `Module` (live-allocation delta, engine warmed
+/// first — the multi-tenant density number). The wasmtime cell undercounts: its JIT
+/// code lives in mmap'd regions outside the counting allocator.
+fn module_ram_rows(run_once_wasm: &[u8]) {
+    let se = submilli::engine();
+    let te = wt::engine();
+    let ie = wi::engine();
+    let ram_row = |label: &str, bytes: &[u8]| {
+        row_bytes(
+            label,
+            retained_ram(|| submilli::compile(&se, bytes)),
+            retained_ram(|| wt::compile(&te, bytes)),
+            retained_ram(|| wi::compile(&ie, bytes)),
+        );
+    };
+    for &(name, bytes) in MODULES {
+        ram_row(&format!("Module RAM   {name}"), bytes);
+    }
+    ram_row("Module RAM   run-once", run_once_wasm);
+    println!("{:<28}(* metadata only: wasmtime JIT code is mmap'd)", "");
 }
 
 fn print_header(run_once_len: usize) {

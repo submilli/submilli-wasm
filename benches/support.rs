@@ -187,3 +187,84 @@ pub const RUN_ONCE: &[(&str, i32, i32, u32)] = &[
     ("sieve(10k)", 10_000, 1_229, 40),
     ("sieve(1M)", 1_000_000, 78_498, 8),
 ];
+
+/// Heap accounting for the density story: a counting wrapper around the system allocator,
+/// installed as the `#[global_allocator]` of every bench binary that includes this module.
+/// All three engines allocate through it in-process, so `live()` deltas give an
+/// engine-agnostic "retained bytes" figure for a compiled module. Known blind spot:
+/// wasmtime's JIT code is mmap'd outside the Rust allocator, so its cells *undercount*
+/// (the caveat is documented in the README).
+#[allow(unsafe_code)] // a GlobalAlloc impl is unavoidably unsafe; it only counts + delegates
+pub mod mem {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
+
+    #[derive(Debug)]
+    pub struct Tracking;
+
+    /// Counting is off by default: the counter cache line is contended under parallel
+    /// allocation (wasmtime's Cranelift threads read ~3× slower with it live), so the
+    /// timing rows must run with only this read-mostly flag on the alloc path.
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    /// Live-byte balance while enabled. `isize`: frees of allocations made while the
+    /// counter was off legitimately drive it negative — only same-window deltas matter.
+    static LIVE: AtomicIsize = AtomicIsize::new(0);
+
+    // SAFETY: pure delegation to `System`; the atomics only observe sizes.
+    unsafe impl GlobalAlloc for Tracking {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() && ENABLED.load(Relaxed) {
+                LIVE.fetch_add(l.size() as isize, Relaxed);
+            }
+            p
+        }
+
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc_zeroed(l) };
+            if !p.is_null() && ENABLED.load(Relaxed) {
+                LIVE.fetch_add(l.size() as isize, Relaxed);
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) };
+            if ENABLED.load(Relaxed) {
+                LIVE.fetch_sub(l.size() as isize, Relaxed);
+            }
+        }
+
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+            let q = unsafe { System.realloc(p, l, new_size) };
+            if !q.is_null() && ENABLED.load(Relaxed) {
+                LIVE.fetch_add(new_size as isize - l.size() as isize, Relaxed);
+            }
+            q
+        }
+    }
+
+    /// Currently live heap bytes (meaningful as same-window deltas only).
+    pub fn live() -> isize {
+        LIVE.load(Relaxed)
+    }
+
+    pub fn set_enabled(on: bool) {
+        ENABLED.store(on, Relaxed);
+    }
+}
+
+/// Live-heap delta retained by `f()`'s return value: warms engine-lazy state with one
+/// discarded call first, then measures allocation across a second. The result is held
+/// until after the reading so its memory is counted, then dropped. Counting is enabled
+/// only inside this window (see [`mem::Tracking`]).
+pub fn retained_ram<T>(f: impl Fn() -> T) -> usize {
+    mem::set_enabled(true);
+    drop(f()); // warm-up: engine caches / lazy init don't count against the module
+    let before = mem::live();
+    let keep = f();
+    let after = mem::live();
+    drop(keep);
+    mem::set_enabled(false);
+    usize::try_from(after - before).unwrap_or(0)
+}
