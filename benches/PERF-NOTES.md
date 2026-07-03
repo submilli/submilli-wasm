@@ -335,3 +335,277 @@ wasmi's proposal set changed nothing). Un-fusing to materialize+match is *worse*
 tight as wasmi's — speculative; confirm the mechanism in disassembly first. The other known lever is
 the architectural **in-place/sidetable** interpreter from §5 (store no op array, re-decode at
 runtime — beats wasmi on startup, at a runtime cost; on-thesis).
+
+---
+
+## 10. Session 2 — zero-alloc arena (win), byte-encoding spike, and the wasmi diff
+
+> **⚠️ Skepticism marker.** The *measurements* below are real (same methodology). Several *conclusions*
+> are **disputed** and explicitly flagged — in particular the "stall-hidden" framing and the reading of
+> what makes wasmi faster. Owner is skeptical byte-encoding is a dead end and skeptical the wasmi IR
+> "folding" is a compile-time factor. Next session will re-test inlining + byte-encoding from scratch.
+> All of §10 is **uncommitted spike work** on top of the §9 committed state.
+
+### 10a. Zero-alloc arena — a real ~10% win (contradicted a prior prediction)
+
+Moved *all* per-function buffers into module-wide arenas pre-reserved once at the start of
+`Module::new` (`ModuleInner.code_ops/code_local_types/code_handlers/code_br_tables/code_offsets`);
+`CompiledFunc` became a pure `Copy` struct of `Span` ranges — **no `Box`, no per-function `Vec`,
+zero allocation during the per-body translation loop**. De-`Arc` (`functions: Vec<CompiledFunc>` +
+a `Code { Arc<ModuleInner>, index }` handle, ops span cached to avoid a per-step lookup) came with it.
+
+| | recycle baseline | zero-alloc arena |
+|---|---|---|
+| spidermonkey `Module::new` | ~27.7 ms | **~25.0 ms** (~10%; ~1.5× → **~1.41×** wasmi) |
+| CoreMark (runtime) | 190 | 188 (noise) |
+
+**This contradicts the earlier "allocation *count* is stall-hidden" claim** (de-`Arc` alone was flat).
+The arena win appears to be *write pattern* (one contiguous sequential stream + killing 6596 large
+per-function `Vec` mallocs), not count. Profile after: `grow_amortized`/`realloc`/`alloc` from *our*
+code effectively gone; the residual is wasmparser-internal. **Owner note: this is the direction that
+worked — memory layout mattered, which is why byte-encoding is worth pursuing, not dismissing.**
+
+### 10b. Byte-encoding spike — measured slower, but *disputed / not fully optimized*
+
+Replaced `Vec<Op>` (24 B fixed enum) with a **variable-length byte stream** (`Vec<u8>`, `Span`s,
+`ip` = byte offset, branch `ip`s patched in place). A hand-rolled fixed-width codec (1-byte tag +
+LE fields), generated from the `Op` enum. **Spec passes** (correct end-to-end).
+
+| version | compile | note |
+|---|---|---|
+| arena-enum (baseline) | ~25.8 ms | — |
+| byte, serde codec | ~35 ms | serde generic dispatch = confound |
+| byte, hand-rolled, re-match in `encode` | ~32 ms | double dispatch (wasmparser + encode) |
+| byte, hand-rolled, **direct write from `visit_*`** (no `Op`) | ~31 ms | removed the 2nd dispatch |
+| byte, direct + **larger arena reserve** (no `Vec` regrow) | ~30 ms | fixed-width bloats size → had under-reserved |
+
+Each confound removed shaved ~1 ms, converging toward — but **not beating** — arena-enum.
+
+**Disputed conclusions (flagged):**
+- The write-up claimed the ~44 MB `Op` write is "stall-hidden" (from `dec-only` ≈ full), so a compact
+  byte stream buys nothing on compile. **Owner disagrees** — the 7 ms gap to wasmi is real
+  implementation difference, and byte-encoding is suspected to be the key.
+- **Known un-done optimization:** the direct writes are still *per-field* (`push(tag)` + `extend(mem)`
+  + `extend(offset)` = 2–3 `Vec` ops/op), **not** the "build the op's bytes and write **once**" design.
+  This is the next thing to try — it's the last confound before a fair verdict.
+- Fixed-width LE is *not* compact (u64 offset = 8 B); a real compact/varint encoding was not built.
+- Runtime: hand-rolled decode ran spec at ~14 s vs ~12 s baseline (small); serde decode was ~26 s
+  (serde was the runtime killer, not bytes).
+
+### 10c. The wasmi diff, read from source (`wasmi-2.0.0-beta.4`)
+
+Confirmed by reading wasmi, not theorising:
+- **Validation is identical** to ours — `ValidatingFuncTranslator::validate_then_translate` calls
+  `validator.visitor(offset).visit_X(arg.clone())` per op (same `wasmparser` `FuncValidator`, same
+  clone). *Not* a difference.
+- **`#[inline(never)]` on every translate `visit_*` method** — keeps per-op work **out** of the
+  monomorphized `visit_operator`, so the hot decode dispatch stays small. **Ours inline the lowering
+  into `visit_operator`.** Strong candidate for the `decode-dispatch +1.4 ms`. *(A quick test of
+  `#[inline(never)]` on the fused methods was inconclusive — but it was run on the byte-encoding build,
+  which is confounded. Needs a clean test on arena-enum.)*
+- **wasmi emits nothing for `i32.const`/`local.get`** — `push_immediate`/`push_local` onto a
+  compile-time stack, folded into the consumer (`i32_add_ssi`). We emit an `Op` for each.
+  **Disputed:** owner argues this is a *runtime* optimization — wasmi still spends compile CPU managing
+  that stack memory, so fewer emitted ops is not obviously the compile-time cause. Unresolved.
+
+wasmi stores code as a **variable-length byte stream** in a reused `Vec<u8>` scratch (recycled across
+functions), copied per function into a `CodeMap` — **inline (`SmallByteSlice`, ≤22 B) or one
+`Box<[u8]>`**; small functions cost zero allocation. Execution walks a raw `ip` pointer (`unsafe`) —
+which we can't (zero-`unsafe` requirement).
+
+### 10d. Per-origin gap breakdown (profiler self-time, arena-enum vs wasmi, ~25 vs ~18 ms)
+
+```
+origin              submilli  wasmi   delta
+decode-dispatch       8.57    7.14   +1.43   our lowering inlined into visit_operator
+our-translate         3.21    0.49   +2.71   we emit const/local ops; wasmi folds them
+alloc/mem/teardown    4.29    2.82   +1.47
+decode-read           2.75    2.39   +0.36   ~parity
+validate              1.63    1.44   +0.19   ~parity (same wasmparser)
+other                 3.10    2.13   +0.98
+```
+
+### 10e. Next session (agreed plan)
+
+1. **Revert the byte-encoding spike**, back to the clean ~25 ms arena-enum, then:
+2. Test **`#[inline(never)]` on our fused/lowering `visit_*`** on that clean baseline (targets the
+   decode-dispatch delta directly).
+3. Re-do **byte-encoding "write-at-once"** (build each op's bytes in a small stack buffer, single
+   `extend`) — the un-done optimization from 10b — and measure fairly.
+4. Owner remains skeptical of the "stall-hidden" model; treat §9/§10 conclusions as hypotheses to
+   falsify, not settled.
+
+---
+
+## 11. Session 3 — the confound: wasmi's default `Module::new` doesn't translate
+
+> Fresh session, fresh profiles (same `xctrace` methodology, per-compile normalization via
+> compile counts), plus source reading of `wasmi-2.0.0-beta.4` and `wasmparser` 0.228/0.252.
+> Every §9/§10 gap conclusion needs reinterpreting in light of 11c.
+
+### 11a. Re-profile with better attribution (nearest-meaningful-ancestor, not leaf buckets)
+
+Leaf-symbol bucketing had been mis-filing validator stack ops (`alloc::vec::Vec::pop`/`push_mut`)
+into "alloc". Re-bucketed by walking each sample's stack to the nearest engine/wasmparser frame,
+per-compile (submilli ~31 ms hot vs wasmi ~19 ms hot, same window):
+
+| bucket | submilli | wasmi | delta |
+|---|---:|---:|---:|
+| `visit_operator` decode dispatch | 9.6 | 9.3 | **~parity** |
+| wasmparser validate | 9.0 | 4.6 | +4.4 |
+| translate / lower | 5.3 | 1.0 | +4.3 |
+| decode read | 3.5 | 2.9 | +0.6 |
+| allocator (from engine code) | 2.5 | 0.9 | +1.6 |
+
+The §9 "decode-dispatch monomorphization" theory is dead: dispatch is at parity (symbol sizes in
+the same binary: our `visit_operator` 7.3 KB vs wasmi's 5.1 KB — bigger, but not costlier).
+
+### 11b. The wasmparser-version trail (real but small)
+
+- **wasmi is not on our wasmparser.** It builds **0.228 with `default-features = false`** (no
+  component-model, no serde, no hash-collections); we build **0.252 with all defaults**. The
+  "identical wasmparser" premise of §5/§9 was false.
+- **Pure `Validator::validate_all(spidermonkey)`, 0.228 vs 0.252 side-by-side** (renamed-package
+  A/B crate, interleaved): **16.6 ms both, ratio 1.00×** — the validator itself didn't regress.
+- But 0.252 grew a decode-side machine 0.228 lacks: `OperatorsReader` now keeps its **own
+  syntactic `ControlStack`**, wraps the visitor in a per-op `FrameStackAdapter`, and allocates
+  that stack per body. `FuncValidator::validate` internally avoids all of it by driving
+  `BinaryReader::visit_operator` directly (its visitor implements `FrameStack`); our fused loop
+  went through `OperatorsReader` and paid it.
+- **Fix (landed, this session):** implement `FrameStack` for `ValidateThenLower` (backed by the
+  translator's own `ctrl` stack, which is structurally complete even in unreachable code) and
+  drive `BinaryReader::visit_operator` + `finish_expression` directly.
+  **~0.6–0.8 ms real** (consistent across every interleaved round), spec suite green.
+- **Slim wasmparser features** (default-features off, wasmi-style): **flat**. Not the mechanism.
+- **`#[inline(never)]` on all lowering `visit_*`** (wasmi's pattern, tested clean this time):
+  **flat-to-slightly-worse** (min-of-10: 25.8 vs 25.1 ms). wasmi outlines *big* translate bodies
+  (register alloc, encoding); ours are a push of a 24-B enum — the call outweighs the i-cache win.
+  Reverted. §10c's candidate is dead too.
+
+### 11c. The headline: `CompilationMode::LazyTranslation` is wasmi's default
+
+`wasmi::Config` defaults to **`LazyTranslation`** — `Module::new` **validates but does not
+translate**; per-function translation happens at first call. Every wasmi `Module::new` number in
+this document is a **validate-only** number. That's why wasmi's "whole compile" (~17.7 ms) ≈ the
+pure `validate_all` floor (16.6 ms) ≈ our stubbed decode+validate (§9) — there was never any
+tightly-folded translation to explain. Interleaved best-of, spidermonkey, one thermal window:
+
+```
+submilli (full compile)          ~25.4 ms
+wasmi    default = lazy          ~17.8 ms   (validate only; translation deferred)
+wasmi    CompilationMode::Eager  ~52.7 ms   (validate + translate, like ours)
+```
+
+pulldown-cmark: submilli 1.17 ms | wasmi-lazy 0.80 ms | wasmi-eager 2.35 ms.
+
+**Apples-to-apples, submilli compiles ~2× faster than wasmi** (both eager). Our surplus over the
+shared validation floor is ~8 ms of lowering; wasmi's is ~35 ms. The §9/§10 "gap" was us doing
+work the competitor had deferred. (`prof_module_new` now takes `wasmi-eager` to reproduce.)
+
+### 11d. Where this leaves the roadmap
+
+- **The remaining ~7.8 ms gap to wasmi's *default* is translation itself.** Beating a
+  validate-only number while eagerly translating means squeezing our translate cost below ~1 ms —
+  not plausible. The two on-thesis levers:
+  1. **Lazy translation mode of our own** (validate eagerly at `Module::new`, lower per function
+     on first call — wasmi/wasmtime precedent). Puts `Module::new` at the ~18–19 ms floor
+     immediately, and the §10a arena + this session's reader fix still help the per-call path.
+  2. The **in-place/sidetable interpreter** (§5) remains the only design that goes *below* the
+     validation floor's add-ons entirely.
+- **§10a zero-alloc arena (~2.5 ms, uncommitted)** is still worth re-landing on its own merits.
+- **bench_table fairness:** resolved — the harness now runs wasmi with `CompilationMode::Eager`
+  (`support.rs`), so every `Module::new` cell measures the same work; the README documents the
+  lazy-default caveat alongside the wasmtime opt-level note.
+- Byte-encoding as a *compile-time* lever is now moot in this comparison: the encoding wasn't
+  why wasmi's compile looked fast — not translating was. (It may still matter for the lazy
+  path's per-first-call latency or cache footprint, i.e. as a *runtime* question.)
+
+---
+
+## 12. Session 3b — execution low-hanging fruit: CoreMark ~192 → ~415 (≈2.2×)
+
+Focus shifted to execution (the run-once rows showed it, not startup, is the binding
+constraint for the run-once use case). Profiled with `examples/prof_execute.rs`
+(CoreMark + the run-once sieve) via the same `xctrace` methodology. Landed changes, each
+measured individually (interleaved baseline A/B at the end: CoreMark 192/195 → 413/422;
+sieve(1M) ~250 → ~130 ms):
+
+| change | effect |
+|---|---|
+| **`#[inline(always)]` on `step`** (single call site: the `run` loop) + **`take_branch` early-out** when `pop == 0` (was calling `memmove` per branch for no-op fixups) | **CoreMark 243 → 435 — the big one.** Kills the per-op call/return + the ~40 B `Result<StepOutcome>` stack round-trip; `ip`/`base` live in registers |
+| **Typed `push_i32/i64/f32/f64`** (`exec/stack.rs`): write the cell bytes directly + `NONE` shadow tag, skipping `Val` construction and the 4-deep `slot_for_val`→`write_slot`→`write_scalar` codec matches per push. Applied to arith/numeric/memory/consts; also `push_default` for locals init (zero cells / `NULL_REF`) | 206 → 243 (+18%) |
+| **One combined `gated` check** for fuel/epoch/GC-pressure (default config: one predictable branch/op instead of three) + **numeric-first dispatch chain** (was gc→gc_array→cast→numeric — every `i32.add` walked 3 failed matches; now numeric→gc→gc_array→cast) | 199 → 206 |
+| **Single memory lookup per load/store** — `mem_ea` was resolving `inner.memory(handle)` (with store-handle check) 3× per access | sieve 129 → 124 ms; CoreMark ~flat |
+
+Tried and **reverted**: blanket `#[inline(always)]` on all 24 arith closure helpers —
+CoreMark *dropped* ~6% (i-cache bloat in the now-monolithic `run`). The helpers stay
+out-of-line.
+
+Profile shape before → after: `step` 36% + `run` 13% + cell/shadow traffic ~24% + a
+9% category-cascade + a 9.6% `gc_codec::write_slot` bucket (inlining artifact — really
+`cell::encode`) → now one fully-inlined `run` at ~78% self-time, with the arith closure
+helpers (~10%) and the memory path (~5%) the visible remainder.
+
+Downstream effects: run-once sieve(10k) 2.48 → 1.51 ms, sieve(1M) 236 → 115 ms; spec
+suite wall time 9.4 → 7.6 s. Structural (not low-hanging) next steps if execution stays
+a priority: shrink the still-per-op `StepOutcome` protocol, cache the current memory
+entity across ops (invalidate on grow/host-call), and compile-time op fusion
+(`local.get+local.get+i32.add` superinstructions) — the wasmi register-IR direction.
+
+### Round 2 (line-level profiling): CoreMark ~420 → ~560 (cumulative ≈2.9×)
+
+Symbol-level profiling had gone blind (one inlined `run` at ~78% self), so this round used
+**address-level samples symbolicated to source lines** (`dsymutil` + `atos`; scratch script).
+That attributed the loop's cost line by line and produced three more wins, each A/B-measured:
+
+| change | effect |
+|---|---|
+| **Per-frame `ops` slice + single fetch** — the per-op `ip >= code.ops.len()` check was 15%
+of wall time (an `Arc`→`Vec`→len chase per op), and `step` then bounds-checked `ops[ip]`
+*again*. Now a two-level loop re-derives `ops` on frame change; `ops.get(ip)`'s `None` case
+*is* the end-of-function return; `step` takes the fetched `&Op` + `next` | 420 → 454 |
+| **In-place binops/unops** (`stack.rs::binop_cells`/`unop_cell`) — result overwrites the
+first operand's slot (binop: one truncate; unop: zero stack movement), replacing the
+pop/pop/push round-trips in every arith helper | 454 → 494 |
+| **`dispatch::<const GATED: bool>`** — monomorphize the loop on "any gate live", so the
+default config (no fuel/epoch/GC-watch) runs with **no** gate branch at all; the gated copy
+stays cold | 494 → **564** |
+
+sieve(1M): 130 → **85 ms**. Session total: CoreMark **192 → ~560 (≈2.9×)**; gap to wasmi
+(~3200) now **~5.7×**, from ~17× at the session start. Run-once rows after both rounds +
+the all-code-executed fixture + eager wasmi: sieve(1k) **697 µs (submilli) vs 824 µs
+(wasmi) vs 5.7 ms (wasmtime)** — submilli wins the light run-once outright.
+
+### Round 3: secondary-dispatch inlining + compare-and-branch fusion — CoreMark ~660 (≈3.4×)
+
+- **`#[inline(always)]` on `exec_numeric` + `exec_memory`** (each has a single call site,
+  inside the already-inlined `step`): **564 → 671 (+19%)** — LLVM threads the secondary
+  category `match` into the primary dispatch, so straight-line numeric/memory ops pay one
+  table jump, not a call plus a second full match. (This delivered what "flatten the
+  category dispatch" was estimated at, without moving any code.)
+- **Fused compare-and-branch** (`Op::BrIfCmp { kind, negate, target }`): an i32 relop
+  immediately followed by `br_if` (or by `if`, i.e. `br_if_not`) collapses into one op at
+  compile time — the relop is *replaced in place*, so `offsets` stay aligned and the patch
+  machinery just points at it. Fusion window (`Translator::fusable_cmp`) is set per emitted
+  op and cleared at every boundary a label can land on (`block`/`loop`/`if`/`else`/`end`/
+  `try_table` — a `loop` header between the pair would otherwise let a back-edge jump *onto*
+  the erased `br_if`). Interleaved A/B: **+2–3% CoreMark, sieve(1M) 43 → 45 runs/3s** —
+  real but modest; the data-dependent branch itself (the misprediction) survives fusion,
+  only the dispatch disappears. Kept.
+- File-cap fallout: `Op` payload types → `module/op_types.rs`; branch lowering + patch
+  machinery → `compile/control/branch.rs`.
+
+Session cumulative: CoreMark **192 → ~660 (≈3.4×)**, sieve(1M) **250 → ~67 ms (≈3.7×)**;
+gap to wasmi (~3200) now **≈4.8×**, from ~17×.
+
+### What's left (in rough order of leverage)
+
+1. **More fusion classes** with the now-proven window mechanism (`local.get local.get <op>`,
+   `local.get i32.const <op>`, load/store address folding) — each nets a few percent; the
+   ceiling is that fusion removes dispatches, not the mispredicting branches themselves.
+2. **The parked architectural option**: stitch-style closure/tail-call dispatch — wasmi 2
+   landed the same idea via explicit-tail-calls (wasmi-labs/wasmi#1946, "sibling calls");
+   stitch is the reference architecture. Owner note: if we go there, be safer than both —
+   e.g. bounce through a trampoline after a fixed native-stack budget rather than trusting
+   unbounded sibling-call chains. This is now the main lever left for execution: the profile
+   is ~50% dispatch blob + ~30% loop scaffolding, exactly what tail-call dispatch attacks.
