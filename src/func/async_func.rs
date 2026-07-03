@@ -33,8 +33,11 @@ impl Func {
     {
         let mut ctx = store.as_context_mut();
         let host_index = ctx.store_mut().push_async_host_func(Arc::new(func));
-        ctx.inner_mut()
-            .alloc_func(FuncEntity::HostAsync { ty, host_index })
+        ctx.inner_mut().alloc_func(FuncEntity::HostAsync {
+            sig: crate::store::HostSig::new(&ty),
+            ty,
+            host_index,
+        })
     }
 
     /// Creates an async host function from a typed Rust closure `Fn(Caller, P) -> Future<R>`.
@@ -56,8 +59,11 @@ impl Func {
         let (ty, cb) = into_async_func(&engine, func);
         let mut ctx = store.as_context_mut();
         let host_index = ctx.store_mut().push_async_host_func(cb);
-        ctx.inner_mut()
-            .alloc_func(FuncEntity::HostAsync { ty, host_index })
+        ctx.inner_mut().alloc_func(FuncEntity::HostAsync {
+            sig: crate::store::HostSig::new(&ty),
+            ty,
+            host_index,
+        })
     }
 
     /// Async sibling of [`call`](Func::call): drives the call as a `Future`. Requires an
@@ -99,7 +105,7 @@ impl Func {
                     params,
                     &ty,
                 )?;
-                crate::exec::host::execute_async(
+                crate::exec::host_async::execute_async(
                     store.as_context_mut().store_mut(),
                     instance,
                     func_index,

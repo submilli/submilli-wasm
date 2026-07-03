@@ -20,8 +20,9 @@ compiled module — the multi-tenant *density* axis.
 # gitignored to keep the repo lean; coremark-minimal.wasm is committed.
 ./scripts/fetch-bench-wasm.sh
 
-# Shareable summary table (best-of-N startup phases + CoreMark score):
-cargo run --release --example bench_table
+# Shareable summary table (best-of-N startup phases + CoreMark score).
+# `--features async` adds the async host-call row (the product's real IO path):
+cargo run --release --example bench_table --features async
 
 # Rigorous, statistical, CI-friendly (criterion) — startup phases only:
 cargo bench --bench lifecycle
@@ -56,6 +57,7 @@ Run once     sieve(1k)        468.96 us    5.72 ms  837.17 us
 Run once     sieve(10k)       918.71 us    5.86 ms  919.58 us
 Run once     sieve(1M)         57.39 ms    7.23 ms   11.30 ms
 Host calls   ping x100k         3.52 ms  325.92 us    1.15 ms
+Host calls   async x100k        7.33 ms    2.69 ms        n/a
 -------------------------------------------------------------
 CoreMark score (higher=fast)        715      36996       3032
 ```
@@ -100,7 +102,14 @@ steady state; a direct scalar codec; swap-based execution parking; and
 finally *loop-resident* sync host calls — the dispatch loop invokes the
 callback directly instead of suspending out through an `Outcome`) took
 submilli from 189 → ~35 ns/call, ~3× from wasmi (~12 ns) with
-panic-containment still on every crossing.
+panic-containment still on every crossing. The **async row** (awaited calls
+to an immediately-ready host future — the machinery under the product's real
+IO path) got the same treatment plus its own pass: 200 → ~73 ns/call, ~2.7×
+from wasmtime (~27 ns; wasmi has no async host functions — its answer is
+resumable calls, so its cell is n/a). An async call's extra ~38 ns over sync
+is the `Outcome` suspend to the driver's await point (structurally required —
+a sync loop can't await) plus the per-call `Box<dyn Future>` both engines'
+APIs mandate.
 
 The **Module RAM rows** are the density axis: heap bytes a compiled module
 keeps resident, which bounds how many tenants fit on a host. Both non-JIT

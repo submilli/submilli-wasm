@@ -737,3 +737,17 @@ ns/call, 5.4×; wasmi ~12, wasmtime ~3)**; CoreMark **~650 → 715–720** (all-
 sieve(1M) **~68 → 57 ms**; run-once sieve(10k) is now a **dead tie with wasmi** (919 vs
 920 µs). Remaining boundary gap: `catch_unwind`, `Caller` construction, and the `Val`
 codec — the typed host-call fast path is the next tier.
+
+Round 4 — **the async boundary** (the product's real IO path — async host fns):
+- New `async ×100k` row (submilli vs wasmtime; wasmi n/a — no async host fns, its answer
+  is resumable calls). Baseline: **~200 ns/call vs wasmtime ~26 ns** — the async path had
+  received none of the sync optimizations.
+- Ported the full treatment: `HostSig` cached on `FuncEntity::HostAsync`, reused scratch
+  buffers, swap-based parking across the await, direct codec. **200 → ~73 ns/call (2.7×)**.
+- Tried and reverted: fully inlining the await into `drive_async` (flattening the nested
+  async-fn state machine) — measured perf-neutral; the layering isn't where the cost is.
+- What remains, structurally: the `Outcome::HostAsync` suspend to the driver's await
+  point (required — a sync dispatch loop cannot await; going lower means fiber-style
+  stacks, which both need `unsafe` and are the wasmtime approach), and the per-call
+  `Box<dyn Future>` the wasmtime-compatible API shape mandates.
+- File-cap fallout: the async driver + helpers moved to `exec/host_async.rs`.

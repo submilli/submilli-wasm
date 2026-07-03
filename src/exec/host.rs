@@ -7,8 +7,6 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::epoch::apply_epoch_deadline;
-#[cfg(feature = "async")]
-use super::epoch::{apply_epoch_deadline_async, yield_now};
 use super::exn::surface_exception;
 use super::frame::Delimiter;
 use super::{cell, Execution, Outcome};
@@ -34,16 +32,16 @@ fn decode_results(result_tys: &[ValType], cells: Vec<cell::Cell>) -> Vec<Val> {
 /// The boundary state of one (top-level or re-entrant) call on the shared execution: where its
 /// operands begin (`value_base`), the parked outer frame depth (`stop_depth`), and the depth `run`
 /// stops at (`run_stop`, one above the delimiter).
-struct Boundary {
-    value_base: usize,
-    stop_depth: usize,
-    run_stop: usize,
+pub(super) struct Boundary {
+    pub(super) value_base: usize,
+    pub(super) stop_depth: usize,
+    pub(super) run_stop: usize,
 }
 
 /// Takes the shared execution (fresh if none is parked), pushes this call's boundary + args + entry
 /// frame, and returns the execution alongside its [`Boundary`]. The delimiter is a host re-entry
 /// when outer frames are already parked, else the top-level entry.
-fn enter<T>(
+pub(super) fn enter<T>(
     store: &mut Store<T>,
     instance: Instance,
     func_index: u32,
@@ -69,7 +67,7 @@ fn enter<T>(
 
 /// Closes out a (sub-)call: extracts results (or restores the stacks on error), re-parks the shared
 /// execution for the outer call to resume (top-level drops it), and surfaces any error.
-fn finish<T>(
+pub(super) fn finish<T>(
     store: &mut Store<T>,
     mut exec: Execution,
     b: &Boundary,
@@ -135,56 +133,6 @@ fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Resu
             Outcome::TableGrow { table, delta, init } => {
                 exec.do_grow_table(store, table, delta, init)?;
             }
-            Outcome::GcGrow {
-                reserved_target,
-                bytes_needed,
-            } => store.grow_gc_reservation(reserved_target, bytes_needed)?,
-        }
-    }
-}
-
-/// Async sibling of [`execute`]: drives the same resumable core to completion as a
-/// `Future`, so the call can be parked under an executor. Mirrors `execute` but awaits
-/// async host calls and yields.
-#[cfg(feature = "async")]
-pub(crate) async fn execute_async<T>(
-    store: &mut Store<T>,
-    instance: Instance,
-    func_index: u32,
-    code: Code,
-    args: Vec<Val>,
-    result_tys: &[ValType],
-) -> Result<Vec<Val>> {
-    let (mut exec, b) = enter(store, instance, func_index, code, args);
-    let outcome = drive_async(&mut exec, store, b.run_stop).await;
-    finish(store, exec, &b, result_tys, outcome)
-}
-
-/// Async sibling of [`drive`].
-#[cfg(feature = "async")]
-async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Result<()> {
-    loop {
-        match exec.run(store, run_stop)? {
-            Outcome::Finished => return Ok(()),
-            Outcome::HostAsync { func, instance } => {
-                exec.invoke_host_async(store, func, instance, run_stop)
-                    .await?;
-            }
-            Outcome::FuelYield => {
-                yield_now().await;
-                store.inner.refuel_from_reserve();
-            }
-            Outcome::EpochDeadline => {
-                if let Err(e) = apply_epoch_deadline_async(store).await {
-                    return Err(exec.attach_suspension_backtrace(&store.inner, e));
-                }
-            }
-            Outcome::Grow { memory, delta } => exec.do_grow_async(store, memory, delta).await?,
-            Outcome::TableGrow { table, delta, init } => {
-                exec.do_grow_table_async(store, table, delta, init).await?;
-            }
-            // GC reservation growth uses the sync limiter path (errors if an async limiter is
-            // installed — combining an async limiter with the GC heap is unsupported for now).
             Outcome::GcGrow {
                 reserved_target,
                 bytes_needed,
@@ -276,7 +224,7 @@ impl Execution {
     /// error that `try_table` must not catch. Keying on the error type (not just the slot) keeps an
     /// unrelated error, or a stale pending from an undrained earlier exception, from being mistaken
     /// for a throw.
-    fn host_call_error(
+    pub(super) fn host_call_error(
         &mut self,
         inner: &mut crate::store::StoreInner,
         e: crate::Error,
@@ -290,78 +238,12 @@ impl Execution {
         Err(e)
     }
 
-    /// Async sibling of [`invoke_host`](Self::invoke_host): runs the suspended async host
-    /// closure and awaits its future before pushing results. Args/results are owned locals,
-    /// so no store borrow is held across the `.await`.
-    #[cfg(feature = "async")]
-    async fn invoke_host_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        func: Func,
-        instance: Instance,
-        stop_depth: usize,
-    ) -> Result<()> {
-        let (param_tys, mut results, host_index) = match store.inner.func(func) {
-            FuncEntity::HostAsync { ty, host_index } => (
-                ty.params().collect::<Vec<ValType>>(),
-                ty.results()
-                    .map(|t| Val::default_for_valtype(&t))
-                    .collect::<Vec<_>>(),
-                *host_index,
-            ),
-            _ => unreachable!("HostAsync only suspends on async host funcs"),
-        };
-        // Scope the host-created GC roots for the call's duration (see `invoke_host`).
-        let roots_mark = store.inner.gc_roots_mark();
-        let params = self.pop_params(&param_tys);
-        let cb = store.async_host_funcs[host_index as usize].clone();
-        // Park the shared execution across the await (see `invoke_host`).
-        store.inner.park_exec(std::mem::take(self));
-        // Contain a host-fn panic across the await (#33): poll inside `CatchUnwind`; see `invoke_host`.
-        let outcome = {
-            let caller = Caller::new(store.as_context_mut(), Some(instance));
-            let fut = cb(caller, &params, &mut results);
-            super::guard::CatchUnwind(std::boxed::Box::into_pin(fut)).await
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(payload) => {
-                super::guard::restore_after_panic(&mut store.inner, roots_mark);
-                super::guard::reraise(payload);
-            }
-        };
-        *self = store.inner.take_exec();
-        if let Err(e) = outcome {
-            store.inner.gc_roots_truncate(roots_mark);
-            return self.host_call_error(&mut store.inner, e, stop_depth);
-        }
-        // See `invoke_host`: a host that returned normally leaves no pending exception.
-        store.inner.take_pending_exception();
-        self.push_results(results);
-        store.inner.gc_roots_truncate(roots_mark);
-        Ok(())
-    }
-
     /// Services a suspended `memory.grow`: consults the limiter and pushes the new
     /// page count, or `-1` on a soft failure (a trap propagates from `grow_memory`).
     fn do_grow<T>(&mut self, store: &mut Store<T>, memory: Memory, delta: u64) -> Result<()> {
         let is_64 = store.inner.memory(memory).ty.is_64();
         let old = store.grow_memory(memory, delta)?;
         self.push_index(is_64, old.unwrap_or(u64::MAX)); // soft-fail → -1 in either width
-        Ok(())
-    }
-
-    /// Async sibling of [`do_grow`](Self::do_grow): awaits an async resource limiter.
-    #[cfg(feature = "async")]
-    async fn do_grow_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        memory: Memory,
-        delta: u64,
-    ) -> Result<()> {
-        let is_64 = store.inner.memory(memory).ty.is_64();
-        let old = store.grow_memory_async(memory, delta).await?;
-        self.push_index(is_64, old.unwrap_or(u64::MAX));
         Ok(())
     }
 
@@ -376,21 +258,6 @@ impl Execution {
     ) -> Result<()> {
         let is_64 = store.inner.table(table).ty.is_64();
         let old = store.grow_table(table, delta, init)?;
-        self.push_index(is_64, old.unwrap_or(u64::MAX));
-        Ok(())
-    }
-
-    /// Async sibling of [`do_grow_table`](Self::do_grow_table).
-    #[cfg(feature = "async")]
-    async fn do_grow_table_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        table: Table,
-        delta: u64,
-        init: Ref,
-    ) -> Result<()> {
-        let is_64 = store.inner.table(table).ty.is_64();
-        let old = store.grow_table_async(table, delta, init).await?;
         self.push_index(is_64, old.unwrap_or(u64::MAX));
         Ok(())
     }

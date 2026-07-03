@@ -369,6 +369,7 @@ impl<T: 'static> Linker<T> {
                 let mut ctx = store.as_context_mut();
                 let host_index = ctx.store_mut().push_async_host_func(cb.clone());
                 let f = ctx.inner_mut().alloc_func(FuncEntity::HostAsync {
+                    sig: crate::store::HostSig::new(ty),
                     ty: ty.clone(),
                     host_index,
                 });

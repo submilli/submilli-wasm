@@ -35,6 +35,8 @@ mod gc;
 mod gc_array;
 pub(crate) mod guard;
 pub(crate) mod host;
+#[cfg(feature = "async")]
+pub(crate) mod host_async;
 mod memory;
 mod numeric;
 mod outcome;

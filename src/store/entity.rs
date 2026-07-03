@@ -136,6 +136,8 @@ pub(crate) enum FuncEntity {
     #[cfg(feature = "async")]
     HostAsync {
         ty: FuncType,
+        /// Cached call-shape, like `Host::sig` (the async boundary is per-call hot too).
+        sig: std::sync::Arc<HostSig>,
         host_index: u32,
     },
 }

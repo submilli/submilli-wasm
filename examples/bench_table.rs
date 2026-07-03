@@ -103,6 +103,7 @@ fn main() {
     cold_start_row();
     run_once_rows(&run_once_wasm);
     host_call_row(&support::host_call_wasm());
+    async_host_call_row();
     execution_row();
 }
 
@@ -264,6 +265,27 @@ fn host_call_row(wasm: &[u8]) {
         cell!(wt),
         cell!(wi),
     );
+}
+
+/// The async host-call boundary (100k awaited calls to an immediately-ready host future).
+/// wasmi has no async host functions (its answer is resumable calls) — its cell is n/a.
+#[cfg(feature = "async")]
+fn async_host_call_row() {
+    const N: i32 = 100_000;
+    let s = support::async_ping::submilli(N);
+    let t = support::async_ping::wasmtime(N);
+    println!(
+        "{:<28}{:>11}{:>11}{:>11}",
+        "Host calls   async x100k",
+        fmt_dur(s),
+        fmt_dur(t),
+        "n/a"
+    );
+}
+
+#[cfg(not(feature = "async"))]
+fn async_host_call_row() {
+    println!("{:<28}(async row: rebuild with --features async)", "");
 }
 
 /// Execution: CoreMark's own score (higher = faster). Single-shot per engine

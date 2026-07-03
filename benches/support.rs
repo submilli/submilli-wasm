@@ -301,3 +301,69 @@ pub fn retained_ram<T>(f: impl Fn() -> T) -> usize {
     mem::set_enabled(false);
     usize::try_from(after - before).unwrap_or(0)
 }
+
+/// Async host-call harness (submilli + wasmtime only: wasmi has no async host functions —
+/// its answer to async is resumable calls). Gated on the crate's `async` feature: build the
+/// bench with `--features async` to include the row. The host fn's future is immediately
+/// ready, so the row measures the async *boundary machinery* (suspend to the driver, future
+/// poll, panic containment across the await), not IO.
+#[cfg(feature = "async")]
+pub mod async_ping {
+    use super::host_call_wasm;
+
+    pub fn submilli(n: i32) -> std::time::Duration {
+        let engine = submilli_wasm::Engine::default(); // async_support is on by default
+        let module = submilli_wasm::Module::new(&engine, host_call_wasm()).unwrap();
+        let mut linker: submilli_wasm::Linker<()> = submilli_wasm::Linker::new(&engine);
+        linker
+            .func_wrap_async("env", "ping", |_caller, (x,): (i32,)| {
+                Box::new(async move { x + 1 })
+            })
+            .unwrap();
+        let mut store = submilli_wasm::Store::new(&engine, ());
+        pollster::block_on(async {
+            let inst = linker.instantiate_async(&mut store, &module).await.unwrap();
+            let f = inst.get_typed_func::<i32, i32>(&mut store, "run").unwrap();
+            // warm-ups, then best-of
+            for _ in 0..3 {
+                assert_eq!(f.call_async(&mut store, n).await.unwrap(), n);
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..20 {
+                let t = std::time::Instant::now();
+                assert_eq!(f.call_async(&mut store, n).await.unwrap(), n);
+                best = best.min(t.elapsed());
+            }
+            best
+        })
+    }
+
+    pub fn wasmtime(n: i32) -> std::time::Duration {
+        let mut c = wasmtime::Config::new();
+        c.cranelift_opt_level(wasmtime::OptLevel::None);
+        // (wasmtime 45 deprecated `async_support` — it is always on.)
+        let engine = wasmtime::Engine::new(&c).unwrap();
+        let module = wasmtime::Module::new(&engine, host_call_wasm()).unwrap();
+        let mut linker: wasmtime::Linker<()> = wasmtime::Linker::new(&engine);
+        linker
+            .func_wrap_async("env", "ping", |_caller, (x,): (i32,)| {
+                Box::new(async move { x + 1 })
+            })
+            .unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        pollster::block_on(async {
+            let inst = linker.instantiate_async(&mut store, &module).await.unwrap();
+            let f = inst.get_typed_func::<i32, i32>(&mut store, "run").unwrap();
+            for _ in 0..3 {
+                assert_eq!(f.call_async(&mut store, n).await.unwrap(), n);
+            }
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..20 {
+                let t = std::time::Instant::now();
+                assert_eq!(f.call_async(&mut store, n).await.unwrap(), n);
+                best = best.min(t.elapsed());
+            }
+            best
+        })
+    }
+}
