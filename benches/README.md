@@ -42,21 +42,21 @@ absolutes. Lower = faster, except the CoreMark score (higher = faster).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark          51.25 us  792.88 us   95.71 us
-Module::new  pulldown-cmark     1.13 ms   22.43 ms    2.34 ms
-Module::new  spidermonkey      24.50 ms  190.21 ms   52.81 ms
-Module RAM   coremark          80.6 KiB 183.5 KiB*   30.2 KiB
-Module RAM   pulldown-cmark     1.8 MiB 520.8 KiB*    2.4 MiB
-Module RAM   spidermonkey      38.3 MiB   3.2 MiB*   16.5 MiB
-Module RAM   run-once         657.1 KiB  50.5 KiB*  235.5 KiB
+Module::new  coremark          50.29 us  728.21 us   97.67 us
+Module::new  pulldown-cmark     1.09 ms   22.33 ms    2.29 ms
+Module::new  spidermonkey      23.63 ms  213.36 ms   53.34 ms
+Module RAM   coremark          66.4 KiB 147.9 KiB*   30.2 KiB
+Module RAM   pulldown-cmark     1.5 MiB   1.1 MiB*  841.1 KiB
+Module RAM   spidermonkey      31.0 MiB   2.5 MiB*   16.5 MiB
+Module RAM   run-once         503.6 KiB  50.8 KiB*  216.7 KiB
                             (* metadata only: wasmtime JIT code is mmap'd)
 Store::new                         0 ns     125 ns       0 ns
-Cold start   coremark          53.12 us  780.08 us   99.54 us
-Run once     sieve(1k)        537.38 us    5.71 ms  817.54 us
-Run once     sieve(10k)         1.04 ms    5.72 ms  898.96 us
-Run once     sieve(1M)         63.01 ms    7.17 ms   11.33 ms
+Cold start   coremark          51.21 us  775.88 us   99.75 us
+Run once     sieve(1k)        480.71 us    5.70 ms  820.79 us
+Run once     sieve(10k)       998.58 us    5.56 ms  906.25 us
+Run once     sieve(1M)         65.15 ms    7.10 ms   11.21 ms
 -------------------------------------------------------------
-CoreMark score (higher=fast)        660      37824       3060
+CoreMark score (higher=fast)        622      38226       3098
 ```
 
 The story: submilli's `Module::new`/cold-start beats wasmtime **~5–16×** (it
@@ -67,8 +67,8 @@ barely moves versus the optimized build — the JIT's compile cost dominates
 regardless of opt level, which is the whole point. Against wasmi — the other
 non-JIT, forced to **eager compilation** so its compile column measures the
 same work (see below) — submilli compiles **~2× faster at every module size**
-(coremark 51 vs 96 µs, spidermonkey 25 vs 53 ms) and wins the small-module
-cold start (53 vs 100 µs), while wasmi executes ~4.6× faster. The compile lead
+(coremark 50 vs 98 µs, spidermonkey 24 vs 53 ms) and wins the small-module
+cold start (51 vs 100 µs), while wasmi executes ~4.9× faster. The compile lead
 comes from fusing validation into lowering, writing every op once straight
 into module-wide arenas, and a compact 16-byte non-drop `Op`; the execution
 gap (was ~17×) shrank ~3.5× across the interpreter-loop optimization passes —
@@ -80,26 +80,28 @@ one window covering empty linker + `Module::new` + fresh `Store` + instantiate
 essentially *all* of its code (see below — generated code is written to be
 used, so a run-once engine doesn't get to skip translating it), with three
 sieve sizes spanning the execution-weight curve. They locate the crossovers
-honestly. While execution is light, **submilli wins the total** — 537 µs vs
-wasmi's 818 µs (its ~740 µs eager compile dominates) and wasmtime's 5.7 ms
+honestly. While execution is light, **submilli wins the total** — 481 µs vs
+wasmi's 821 µs (its ~740 µs eager compile dominates) and wasmtime's 5.7 ms
 (the JIT's compile bill) — the fast-startup thesis paying off end to end. Once
-execution dominates, the ~4.6× interpreter gap takes over and wasmi wins
-(1.04 ms vs 0.9 ms at sieve(10k), 63 ms vs 11 ms at sieve(1M); wasmtime
+execution dominates, the ~4.9× interpreter gap takes over and wasmi wins
+(1.0 ms vs 0.91 ms at sieve(10k), 65 ms vs 11 ms at sieve(1M); wasmtime
 flattens at ~6–7 ms regardless). The crossover sits around a couple of
 milliseconds of interpreted work — the interpreter passes in `PERF-NOTES.md`
-§12 cut these totals ~4× (sieve(1M) 236 → 63 ms), and pushing the crossover
+§12 cut these totals ~4× (sieve(1M) 236 → 65 ms), and pushing the crossover
 further out is the tail-call-dispatch class of work.
 
 The **Module RAM rows** are the density axis: heap bytes a compiled module
-keeps resident, which bounds how many tenants fit on a host. The picture is
-mixed and honestly so: submilli beats wasmi on pulldown-cmark (1.8 vs 2.4 MiB)
-but trails on spidermonkey (38 vs 16.5 MiB — wasmi's variable-length byte IR
-out-packs our fixed 16-byte ops, and ~7 MiB of ours is the backtrace offset
-table that submilli retains by default and wasmi doesn't keep at all). Recent
-work cut submilli's footprint sharply (24→16-byte ops, then module-wide arenas:
-peak compile RSS 162 → 44.5 MB, `PERF-NOTES.md` §13); the remaining rung is an
-8–12-byte encoding. The starred wasmtime cells are floor values — its JIT code
-lives in mmap'd executable regions the heap counter cannot see.
+keeps resident, which bounds how many tenants fit on a host. Both non-JIT
+engines run with debug/name retention **off** (see below) so the rows compare
+pure compiled-code density, and the story is uniform: **wasmi is ~2× denser
+at every size** (coremark 66 vs 30 KiB, pulldown 1.5 MiB vs 841 KiB,
+spidermonkey 31.0 vs 16.5 MiB) — its variable-length byte IR averages ~9
+bytes/op against submilli's fixed 16-byte `Op`. Recent work already cut
+submilli's footprint sharply (24→16-byte ops, then module-wide arenas: peak
+compile RSS 162 → 44.5 MB, `PERF-NOTES.md` §13); closing the remaining ~2× is
+the 8–12-byte encoding rung (pool the wide constants, wasmi-style). The
+starred wasmtime cells are floor values — its JIT code lives in mmap'd
+executable regions the heap counter cannot see.
 
 ## Methodology & fairness
 
@@ -142,6 +144,14 @@ lives in mmap'd executable regions the heap counter cannot see.
   cherry-picking.
 - **Best-of-N** for startup phases (resists upward scheduler noise); **criterion**
   for the statistically-rigorous, regression-tracking numbers.
+- **Debug/name retention is off on both non-JIT engines.** submilli runs
+  `wasm_backtrace(false)` (drops its per-op backtrace offset table + `name`
+  section — the wasmtime-compatible default keeps them, costing ~+20% module
+  RAM and ~10% startup); wasmi runs `ignore_custom_sections(true)` (by default
+  it retains raw custom sections in the module — pulldown-cmark's `name`
+  section alone is ~1.6 MiB, which inflated its RAM cell ~3×). Same-work
+  principle as the wasmtime opt-level and wasmi eager-mode choices: every cell
+  measures compiled code, not optional metadata.
 - **Module RAM is a live-heap delta from a counting global allocator**
   (`support::mem`): warm the engine with one discarded compile, then measure
   allocated-minus-freed across a second, holding the module until read. All

@@ -90,13 +90,13 @@ macro_rules! engine_ops {
 }
 
 // wasmtime-compatible API: `Linker::instantiate`, typed-func lookup takes `&mut`.
-engine_ops!(
-    submilli,
-    submilli_wasm,
-    instantiate,
-    mut,
-    submilli_wasm::Engine::default()
-);
+// submilli runs with backtrace retention **off** (drops the per-op offsets table + name
+// section) so the RAM rows compare pure compiled-code density against wasmi, which is
+// configured to drop its custom-section retention below — apples to apples. The default
+// (`wasm_backtrace` on, wasmtime-compatible) costs ~+20% module RAM and ~10% startup.
+engine_ops!(submilli, submilli_wasm, instantiate, mut, {
+    submilli_wasm::Engine::new(submilli_wasm::Config::new().wasm_backtrace(false)).unwrap()
+});
 // wasmtime runs Cranelift with **no optimization** (`OptLevel::None`) — the fair floor for a
 // startup comparison, since optimization is exactly the compile-time cost this project skips.
 engine_ops!(wt, wasmtime, instantiate, mut, {
@@ -111,6 +111,10 @@ engine_ops!(wt, wasmtime, instantiate, mut, {
 engine_ops!(wi, wasmi, instantiate_and_start, shared, {
     let mut c = wasmi::Config::default();
     c.compilation_mode(wasmi::CompilationMode::Eager);
+    // Drop custom-section retention (name etc.), matching submilli's no-retention config
+    // above — by default wasmi keeps raw custom sections in the module (pulldown-cmark's
+    // name section alone is ~1.6 MiB, which would inflate its Module RAM cell).
+    c.ignore_custom_sections(true);
     wasmi::Engine::new(&c)
 });
 /// Synthetic fixture for the run-once benchmark: the "LLM-generated code that
