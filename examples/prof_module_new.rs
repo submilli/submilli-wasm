@@ -21,6 +21,7 @@ fn main() {
 
     match engine.as_str() {
         "wasmi" => run::<Wasmi>(bytes, &which, secs),
+        "wasmi-eager" => run::<WasmiEager>(bytes, &which, secs),
         _ => run::<Submilli>(bytes, &which, secs),
     }
 }
@@ -45,6 +46,21 @@ struct Wasmi(wasmi::Engine);
 impl Compile for Wasmi {
     fn setup() -> Self {
         Wasmi(wasmi::Engine::default())
+    }
+    fn compile(&self, bytes: &[u8]) {
+        let m = wasmi::Module::new(&self.0, bytes).unwrap();
+        std::hint::black_box(&m);
+    }
+}
+
+/// wasmi with `CompilationMode::Eager` — its default is `LazyTranslation`, under which
+/// `Module::new` only validates and defers per-function translation to first call.
+struct WasmiEager(wasmi::Engine);
+impl Compile for WasmiEager {
+    fn setup() -> Self {
+        let mut config = wasmi::Config::default();
+        config.compilation_mode(wasmi::CompilationMode::Eager);
+        WasmiEager(wasmi::Engine::new(&config))
     }
     fn compile(&self, bytes: &[u8]) {
         let m = wasmi::Module::new(&self.0, bytes).unwrap();

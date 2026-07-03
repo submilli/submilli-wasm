@@ -65,12 +65,23 @@ macro_rules! engine_ops {
             pub fn instantiate(l: &Linker, s: &mut Store, m: &Module) -> Instance {
                 l.$instantiate(&mut *s, m).unwrap()
             }
+            /// A linker with no host functions, for import-free modules.
+            pub fn empty_linker(e: &Engine) -> Linker {
+                w::Linker::new(e)
+            }
             /// Call CoreMark's `run () -> f32`, returning the score.
             pub fn run_coremark(inst: &Instance, s: &mut Store) -> f32 {
                 let f = inst
                     .get_typed_func::<(), f32>(engine_ops!(@store $typed_store, s), "run")
                     .unwrap();
                 f.call(&mut *s, ()).unwrap()
+            }
+            /// Call the run-once module's `run (i32) -> i32`.
+            pub fn run_i32(inst: &Instance, s: &mut Store, arg: i32) -> i32 {
+                let f = inst
+                    .get_typed_func::<i32, i32>(engine_ops!(@store $typed_store, s), "run")
+                    .unwrap();
+                f.call(&mut *s, arg).unwrap()
             }
         }
     };
@@ -93,11 +104,86 @@ engine_ops!(wt, wasmtime, instantiate, mut, {
     c.cranelift_opt_level(wasmtime::OptLevel::None);
     wasmtime::Engine::new(&c).unwrap()
 });
-// wasmi: folds `start` into instantiation; typed-func lookup takes `&store`.
-engine_ops!(
-    wi,
-    wasmi,
-    instantiate_and_start,
-    shared,
-    wasmi::Engine::default()
-);
+// wasmi runs with **eager compilation** — its default (`CompilationMode::LazyTranslation`)
+// validates but defers per-function translation to first call, which would make its
+// `Module::new` a validate-only number next to the other engines' full compiles.
+// Also: folds `start` into instantiation; typed-func lookup takes `&store`.
+engine_ops!(wi, wasmi, instantiate_and_start, shared, {
+    let mut c = wasmi::Config::default();
+    c.compilation_mode(wasmi::CompilationMode::Eager);
+    wasmi::Engine::new(&c)
+});
+/// Synthetic fixture for the run-once benchmark: the "LLM-generated code that
+/// runs once" shape. ~1200 distinct small helper functions in call chains of
+/// 100 (each function calls the next; `run` calls every chain head in turn),
+/// so executing `run` touches *all* of the module's code — generated code is
+/// written to be used, not shipped cold, which also means lazy-translation
+/// engines pay their deferred work inside the timed window. Chains are capped
+/// at 100 deep to stay well under every engine's default recursion limit.
+/// A prime-sieve kernel is exported as `run (i32 n) -> i32` (count of primes
+/// below `n`; `run` walks the chains first). No imports, so every engine
+/// instantiates it with an empty linker. Assembled from WAT once in setup —
+/// never inside a timed phase.
+pub fn run_once_wasm() -> Vec<u8> {
+    use std::fmt::Write as _;
+    const BULK_FUNCS: i32 = 1200;
+    const CHAIN: i32 = 100;
+    let mut w = String::from("(module\n  (memory (export \"memory\") 16)\n");
+    for i in 0..BULK_FUNCS {
+        let (a, b, s) = (i % 97 + 3, i % 251 + 1, i % 13 + 1);
+        let chain = if (i + 1) % CHAIN != 0 && i + 1 < BULK_FUNCS {
+            format!("(call $f{} (local.get $t))", i + 1)
+        } else {
+            "(local.get $t)".to_string()
+        };
+        write!(
+            w,
+            "  (func $f{i} (param $x i32) (result i32) (local $t i32)\n    \
+             (local.set $t (i32.add (i32.mul (local.get $x) (i32.const {a})) (i32.const {b})))\n    \
+             (local.set $t (i32.xor (local.get $t) (i32.shr_u (local.get $t) (i32.const {s}))))\n    \
+             (i32.add (i32.and {chain} (i32.const 16777215)) (i32.rotl (local.get $x) (i32.const {s}))))\n",
+        )
+        .unwrap();
+    }
+    // Sieve of Eratosthenes over one byte per candidate (memory 16 pages = 1 MiB,
+    // so `n` up to 1_000_000 stays in bounds; fresh instances start zeroed).
+    w.push_str(
+        "  (func $sieve (param $n i32) (result i32) (local $i i32) (local $j i32) (local $count i32)\n\
+         (local.set $i (i32.const 2))\n\
+         (block $sieved (loop $outer\n\
+           (br_if $sieved (i32.gt_u (i32.mul (local.get $i) (local.get $i)) (local.get $n)))\n\
+           (if (i32.eqz (i32.load8_u (local.get $i))) (then\n\
+             (local.set $j (i32.mul (local.get $i) (local.get $i)))\n\
+             (block $marked (loop $mark\n\
+               (br_if $marked (i32.ge_u (local.get $j) (local.get $n)))\n\
+               (i32.store8 (local.get $j) (i32.const 1))\n\
+               (local.set $j (i32.add (local.get $j) (local.get $i)))\n\
+               (br $mark)))))\n\
+           (local.set $i (i32.add (local.get $i) (i32.const 1)))\n\
+           (br $outer)))\n\
+         (local.set $i (i32.const 2))\n\
+         (block $counted (loop $tally\n\
+           (br_if $counted (i32.ge_u (local.get $i) (local.get $n)))\n\
+           (local.set $count (i32.add (local.get $count) (i32.xor (i32.load8_u (local.get $i)) (i32.const 1))))\n\
+           (local.set $i (i32.add (local.get $i) (i32.const 1)))\n\
+           (br $tally)))\n\
+         (local.get $count))\n\
+         (func (export \"run\") (param $n i32) (result i32)\n",
+    );
+    // `run` walks every chain head, executing all of the module's code, then sieves.
+    for head in (0..BULK_FUNCS).step_by(CHAIN as usize) {
+        writeln!(w, "    (drop (call $f{head} (local.get $n)))").unwrap();
+    }
+    w.push_str("    (call $sieve (local.get $n)))\n)\n");
+    wat::parse_str(&w).unwrap()
+}
+
+/// `(label, sieve bound, expected prime count, best-of iters)` rows for the
+/// run-once benchmark, spanning the execution-weight curve: trivial execution
+/// (startup-dominated — the fast-startup sweet spot), a light-but-real run,
+/// and a heavy one (execution-dominated — where fast runtimes catch back up).
+pub const RUN_ONCE: &[(&str, i32, i32, u32)] = &[
+    ("sieve(1k)", 1_000, 168, 40),
+    ("sieve(10k)", 10_000, 1_229, 40),
+    ("sieve(1M)", 1_000_000, 78_498, 8),
+];

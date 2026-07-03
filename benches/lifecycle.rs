@@ -139,5 +139,60 @@ fn cold_start(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, module_new, store_new, instantiate, cold_start);
+/// The whole pipeline in one timed window — fresh linker + compile + fresh
+/// store + instantiate + execute — for a module that is never reused: the
+/// "LLM-generated code that runs once" use case. Light workload only; the
+/// execution-heavy variant lives in `bench_table` (too slow to sample here).
+fn run_once(c: &mut Criterion) {
+    let (label, n, expected, _) = support::RUN_ONCE[0];
+    let wasm = support::run_once_wasm();
+    let mut g = c.benchmark_group(format!("run_once/{label}"));
+    g.sample_size(20);
+    {
+        let e = support::submilli::engine();
+        g.bench_function("submilli", |b| {
+            b.iter(|| {
+                let m = support::submilli::compile(&e, &wasm);
+                let l = support::submilli::empty_linker(&e);
+                let mut s = support::submilli::store(&e);
+                let inst = support::submilli::instantiate(&l, &mut s, &m);
+                assert_eq!(support::submilli::run_i32(&inst, &mut s, n), expected);
+            });
+        });
+    }
+    {
+        let e = support::wt::engine();
+        g.bench_function("wasmtime", |b| {
+            b.iter(|| {
+                let m = support::wt::compile(&e, &wasm);
+                let l = support::wt::empty_linker(&e);
+                let mut s = support::wt::store(&e);
+                let inst = support::wt::instantiate(&l, &mut s, &m);
+                assert_eq!(support::wt::run_i32(&inst, &mut s, n), expected);
+            });
+        });
+    }
+    {
+        let e = support::wi::engine();
+        g.bench_function("wasmi", |b| {
+            b.iter(|| {
+                let m = support::wi::compile(&e, &wasm);
+                let l = support::wi::empty_linker(&e);
+                let mut s = support::wi::store(&e);
+                let inst = support::wi::instantiate(&l, &mut s, &m);
+                assert_eq!(support::wi::run_i32(&inst, &mut s, n), expected);
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    module_new,
+    store_new,
+    instantiate,
+    cold_start,
+    run_once
+);
 criterion_main!(benches);

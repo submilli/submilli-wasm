@@ -3,8 +3,9 @@
 //! interpreter loses to a JIT), this measures the *whole* lifecycle — the axis
 //! this project optimizes: `fast compilation/startup >> runtime speed`.
 //!
-//! Startup phases are best-of-N wall clock. Execution is CoreMark's own score
-//! (higher = faster), taken single-shot because each run self-times to ~18 s.
+//! Startup phases and the fused run-once totals are best-of-N wall clock.
+//! Execution is CoreMark's own score (higher = faster), taken single-shot
+//! because each run self-times to ~18 s.
 //!
 //! Run with: `cargo run --release --example bench_table`
 #![allow(clippy::unwrap_used)]
@@ -14,14 +15,19 @@ use std::time::{Duration, Instant};
 
 #[path = "../benches/support.rs"]
 mod support;
-use support::{submilli, wi, wt, COREMARK, MODULES};
+use support::{submilli, wi, wt, COREMARK, MODULES, RUN_ONCE};
 
-/// Best-of-`iters` wall clock (one warmup discarded). Best-of resists the OS
-/// scheduler adding noise upward; it's the fairest single number for a table.
-/// The produced value is black-boxed *after* the timer stops so the compiler
-/// can't elide the work, without charging the black-box to the measurement.
+/// Best-of-`iters` wall clock (three warmups discarded — one is not enough: the
+/// process-global first use of an engine still pays dyld/allocator/page-fault
+/// warm-up, which used to inflate the table's very first row). Best-of resists
+/// the OS scheduler adding noise upward; it's the fairest single number for a
+/// table. The produced value is black-boxed *after* the timer stops so the
+/// compiler can't elide the work, without charging the black-box to the
+/// measurement.
 fn best_of<T>(iters: u32, mut f: impl FnMut() -> T) -> Duration {
-    black_box(f());
+    for _ in 0..3 {
+        black_box(f());
+    }
     let mut best = Duration::MAX;
     for _ in 0..iters {
         let t = Instant::now();
@@ -77,18 +83,28 @@ macro_rules! coremark_score {
 }
 
 fn main() {
-    print_header();
+    // Busy-spin briefly so the scheduler moves us to a boosted P-core before the
+    // first row is timed — otherwise that row alone absorbs the ramp-up and can
+    // read ~2× high (it intermittently did, even with per-row warm-up calls).
+    let settle = Instant::now();
+    while settle.elapsed() < Duration::from_millis(300) {
+        black_box(0);
+    }
+    let run_once_wasm = support::run_once_wasm();
+    print_header(run_once_wasm.len());
     module_new_rows();
     store_new_row();
     cold_start_row();
+    run_once_rows(&run_once_wasm);
     execution_row();
 }
 
-fn print_header() {
+fn print_header(run_once_len: usize) {
     println!("=== submilli-wasm lifecycle benchmark (lower = faster) ===\n");
     for &(name, bytes) in MODULES {
         println!("  {name:<16} {}", kib(bytes.len()));
     }
+    println!("  {:<16} {} (generated)", "run-once", kib(run_once_len));
     println!(
         "\n{:<28}{:>11}{:>11}{:>11}",
         "phase", "submilli", "wasmtime", "wasmi"
@@ -152,6 +168,43 @@ fn cold_start_row() {
             wi::instantiate(&il, &mut s, &m)
         }),
     );
+}
+
+/// The whole pipeline in one timed window — fresh linker + `Module::new` +
+/// fresh store + instantiate + execute — for a module that is **never reused**:
+/// the "LLM-generated code that runs once" use case this project targets. The
+/// fixture executes ~all of its code (see `run_once_wasm`), so wasmi's eager
+/// mode is representative — lazy translation would just pay inside the window.
+fn run_once_rows(wasm: &[u8]) {
+    let se = submilli::engine();
+    let te = wt::engine();
+    let ie = wi::engine();
+    for &(label, n, expected, iters) in RUN_ONCE {
+        row(
+            &format!("Run once     {label}"),
+            best_of(iters, || {
+                let m = submilli::compile(&se, wasm);
+                let l = submilli::empty_linker(&se);
+                let mut s = submilli::store(&se);
+                let inst = submilli::instantiate(&l, &mut s, &m);
+                assert_eq!(submilli::run_i32(&inst, &mut s, n), expected);
+            }),
+            best_of(iters, || {
+                let m = wt::compile(&te, wasm);
+                let l = wt::empty_linker(&te);
+                let mut s = wt::store(&te);
+                let inst = wt::instantiate(&l, &mut s, &m);
+                assert_eq!(wt::run_i32(&inst, &mut s, n), expected);
+            }),
+            best_of(iters, || {
+                let m = wi::compile(&ie, wasm);
+                let l = wi::empty_linker(&ie);
+                let mut s = wi::store(&ie);
+                let inst = wi::instantiate(&l, &mut s, &m);
+                assert_eq!(wi::run_i32(&inst, &mut s, n), expected);
+            }),
+        );
+    }
 }
 
 /// Execution: CoreMark's own score (higher = faster). Single-shot per engine
