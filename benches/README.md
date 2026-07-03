@@ -42,22 +42,22 @@ absolutes. Lower = faster, except the CoreMark score (higher = faster).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark          50.29 us  728.21 us   97.67 us
-Module::new  pulldown-cmark     1.09 ms   22.33 ms    2.29 ms
-Module::new  spidermonkey      23.63 ms  213.36 ms   53.34 ms
-Module RAM   coremark          66.4 KiB 147.9 KiB*   30.2 KiB
-Module RAM   pulldown-cmark     1.5 MiB   1.1 MiB*  841.1 KiB
-Module RAM   spidermonkey      31.0 MiB   2.5 MiB*   16.5 MiB
-Module RAM   run-once         503.6 KiB  50.8 KiB*  216.7 KiB
+Module::new  coremark          51.12 us  792.71 us  100.71 us
+Module::new  pulldown-cmark     1.11 ms   22.16 ms    2.31 ms
+Module::new  spidermonkey      23.81 ms  192.81 ms   54.18 ms
+Module RAM   coremark          66.4 KiB  78.8 KiB*   30.2 KiB
+Module RAM   pulldown-cmark     1.5 MiB   1.4 MiB*  841.1 KiB
+Module RAM   spidermonkey      31.0 MiB   3.8 MiB*   16.5 MiB
+Module RAM   run-once         503.6 KiB  63.8 KiB*  216.7 KiB
                             (* metadata only: wasmtime JIT code is mmap'd)
 Store::new                         0 ns     125 ns       0 ns
-Cold start   coremark          51.21 us  775.88 us   99.75 us
-Run once     sieve(1k)        480.71 us    5.70 ms  820.79 us
-Run once     sieve(10k)       998.58 us    5.56 ms  906.25 us
-Run once     sieve(1M)         65.15 ms    7.10 ms   11.21 ms
-Host calls   ping x100k         5.93 ms  367.12 us    1.35 ms
+Cold start   coremark          52.04 us  769.25 us  100.83 us
+Run once     sieve(1k)        468.96 us    5.72 ms  837.17 us
+Run once     sieve(10k)       918.71 us    5.86 ms  919.58 us
+Run once     sieve(1M)         57.39 ms    7.23 ms   11.30 ms
+Host calls   ping x100k         3.52 ms  325.92 us    1.15 ms
 -------------------------------------------------------------
-CoreMark score (higher=fast)        622      38226       3098
+CoreMark score (higher=fast)        715      36996       3032
 ```
 
 The story: submilli's `Module::new`/cold-start beats wasmtime **~5–16×** (it
@@ -69,7 +69,7 @@ regardless of opt level, which is the whole point. Against wasmi — the other
 non-JIT, forced to **eager compilation** so its compile column measures the
 same work (see below) — submilli compiles **~2× faster at every module size**
 (coremark 50 vs 98 µs, spidermonkey 24 vs 53 ms) and wins the small-module
-cold start (51 vs 100 µs), while wasmi executes ~4.9× faster. The compile lead
+cold start (51 vs 100 µs), while wasmi executes ~4.2× faster. The compile lead
 comes from fusing validation into lowering, writing every op once straight
 into module-wide arenas, and a compact 16-byte non-drop `Op`; the execution
 gap (was ~17×) shrank ~3.5× across the interpreter-loop optimization passes —
@@ -81,26 +81,26 @@ one window covering empty linker + `Module::new` + fresh `Store` + instantiate
 essentially *all* of its code (see below — generated code is written to be
 used, so a run-once engine doesn't get to skip translating it), with three
 sieve sizes spanning the execution-weight curve. They locate the crossovers
-honestly. While execution is light, **submilli wins the total** — 481 µs vs
-wasmi's 821 µs (its ~740 µs eager compile dominates) and wasmtime's 5.7 ms
-(the JIT's compile bill) — the fast-startup thesis paying off end to end. Once
-execution dominates, the ~4.9× interpreter gap takes over and wasmi wins
-(1.0 ms vs 0.91 ms at sieve(10k), 65 ms vs 11 ms at sieve(1M); wasmtime
-flattens at ~6–7 ms regardless). The crossover sits around a couple of
-milliseconds of interpreted work — the interpreter passes in `PERF-NOTES.md`
-§12 cut these totals ~4× (sieve(1M) 236 → 65 ms), and pushing the crossover
-further out is the tail-call-dispatch class of work.
+honestly. While execution is light, **submilli wins the total** — 469 µs vs
+wasmi's 837 µs (its ~740 µs eager compile dominates) and wasmtime's 5.7 ms
+(the JIT's compile bill) — and at sieve(10k) the totals are now a dead tie
+(919 vs 920 µs). Only past that does the ~4.2× interpreter gap hand wasmi the
+total (57 ms vs 11 ms at sieve(1M); wasmtime flattens at ~6–7 ms regardless).
+The interpreter passes in `PERF-NOTES.md` §12 cut these totals ~4×
+(sieve(1M) 236 → 57 ms); pushing the crossover further out is the
+tail-call-dispatch class of work.
 
 The **host-call row** measures the guest→host→guest boundary — 100k
 data-dependent calls to a trivial imported function, execution only. For
 IO-heavy orchestration guests (the product workload: thin glue around host
 stdlib calls) this, not compute throughput, is the runtime number that
-matters. Two optimization passes (cache each host fn's signature at
+matters. Three optimization passes (cache each host fn's signature at
 registration; reuse arg/result buffers so the boundary is allocation-free in
-steady state; a direct scalar codec; swap-based execution parking) took
-submilli from 189 → ~42 ns/call; the remaining gap to wasmi (~13 ns) and
-wasmtime (~4 ns) is the dispatch-loop exit/re-entry and panic-containment
-per crossing.
+steady state; a direct scalar codec; swap-based execution parking; and
+finally *loop-resident* sync host calls — the dispatch loop invokes the
+callback directly instead of suspending out through an `Outcome`) took
+submilli from 189 → ~35 ns/call, ~3× from wasmi (~12 ns) with
+panic-containment still on every crossing.
 
 The **Module RAM rows** are the density axis: heap bytes a compiled module
 keeps resident, which bounds how many tenants fit on a host. Both non-JIT

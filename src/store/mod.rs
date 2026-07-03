@@ -1,5 +1,6 @@
 //! `Store<T>` — owns runtime entities and host state; the context spine.
 
+mod accessors;
 mod arena;
 mod context;
 mod entity;

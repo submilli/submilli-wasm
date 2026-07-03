@@ -114,11 +114,8 @@ pub(crate) fn execute<T>(
 /// error propagates raw, to be surfaced + cleaned up by [`finish`].
 fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Result<()> {
     loop {
-        match exec.run(&mut store.inner, run_stop)? {
+        match exec.run(store, run_stop)? {
             Outcome::Finished => return Ok(()),
-            Outcome::HostCall { func, instance } => {
-                exec.invoke_host(store, func, instance, run_stop)?;
-            }
             #[cfg(feature = "async")]
             Outcome::HostAsync { .. } => {
                 return Err(crate::Error::msg(
@@ -167,11 +164,8 @@ pub(crate) async fn execute_async<T>(
 #[cfg(feature = "async")]
 async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Result<()> {
     loop {
-        match exec.run(&mut store.inner, run_stop)? {
+        match exec.run(store, run_stop)? {
             Outcome::Finished => return Ok(()),
-            Outcome::HostCall { func, instance } => {
-                exec.invoke_host(store, func, instance, run_stop)?;
-            }
             Outcome::HostAsync { func, instance } => {
                 exec.invoke_host_async(store, func, instance, run_stop)
                     .await?;
@@ -203,7 +197,11 @@ impl Execution {
     /// Invokes a suspended host function: pops its args off the operand stack,
     /// runs the closure with a `Caller`, and pushes the results back. A host `Err`
     /// propagates as the call's trap/error.
-    fn invoke_host<T>(
+    // `inline(never)`: this body (buffers, catch_unwind, Caller, error paths) is called from
+    // *inside* the dispatch loop now — letting it inline there wrecks the loop's code layout
+    // (measured ~2x slower across all workloads when it did).
+    #[inline(never)]
+    pub(super) fn invoke_host<T>(
         &mut self,
         store: &mut Store<T>,
         func: Func,

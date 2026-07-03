@@ -35,6 +35,7 @@ fn resolve(code: &Code, m: &MemArg) -> (u32, u64) {
 
 /// The instance's memory at index `idx` (imported memories first, then defined â the wasm index
 /// space). `memory.grow` is serviced separately in the run loop (for the limiter).
+#[inline]
 fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Memory {
     inner.instance(instance).memories[idx as usize]
 }

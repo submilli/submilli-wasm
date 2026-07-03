@@ -715,3 +715,25 @@ must go lower: a typed host-call fast path that skips the `Val` layer entirely
 (wasmtime-style `IntoFunc` specialization reading operand cells directly), and keeping
 the dispatch loop resident across host calls — both are architecture conversations
 (typed-store access from the untyped loop; async parking interplay).
+
+Round 3 — **loop-resident sync host calls** (and the bug it flushed out):
+- `run`/`dispatch` are now generic over the store's data type `T`, so the `DoHostCall`
+  arm invokes the callback *inside* the dispatch loop (execution swap-parked around it —
+  re-entrant `Func::call` still shares the stacks; async host fns still suspend out
+  through `Outcome`, a sync loop can't await). `Outcome::HostCall` is gone.
+- Cost of genericity: the interpreter monomorphizes in the consumer crate, which
+  initially **halved every benchmark** — two fixes: `#[inline(never)]` on `invoke_host`
+  (its body wrecked the loop's code layout when inlined into it), and `#[inline]` on the
+  hot helper surface (`stack`/`cell`/`frame`/`call` + store accessors, now split into
+  `store/accessors.rs`) since cross-crate inlining needs the attribute.
+- **The regression exposed a long-standing hot-path bug**: `gc_pressure_watch` armed on
+  `is_collecting()` alone, and the default collector is mark-sweep — so every default
+  engine ran the *gated* loop, paying a GC-mailbox check (`footprint_over_floor` + an
+  atomic read) on **every op** since #27g landed. The mailbox is only ever posted when
+  `gc_memory_threshold` is configured; the watch now requires that too.
+
+Net effect on everything at once: host calls **18.9 → 3.5 ms per 100k (189 → ~35
+ns/call, 5.4×; wasmi ~12, wasmtime ~3)**; CoreMark **~650 → 715–720** (all-time high);
+sieve(1M) **~68 → 57 ms**; run-once sieve(10k) is now a **dead tie with wasmi** (919 vs
+920 µs). Remaining boundary gap: `catch_unwind`, `Caller` construction, and the `Val`
+codec — the typed host-call fast path is the next tier.

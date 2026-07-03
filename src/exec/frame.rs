@@ -37,6 +37,7 @@ pub(crate) enum Delimiter {
 }
 
 impl super::Execution {
+    #[inline]
     pub(super) fn push_call(&mut self, instance: Instance, func_index: u32, code: Code) {
         let func = code.func(); // resolved once; the frame caches the record
         let locals_base = self.values.len() as u32 - func.n_params;
@@ -57,6 +58,7 @@ impl super::Execution {
     /// Pushes a [`Delimiter`] boundary marker (no operands, inert `code`/`instance` filler). The
     /// next `push_call` lays the entered function's frame directly above it; `run`/`unwind` stop at
     /// this frame's depth so the call below it stays parked and untouched.
+    #[inline]
     pub(super) fn push_delimiter(&mut self, kind: Delimiter, instance: Instance, code: Code) {
         let locals_base = self.values.len() as u32;
         let func = code.func();
@@ -72,6 +74,7 @@ impl super::Execution {
     }
 
     /// Moves the top `keep` operands down over `pop` discarded ones, then jumps.
+    #[inline]
     pub(super) fn take_branch(&mut self, t: BranchTarget) {
         if t.pop == 0 {
             return; // nothing discarded — the kept operands are already in place
@@ -87,6 +90,7 @@ impl super::Execution {
         self.shadow.truncate(dst + keep);
     }
 
+    #[inline]
     pub(super) fn top(&self) -> (Code, CompiledFunc, u32, u32, Instance) {
         let f = self.frames.last().expect("current frame");
         (f.code.clone(), f.func, f.ip, f.locals_base, f.instance)
@@ -95,6 +99,7 @@ impl super::Execution {
     /// Pops the current frame, moving its top `n_results` operands down to the
     /// frame base. Returns true if the frame stack has fallen back to `stop_depth`
     /// (this call's boundary) — i.e. the call this `run` was driving has finished.
+    #[inline]
     pub(super) fn do_return(&mut self, n_results: u32, stop_depth: usize) -> bool {
         let frame = self.frames.pop().expect("frame stack underflow");
         let n = n_results as usize;

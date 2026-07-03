@@ -284,6 +284,7 @@ fn cmp_i32(kind: CmpKind, a: i32, b: i32) -> bool {
 
 /// A tail (`return_call*`) site replaces the current frame; a normal call keeps `next` as the
 /// caller's resume ip (#39).
+#[inline]
 fn call_kind(tail: bool, next: u32) -> CallKind {
     if tail {
         CallKind::Tail

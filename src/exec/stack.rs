@@ -18,6 +18,7 @@ use super::cell::{
 /// Direct cell → `Val` for the host boundary: one match on the type instead of the layered
 /// GC-slot codec (three nested matches), which was measurable at per-call frequency.
 /// Non-scalars fall back to the generic [`decode`].
+#[inline]
 fn decode_val(c: Cell, t: &ValType) -> Val {
     match t {
         ValType::I32 => Val::I32(c.unwrap_i32()),
@@ -29,6 +30,7 @@ fn decode_val(c: Cell, t: &ValType) -> Val {
 }
 
 /// Direct `Val` → cell (see [`decode_val`]); non-scalars fall back to the generic [`encode`].
+#[inline]
 fn encode_val(v: Val) -> Cell {
     match v {
         Val::I32(x) => Cell::from_i32(x),
@@ -46,23 +48,28 @@ use crate::value::{Val, ValType};
 impl Execution {
     /// Pushes a scalar cell (shadow tag `NONE`) straight from its bytes — the arithmetic hot
     /// path, skipping the `Val` round-trip through the GC slot codec that [`push`] pays.
+    #[inline]
     fn push_scalar<const N: usize>(&mut self, bytes: [u8; N]) {
         self.shadow.push(RefTag::NONE);
         self.values.push(Cell::of_bytes(bytes));
     }
 
+    #[inline]
     pub(super) fn push_i32(&mut self, v: i32) {
         self.push_scalar(v.to_le_bytes());
     }
 
+    #[inline]
     pub(super) fn push_i64(&mut self, v: i64) {
         self.push_scalar(v.to_le_bytes());
     }
 
+    #[inline]
     pub(super) fn push_f32(&mut self, v: f32) {
         self.push_scalar(v.to_bits().to_le_bytes());
     }
 
+    #[inline]
     pub(super) fn push_f64(&mut self, v: f64) {
         self.push_scalar(v.to_bits().to_le_bytes());
     }
@@ -70,6 +77,7 @@ impl Execution {
     /// Pushes a local's default value straight as a cell (locals init on every call): scalars and
     /// `v128` default to all-zero bits, references to the null handle with their hierarchy tag —
     /// exactly what `push(Val::default_for(ty))` produces, minus the `Val` round-trip.
+    #[inline]
     pub(super) fn push_default(&mut self, ty: &IrVal) {
         if let IrVal::Ref { heap, .. } = ty {
             self.shadow
@@ -81,10 +89,12 @@ impl Execution {
     }
 
     /// Raw-bits pushes for `f32.const`/`f64.const`, whose `Op` immediates are already bit patterns.
+    #[inline]
     pub(super) fn push_f32_bits(&mut self, bits: u32) {
         self.push_scalar(bits.to_le_bytes());
     }
 
+    #[inline]
     pub(super) fn push_f64_bits(&mut self, bits: u64) {
         self.push_scalar(bits.to_le_bytes());
     }
@@ -92,6 +102,7 @@ impl Execution {
     /// In-place binary op over the top two cells: the result overwrites the first operand's slot
     /// and the stack shrinks by one — one bounds region, no pop/push round-trips. For scalar ops
     /// only (operand and result shadow tags are all `NONE`, so the shadow just shrinks).
+    #[inline]
     pub(super) fn binop_cells(&mut self, f: impl FnOnce(Cell, Cell) -> Cell) {
         let n = self.values.len();
         self.values[n - 2] = f(self.values[n - 2], self.values[n - 1]);
@@ -101,6 +112,7 @@ impl Execution {
 
     /// Fallible [`binop_cells`](Self::binop_cells) (div/rem trap paths). The stack is adjusted
     /// only on success — a trapping op leaves it to the unwinder.
+    #[inline]
     pub(super) fn binop_cells_try(
         &mut self,
         f: impl FnOnce(Cell, Cell) -> crate::Result<Cell>,
@@ -113,11 +125,13 @@ impl Execution {
     }
 
     /// In-place unary op over the top cell — no stack movement at all. Scalar ops only.
+    #[inline]
     pub(super) fn unop_cell(&mut self, f: impl FnOnce(Cell) -> Cell) {
         let n = self.values.len();
         self.values[n - 1] = f(self.values[n - 1]);
     }
 
+    #[inline]
     pub(super) fn pop(&mut self) -> Cell {
         self.shadow.pop();
         self.values.pop().expect("operand stack underflow")
@@ -125,11 +139,13 @@ impl Execution {
 
     /// Pops a cell together with its root-shadow tag (for type-agnostic moves that must carry the
     /// reference hierarchy: `select`, `br_on_null`/`br_on_non_null`).
+    #[inline]
     pub(super) fn pop_tagged(&mut self) -> (Cell, RefTag) {
         let tag = self.shadow.pop().expect("shadow underflow");
         (self.values.pop().expect("operand stack underflow"), tag)
     }
 
+    #[inline]
     pub(super) fn push(&mut self, v: Val) {
         self.shadow.push(RefTag::of_val(&v));
         self.values.push(encode(v));
@@ -137,23 +153,27 @@ impl Execution {
 
     /// Pushes an already-encoded cell with its known shadow tag (type-agnostic moves:
     /// `local.get`, `select`, `br_on_null`).
+    #[inline]
     pub(super) fn push_cell(&mut self, cell: Cell, tag: RefTag) {
         self.shadow.push(tag);
         self.values.push(cell);
     }
 
     /// The cell + shadow tag at operand index `i` (a `local.get` source).
+    #[inline]
     pub(super) fn cell_at(&self, i: usize) -> (Cell, RefTag) {
         (self.values[i], self.shadow[i])
     }
 
     /// Writes a cell + shadow tag at operand index `i` (a `local.set`/`local.tee` target).
+    #[inline]
     pub(super) fn set_cell(&mut self, i: usize, cell: Cell, tag: RefTag) {
         self.values[i] = cell;
         self.shadow[i] = tag;
     }
 
     /// The top operand as an `i32` without popping (an `array.new*` count peek).
+    #[inline]
     pub(super) fn top_i32(&self) -> i32 {
         self.values
             .last()
@@ -162,6 +182,7 @@ impl Execution {
     }
 
     /// The top cell + shadow tag without popping (a `local.tee` source).
+    #[inline]
     pub(super) fn top_cell(&self) -> (Cell, RefTag) {
         (
             *self.values.last().expect("operand stack underflow"),
@@ -169,12 +190,14 @@ impl Execution {
         )
     }
 
+    #[inline]
     pub(super) fn pop_i32(&mut self) -> i32 {
         self.pop().unwrap_i32()
     }
 
     /// Pops an index/length/address operand, widening to `u64`. `is_64` (from the target
     /// memory/table's type) selects the width â there is no runtime tag to read (#42).
+    #[inline]
     pub(super) fn pop_index(&mut self, is_64: bool) -> u64 {
         let cell = self.pop();
         if is_64 {
@@ -185,6 +208,7 @@ impl Execution {
     }
 
     /// Pushes a size/grow result as i64 for a 64-bit memory/table, else i32 (#42).
+    #[inline]
     pub(super) fn push_index(&mut self, is_64: bool, v: u64) {
         self.push(if is_64 {
             Val::I64(v as i64)
@@ -194,23 +218,27 @@ impl Execution {
     }
 
     /// Pops a reference operand of a statically-known hierarchy (null â the typed null `Val`).
+    #[inline]
     pub(super) fn pop_ref(&mut self, kind: RefKind) -> Val {
         let cell = self.pop();
         read_slot(Slot::Ref { offset: 0, kind }, cell.bytes())
     }
 
+    #[inline]
     pub(super) fn pop_anyref(&mut self) -> Val {
         self.pop_ref(RefKind::Any)
     }
 
     /// Pops the value for a GC field/element write: decoded to the field's hierarchy/scalar kind
     /// (the caller's `write_slot` re-narrows packed `i8`/`i16` into the body).
+    #[inline]
     pub(super) fn pop_val_for(&mut self, field: Slot) -> Val {
         let cell = self.pop();
         read_slot(stack_slot_for_field(field), cell.bytes())
     }
 
     /// Splits off the top `tys.len()` operand cells and decodes them to `Val`s (host-call args).
+    #[inline]
     pub(super) fn pop_params(&mut self, tys: &[ValType]) -> Vec<Val> {
         let mut out = Vec::with_capacity(tys.len());
         self.pop_params_into(tys, &mut out);
@@ -219,6 +247,7 @@ impl Execution {
 
     /// Alloc-free [`pop_params`](Self::pop_params): decodes the top `tys.len()` operands into
     /// `out` (the reused host-call scratch buffer) and pops them.
+    #[inline]
     pub(super) fn pop_params_into(&mut self, tys: &[ValType], out: &mut Vec<Val>) {
         let base = self.values.len() - tys.len();
         out.extend(
@@ -232,12 +261,14 @@ impl Execution {
     }
 
     /// Encodes and pushes host-call results back onto the operand stack.
+    #[inline]
     pub(super) fn push_results(&mut self, results: Vec<Val>) {
         self.push_results_slice(&results);
     }
 
     /// Borrowing [`push_results`](Self::push_results) (the reused scratch buffer survives).
     /// Indexed loops for the same reason as [`pop_params_into`](Self::pop_params_into).
+    #[inline]
     pub(super) fn push_results_slice(&mut self, results: &[Val]) {
         self.shadow.reserve(results.len());
         self.values.reserve(results.len());
@@ -249,6 +280,7 @@ impl Execution {
 
     /// Iterates the live operand/local roots: each `(handle, RefKind)` for a non-null reference
     /// slot, recovered from the root shadow. Drives the tracing collector's stack-root scan (#27g).
+    #[inline]
     pub(crate) fn operand_roots(&self) -> impl Iterator<Item = (u32, RefKind)> + '_ {
         self.values
             .iter()

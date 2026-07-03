@@ -48,7 +48,7 @@ pub(crate) mod trace;
 
 use crate::instance::Instance;
 use crate::module::code::Code;
-use crate::store::StoreInner;
+use crate::store::Store;
 use crate::trap::Trap;
 use crate::value::Val;
 use crate::Result;
@@ -168,7 +168,9 @@ impl Execution {
 
     /// Runs frames until the stack falls back to `stop_depth` (the boundary this `run` is
     /// responsible for): `0` for a top-level call, or the parked outer depth for a host re-entry.
-    fn run(&mut self, inner: &mut StoreInner, stop_depth: usize) -> Result<Outcome> {
+    /// Generic over the store's data type so *sync host calls run loop-resident* — the callback
+    /// needs a `Caller<T>`; only async host fns still suspend out through an [`Outcome`].
+    fn run<T>(&mut self, store: &mut Store<T>, stop_depth: usize) -> Result<Outcome> {
         // A `return_call` to a host fn from the boundary frame pops it, then the host pushes its
         // results; re-entering here at `stop_depth` means the call finished (#39).
         if self.frames.len() == stop_depth {
@@ -179,37 +181,40 @@ impl Execution {
         // (just a host call) would never be checked. With the host-crossing reserve folded into
         // `stack_bytes`, this entry check makes even pure host↔wasm ping-pong trap here rather
         // than abort the native stack (#30).
-        if self.stack_bytes() >= inner.engine().max_wasm_stack() {
+        if self.stack_bytes() >= store.inner.engine().max_wasm_stack() {
             let ip = self.frames.last().map_or(0, |f| f.ip);
-            return Err(self.attach_trap_backtrace(inner, Trap::StackOverflow.into(), ip));
+            return Err(self.attach_trap_backtrace(&store.inner, Trap::StackOverflow.into(), ip));
         }
-        let fuel_enabled = inner.engine().consume_fuel();
-        let epoch_enabled = inner.engine().epoch_interruption();
-        // The engine-wide GC-pressure axis is only live under a tracing collector (else the
-        // mailbox is never posted to — no hot-path cost by default).
-        let gc_pressure_watch = inner.gc.is_collecting();
+        let fuel_enabled = store.inner.engine().consume_fuel();
+        let epoch_enabled = store.inner.engine().epoch_interruption();
+        // The engine-wide GC-pressure axis is live only when a tracing collector *and* the
+        // engine-wide memory threshold are configured — without the threshold the mailbox is
+        // never posted to, so watching it would put dead per-op work on the hot path (it did:
+        // the default engine ran the gated loop for months of CoreMark numbers).
+        let gc_pressure_watch =
+            store.inner.gc.is_collecting() && store.inner.engine().gc_memory_threshold().is_some();
         // Monomorphize the dispatch loop on whether any gate is live, so the default
         // configuration (no fuel, no epoch, no tracing GC) runs a loop with *no* gate branch at
         // all; the gated copy stays cold.
         if fuel_enabled || epoch_enabled || gc_pressure_watch {
-            self.dispatch::<true>(
-                inner,
+            self.dispatch::<T, true>(
+                store,
                 stop_depth,
                 (fuel_enabled, epoch_enabled, gc_pressure_watch),
             )
         } else {
-            self.dispatch::<false>(inner, stop_depth, (false, false, false))
+            self.dispatch::<T, false>(store, stop_depth, (false, false, false))
         }
     }
 
     #[allow(clippy::too_many_lines)] // the resumable dispatch loop; arms are short
-    fn dispatch<const GATED: bool>(
+    fn dispatch<T, const GATED: bool>(
         &mut self,
-        inner: &mut StoreInner,
+        store: &mut Store<T>,
         stop_depth: usize,
         gates: (bool, bool, bool),
     ) -> Result<Outcome> {
-        let stack_limit = inner.engine().max_wasm_stack();
+        let stack_limit = store.inner.engine().max_wasm_stack();
         let (mut code, mut func, mut ip, mut base, mut instance) = self.top();
         // Two-level loop: the outer level re-derives the current frame's `ops` slice whenever the
         // frame changes; the inner level then fetches each op with a single `.get` — no per-op
@@ -226,23 +231,23 @@ impl Execution {
                     continue 'frame;
                 };
                 if GATED {
-                    if let Some(out) = self.service_gates(inner, gates, ip)? {
+                    if let Some(out) = self.service_gates(&mut store.inner, gates, ip)? {
                         return Ok(out);
                     }
                 }
-                match self.step(inner, &code, op, ip + 1, base, instance) {
-                    Err(e) => match self.unwind(inner, e, ip, stop_depth) {
+                match self.step(&mut store.inner, &code, op, ip + 1, base, instance) {
+                    Err(e) => match self.unwind(&mut store.inner, e, ip, stop_depth) {
                         Ok(()) => {
                             (code, func, ip, base, instance) = self.top();
                             continue 'frame;
                         }
-                        Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
+                        Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
                     },
                     Ok(StepOutcome::Advance(next)) => ip = next,
                     Ok(StepOutcome::DoCall(req)) => {
                         if self.stack_bytes() >= stack_limit {
                             return Err(self.attach_trap_backtrace(
-                                inner,
+                                &store.inner,
                                 Trap::StackOverflow.into(),
                                 ip,
                             ));
@@ -269,15 +274,20 @@ impl Execution {
                         instance = req.instance;
                         continue 'frame;
                     }
-                    // Tail call to a host fn: pop the current frame; the host's results return to the
-                    // caller (or, if the outermost frame is gone, to the embedder via the guard above).
+                    // Tail call to a host fn (#39): pop the current frame, run the host call
+                    // loop-resident; if that emptied this segment, its results are the call's.
                     Ok(StepOutcome::DoTailHostCall {
-                        func,
-                        instance,
+                        func: host_fn,
+                        instance: host_inst,
                         n_params,
                     }) => {
                         self.do_return(n_params, stop_depth);
-                        return Ok(Outcome::HostCall { func, instance });
+                        self.invoke_host(store, host_fn, host_inst, stop_depth)?;
+                        if self.frames.len() == stop_depth {
+                            return Ok(Outcome::Finished);
+                        }
+                        (code, func, ip, base, instance) = self.top();
+                        continue 'frame;
                     }
                     #[cfg(feature = "async")]
                     Ok(StepOutcome::DoTailHostAsyncCall {
@@ -288,13 +298,23 @@ impl Execution {
                         self.do_return(n_params, stop_depth);
                         return Ok(Outcome::HostAsync { func, instance });
                     }
+                    // Sync host call, loop-resident: the callback runs right here (the execution
+                    // is swap-parked around it inside `invoke_host`, so re-entrant `Func::call`s
+                    // still share these stacks). On return the frame stack is normally untouched
+                    // (resume at `return_ip`); a host *throw* may have unwound to a handler, in
+                    // which case the resume point moved — re-derive from the top frame.
                     Ok(StepOutcome::DoHostCall {
-                        func,
-                        instance,
+                        func: host_fn,
+                        instance: host_inst,
                         return_ip,
                     }) => {
                         self.frames.last_mut().expect("caller frame").ip = return_ip;
-                        return Ok(Outcome::HostCall { func, instance });
+                        self.invoke_host(store, host_fn, host_inst, stop_depth)?;
+                        if self.frames.len() == stop_depth {
+                            return Ok(Outcome::Finished);
+                        }
+                        (code, func, ip, base, instance) = self.top();
+                        continue 'frame;
                     }
                     #[cfg(feature = "async")]
                     Ok(StepOutcome::DoHostAsyncCall {

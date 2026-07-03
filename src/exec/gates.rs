@@ -10,6 +10,7 @@ impl Execution {
     /// Services the rare per-op gates — `(fuel, epoch, gc_pressure)` per the engine config:
     /// `Ok(Some(_))` suspends the loop (yield/deadline), `Err` traps (fuel exhausted), `Ok(None)`
     /// continues. Off the hot path: `run` calls this only when at least one gate is enabled.
+    #[inline]
     pub(super) fn service_gates(
         &mut self,
         inner: &mut StoreInner,

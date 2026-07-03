@@ -20,6 +20,7 @@ pub(crate) struct Span {
 }
 
 impl Span {
+    #[inline]
     pub(crate) fn range(self) -> std::ops::Range<usize> {
         self.start as usize..(self.start + self.len) as usize
     }

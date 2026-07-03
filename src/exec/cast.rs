@@ -66,6 +66,7 @@ impl Execution {
     /// `br_on_cast` (`on_fail=false`) / `br_on_cast_fail` (`on_fail=true`): the reference stays on
     /// the stack either way; returns the branch IP when the (possibly negated) cast test decides
     /// to take the branch.
+    #[inline]
     pub(super) fn br_on_cast(
         &mut self,
         inner: &StoreInner,

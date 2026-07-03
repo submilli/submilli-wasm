@@ -20,6 +20,7 @@ pub(super) enum CallKind {
 /// Resolves a function handle to a wasm body (defining instance + compiled code) or a
 /// host func. Imported functions resolve transparently — the handle already points at
 /// the defining instance's `FuncEntity`.
+#[inline]
 pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
     match inner.func(f) {
         FuncEntity::Wasm {
@@ -39,6 +40,7 @@ pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
 impl Execution {
     /// `call_indirect` / `return_call_indirect` (`tail`, #39): table lookup, signature check, then
     /// the (wasm or host) call outcome.
+    #[inline]
     pub(super) fn do_call_indirect(
         &mut self,
         inner: &StoreInner,
@@ -84,6 +86,7 @@ impl Execution {
 
     /// `call_ref` / `return_call_ref` (`tail`, #39): pop a funcref operand and dispatch. Null traps;
     /// the signature is statically guaranteed (validation), so there is no runtime type check.
+    #[inline]
     pub(super) fn do_call_ref(
         &mut self,
         inner: &StoreInner,
@@ -101,6 +104,7 @@ impl Execution {
 
 /// Builds the step outcome from a resolved callee. `tail` (#39) replaces the current frame instead
 /// of nesting; for a tail host call it carries `n_params` so the run loop can reposition the args.
+#[inline]
 pub(super) fn call_outcome(
     inner: &StoreInner,
     resolved: ResolvedCall,

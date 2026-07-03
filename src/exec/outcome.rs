@@ -12,10 +12,6 @@ use crate::value::Ref;
 /// suspended on something the (generic) driver in [`host`](super::host) must service.
 pub(crate) enum Outcome {
     Finished,
-    HostCall {
-        func: Func,
-        instance: Instance,
-    },
     /// Suspended on an async host function; only the async driver can service it.
     #[cfg(feature = "async")]
     HostAsync {
