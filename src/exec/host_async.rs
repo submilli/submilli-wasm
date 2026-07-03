@@ -40,6 +40,10 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
             Outcome::HostAsync { func, instance } => {
                 exec.invoke_host_async(store, func, instance, run_stop)
                     .await?;
+                // The await is the natural long-latency safepoint: other tenants generate
+                // engine-wide GC pressure while this guest is parked, so honor the mailbox
+                // on resume (sync host calls skip this — their path is tens of ns).
+                exec.gc_pressure_safepoint(&mut store.inner);
             }
             Outcome::FuelYield => {
                 yield_now().await;

@@ -751,3 +751,18 @@ Round 4 — **the async boundary** (the product's real IO path — async host fn
   stacks, which both need `unsafe` and are the wasmtime approach), and the per-call
   `Box<dyn Future>` the wasmtime-compatible API shape mandates.
 - File-cap fallout: the async driver + helpers moved to `exec/host_async.rs`.
+
+Round 5 — **amortized GC-pressure safepoints** (owner's design): the §14 fix stopped
+*default* engines from paying the per-op mailbox check, but a threshold-configured engine
+(the multi-tenant product posture!) still selected the gated loop. The mailbox is advisory
+— µs of latency is fine — so the check moved off the per-op path entirely:
+- every **1024 guest calls** (countdown in the `DoCall`/`DoTailCall` arms — zero per-op
+  cost even when armed; call sites are already ~20 ns);
+- **after every async host-call await** (the natural long-latency safepoint: other tenants
+  generate pressure while this guest is parked) — sync host calls deliberately skip it
+  (their path is ~35 ns);
+- allocating guests still respond immediately via the reservation path (`DoGcGrow`).
+`GATED` now means fuel-or-epoch only. Non-calling, non-allocating spins never check — they
+also add no pressure, and multi-tenant deployments run epoch/fuel regardless.
+Measured: threshold-configured CoreMark **727** (== the unconfigured fast path; the gated
+loop would have held it ~10% lower). Defaults unchanged (717/841 hostcall).

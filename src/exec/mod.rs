@@ -79,6 +79,13 @@ pub(crate) struct Execution {
     host_reentry_depth: usize,
 }
 
+/// Guest calls between amortized GC-pressure mailbox checks (see `run`): pressure is
+/// advisory, so µs-scale response latency is fine, and anchoring to calls keeps the per-op
+/// path clean even for threshold-configured engines. Non-calling guests are covered by the
+/// allocation/reservation path (allocators respond immediately via `DoGcGrow`) and by the
+/// async-host-call safepoint; a non-calling, non-allocating spin adds no GC pressure.
+const GC_CHECK_INTERVAL: u32 = 1024;
+
 /// Native-stack bytes charged per host→wasm re-entry crossing against `max_wasm_stack` (#30). A
 /// host fn that re-enters wasm (`Func::call`) nests interpreter + closure frames on the native Rust
 /// stack — invisible to the heap-based wasm frame accounting (a wasm frame is ~24 B; the native
@@ -189,23 +196,17 @@ impl Execution {
         }
         let fuel_enabled = store.inner.engine().consume_fuel();
         let epoch_enabled = store.inner.engine().epoch_interruption();
-        // The engine-wide GC-pressure axis is live only when a tracing collector *and* the
-        // engine-wide memory threshold are configured — without the threshold the mailbox is
-        // never posted to, so watching it would put dead per-op work on the hot path (it did:
-        // the default engine ran the gated loop for months of CoreMark numbers).
-        let gc_pressure_watch =
-            store.inner.gc.is_collecting() && store.inner.engine().gc_memory_threshold().is_some();
-        // Monomorphize the dispatch loop on whether any gate is live, so the default
-        // configuration (no fuel, no epoch, no tracing GC) runs a loop with *no* gate branch at
-        // all; the gated copy stays cold.
-        if fuel_enabled || epoch_enabled || gc_pressure_watch {
-            self.dispatch::<T, true>(
-                store,
-                stop_depth,
-                (fuel_enabled, epoch_enabled, gc_pressure_watch),
-            )
+        // Monomorphize the dispatch loop on whether a *per-op* gate is live (fuel metering /
+        // epoch deadlines), so other configurations run a loop with no gate branch at all. The
+        // engine-wide GC-pressure mailbox is deliberately NOT a per-op gate: it is advisory
+        // (microseconds of latency are fine), so the loop honors it every
+        // [`GC_CHECK_INTERVAL`] guest calls instead — a threshold-configured deployment keeps
+        // the fast loop. (Its predecessor armed per-op on `is_collecting()` alone, taxing every
+        // default engine — see PERF-NOTES §14.)
+        if fuel_enabled || epoch_enabled {
+            self.dispatch::<T, true>(store, stop_depth, (fuel_enabled, epoch_enabled))
         } else {
-            self.dispatch::<T, false>(store, stop_depth, (false, false, false))
+            self.dispatch::<T, false>(store, stop_depth, (false, false))
         }
     }
 
@@ -214,9 +215,14 @@ impl Execution {
         &mut self,
         store: &mut Store<T>,
         stop_depth: usize,
-        gates: (bool, bool, bool),
+        gates: (bool, bool),
     ) -> Result<Outcome> {
         let stack_limit = store.inner.engine().max_wasm_stack();
+        // Amortized GC-pressure safepoint: armed only when the engine-wide axis exists, and
+        // anchored to guest *calls* (zero per-op cost; call sites are already heavyweight).
+        let gc_watch =
+            store.inner.gc.is_collecting() && store.inner.engine().gc_memory_threshold().is_some();
+        let mut gc_countdown: u32 = GC_CHECK_INTERVAL;
         let (mut code, mut func, mut ip, mut base, mut instance) = self.top();
         // Two-level loop: the outer level re-derives the current frame's `ops` slice whenever the
         // frame changes; the inner level then fetches each op with a single `.get` — no per-op
@@ -261,6 +267,13 @@ impl Execution {
                         ip = 0;
                         base = self.frames.last().expect("callee frame").locals_base;
                         instance = req.instance;
+                        if gc_watch {
+                            gc_countdown -= 1;
+                            if gc_countdown == 0 {
+                                gc_countdown = GC_CHECK_INTERVAL;
+                                self.service_gc_pressure(&mut store.inner);
+                            }
+                        }
                         continue 'frame;
                     }
                     // Tail call (#39): replace the current frame — `do_return(n_params)` repositions
@@ -274,6 +287,13 @@ impl Execution {
                         ip = 0;
                         base = self.frames.last().expect("callee frame").locals_base;
                         instance = req.instance;
+                        if gc_watch {
+                            gc_countdown -= 1;
+                            if gc_countdown == 0 {
+                                gc_countdown = GC_CHECK_INTERVAL;
+                                self.service_gc_pressure(&mut store.inner);
+                            }
+                        }
                         continue 'frame;
                     }
                     // Tail call to a host fn (#39): pop the current frame, run the host call

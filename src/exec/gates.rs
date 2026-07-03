@@ -14,7 +14,7 @@ impl Execution {
     pub(super) fn service_gates(
         &mut self,
         inner: &mut StoreInner,
-        (fuel, epoch, gc_pressure): (bool, bool, bool),
+        (fuel, epoch): (bool, bool),
         ip: u32,
     ) -> Result<Option<Outcome>> {
         if fuel {
@@ -39,13 +39,26 @@ impl Execution {
             self.frames.last_mut().expect("current frame").ip = ip;
             return Ok(Some(Outcome::EpochDeadline));
         }
-        // Honor an engine-wide GC-pressure request posted to this store's mailbox at this safe
-        // point (operands are roots via the shadow). Read-and-clear, so we collect once per posted
-        // request (not over and over); only large-footprint stores bother (no thundering herd);
-        // request, not force — a finishing store simply never reaches here.
-        if gc_pressure && inner.gc.footprint_over_floor() && inner.take_gc_request() {
+        Ok(None)
+    }
+
+    /// Honors a posted engine-wide GC-pressure request (read-and-clear; operands are roots via
+    /// the shadow, so any safepoint with consistent stacks qualifies). Amortized off the per-op
+    /// path: the dispatch loop calls this every [`super::GC_CHECK_INTERVAL`] guest calls, and
+    /// the async driver after every host-call await (the natural long-latency point — other
+    /// tenants generate pressure while this guest is parked). Only large-footprint stores
+    /// collect (no thundering herd); request, not force.
+    pub(super) fn service_gc_pressure(&mut self, inner: &mut StoreInner) {
+        if inner.gc.footprint_over_floor() && inner.take_gc_request() {
             self.gc_collect_now(inner);
         }
-        Ok(None)
+    }
+
+    /// [`service_gc_pressure`](Self::service_gc_pressure) with the armed check included, for
+    /// call sites outside the dispatch loop (which precomputes the armed flag).
+    pub(super) fn gc_pressure_safepoint(&mut self, inner: &mut StoreInner) {
+        if inner.gc.is_collecting() && inner.engine().gc_memory_threshold().is_some() {
+            self.service_gc_pressure(inner);
+        }
     }
 }
