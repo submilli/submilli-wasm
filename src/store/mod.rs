@@ -13,6 +13,7 @@ mod managed;
 mod reclaim;
 
 pub use context::{AsContext, AsContextMut, StoreContext, StoreContextMut};
+pub(crate) use entity::HostSig;
 pub(crate) use entity::{
     exn_charge, ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity,
     TagEntity, PAGE_SIZE,

@@ -49,6 +49,10 @@ pub(crate) struct StoreInner {
     pub(super) tables: Arena<TableEntity>,
     pub(super) globals: Arena<GlobalEntity>,
     tags: Arena<TagEntity>,
+    /// Reused host-call arg/result buffers (see `exec::host::invoke_host`): taken per call,
+    /// returned after, so the steady-state boundary is allocation-free. A re-entrant host
+    /// call takes a fresh (empty) pair — only nesting allocates.
+    host_scratch: (Vec<crate::value::Val>, Vec<crate::value::Val>),
     /// Exception instances backing `exnref` values; `Rooted<ExnRef>` indexes here. Grow-only
     /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) enumerates
     /// transitively (the exn arena itself is not reclaimed yet — see `gc_collect`).
@@ -101,6 +105,7 @@ impl StoreInner {
             tables: Arena::default(),
             globals: Arena::default(),
             tags: Arena::default(),
+            host_scratch: (Vec::new(), Vec::new()),
             exns: ReclaimArena::default(),
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
@@ -235,6 +240,24 @@ impl StoreInner {
             index: self.memories.alloc(entity),
             store: self.store_id,
         }
+    }
+
+    /// Takes the reused host-call buffers (cleared by the caller before use); a nested
+    /// (re-entrant) host call sees empty defaults and allocates its own pair.
+    #[inline]
+    pub(crate) fn take_host_scratch(&mut self) -> (Vec<crate::value::Val>, Vec<crate::value::Val>) {
+        std::mem::take(&mut self.host_scratch)
+    }
+
+    #[inline]
+    pub(crate) fn put_host_scratch(
+        &mut self,
+        mut params: Vec<crate::value::Val>,
+        mut results: Vec<crate::value::Val>,
+    ) {
+        params.clear();
+        results.clear();
+        self.host_scratch = (params, results);
     }
 
     pub(crate) fn memory(&self, handle: Memory) -> &MemoryEntity {

@@ -20,7 +20,25 @@ fn main() {
         .unwrap_or(15);
 
     let e = submilli::engine();
-    if which == "sieve" {
+    if which == "hostcall" {
+        let m = submilli::compile(&e, &support::host_call_wasm());
+        let l = submilli::ping_linker(&e);
+        let mut s = submilli::store(&e);
+        let inst = submilli::instantiate(&l, &mut s, &m);
+        let t = Instant::now();
+        assert_eq!(submilli::run_i32(&inst, &mut s, 100_000), 100_000);
+        eprintln!(
+            "ping x100k once = {:.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut n = 0u64;
+        while Instant::now() < deadline {
+            assert_eq!(submilli::run_i32(&inst, &mut s, 100_000), 100_000);
+            n += 1;
+        }
+        eprintln!("did {n} ping-x100k runs in {secs}s");
+    } else if which == "sieve" {
         let wasm = support::run_once_wasm();
         let m = submilli::compile(&e, &wasm);
         let l = submilli::empty_linker(&e);

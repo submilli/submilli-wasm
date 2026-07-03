@@ -126,6 +126,9 @@ pub(crate) enum FuncEntity {
     },
     Host {
         ty: FuncType,
+        /// Signature materialized once at registration so the per-call path never walks
+        /// the engine's type registry (see `exec::host::invoke_host`).
+        sig: std::sync::Arc<HostSig>,
         host_index: u32,
     },
     /// An async host function: signature + index into the store's `async_host_funcs`.
@@ -268,5 +271,27 @@ impl TableEntity {
             self.elems[i as usize] = val.clone();
         }
         true
+    }
+}
+
+/// A host function's call-shape, cached at registration: the param types (to decode
+/// operand cells into `Val` args) and one default `Val` per result (to pre-fill the
+/// results buffer the callback writes into). Shared via `Arc` so the per-call path
+/// borrows nothing from the store.
+#[derive(Debug)]
+pub(crate) struct HostSig {
+    pub params: Box<[crate::value::ValType]>,
+    pub result_defaults: Box<[crate::value::Val]>,
+}
+
+impl HostSig {
+    pub(crate) fn new(ty: &FuncType) -> std::sync::Arc<HostSig> {
+        std::sync::Arc::new(HostSig {
+            params: ty.params().collect(),
+            result_defaults: ty
+                .results()
+                .map(|t| crate::value::Val::default_for_valtype(&t))
+                .collect(),
+        })
     }
 }

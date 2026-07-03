@@ -55,6 +55,7 @@ Cold start   coremark          51.21 us  775.88 us   99.75 us
 Run once     sieve(1k)        480.71 us    5.70 ms  820.79 us
 Run once     sieve(10k)       998.58 us    5.56 ms  906.25 us
 Run once     sieve(1M)         65.15 ms    7.10 ms   11.21 ms
+Host calls   ping x100k         5.93 ms  367.12 us    1.35 ms
 -------------------------------------------------------------
 CoreMark score (higher=fast)        622      38226       3098
 ```
@@ -89,6 +90,16 @@ flattens at ~6–7 ms regardless). The crossover sits around a couple of
 milliseconds of interpreted work — the interpreter passes in `PERF-NOTES.md`
 §12 cut these totals ~4× (sieve(1M) 236 → 65 ms), and pushing the crossover
 further out is the tail-call-dispatch class of work.
+
+The **host-call row** measures the guest→host→guest boundary — 100k
+data-dependent calls to a trivial imported function, execution only. For
+IO-heavy orchestration guests (the product workload: thin glue around host
+stdlib calls) this, not compute throughput, is the runtime number that
+matters. A first optimization pass (cache each host fn's signature at
+registration, reuse arg/result buffers across calls — the boundary is now
+allocation-free in steady state) took submilli from 189 → ~59 ns/call; the
+remaining gap to wasmi (~13 ns) and wasmtime (~4 ns) is the dispatch-loop
+exit/re-entry and panic-containment per call.
 
 The **Module RAM rows** are the density axis: heap bytes a compiled module
 keeps resident, which bounds how many tenants fit on a host. Both non-JIT

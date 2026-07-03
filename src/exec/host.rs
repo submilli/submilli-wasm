@@ -210,27 +210,30 @@ impl Execution {
         instance: Instance,
         stop_depth: usize,
     ) -> Result<()> {
-        let (param_tys, mut results, host_index) = match store.inner.func(func) {
-            FuncEntity::Host { ty, host_index } => (
-                ty.params().collect::<Vec<ValType>>(),
-                ty.results()
-                    .map(|t| Val::default_for_valtype(&t))
-                    .collect::<Vec<_>>(),
-                *host_index,
-            ),
+        let (sig, host_index) = match store.inner.func(func) {
+            FuncEntity::Host {
+                sig, host_index, ..
+            } => (sig.clone(), *host_index),
             FuncEntity::Wasm { .. } => unreachable!("HostCall only suspends on sync host funcs"),
             #[cfg(feature = "async")]
             FuncEntity::HostAsync { .. } => {
                 unreachable!("HostCall only suspends on sync host funcs")
             }
         };
+        // Reused arg/result buffers (returned below): with the cached signature, the whole
+        // boundary is allocation-free in steady state. A re-entrant host call takes a fresh
+        // (empty) pair — only nesting allocates.
+        let (mut params, mut results) = store.inner.take_host_scratch();
+        results.clear();
+        results.extend_from_slice(&sig.result_defaults);
         // Scope the host roots created during the call (the GC host API registers a root per
         // `StructRef`/`ArrayRef`/`ExternRef` it builds). Without this they accumulate for the
         // store's life — a host fn that builds a GC object per call (e.g. one string per line) would
         // pin every one, defeating collection. Returned values survive via `push_results` (operand
         // roots); anything the host stored into a global/table/pending-exception is rooted there.
         let roots_mark = store.inner.gc_roots_mark();
-        let params = self.pop_params(&param_tys);
+        params.clear();
+        self.pop_params_into(&sig.params, &mut params);
         let cb = store.host_funcs[host_index as usize].clone();
         // Park the shared execution so a host fn that re-enters wasm (`Func::call`) runs on these
         // same stacks; reclaim it after the call (a re-entrant call re-parks it on its way out). The
@@ -263,7 +266,8 @@ impl Execution {
         // `Store::throw` but swallowed instead of propagating (host misuse) — the pending slot is
         // scoped to a single host call and must be empty once one completes without throwing.
         store.inner.take_pending_exception();
-        self.push_results(results);
+        self.push_results_slice(&results);
+        store.inner.put_host_scratch(params, results);
         store.inner.gc_roots_truncate(roots_mark); // results are now operand-rooted
         Ok(())
     }

@@ -670,3 +670,35 @@ Measured (interleaved vs the 16-B baseline, same window):
 **Session 4 combined (24-B start → 16-B ops + arenas): peak RSS 162 → 44.5 MB (−73%),
 compile 27.8 → 24.7 ms, runtime flat.** The density ladder's next rung (8–12 B ops via
 const pooling) is now the only encoding lever left, and much less pressing.
+
+---
+
+## 14. Session 5 — the host-call boundary (the product workload's real hot path)
+
+The compute benchmarks (CoreMark, sieve) never exercised what IO-heavy orchestration
+guests actually do: cross the guest→host boundary constantly. A new `ping ×100k` row
+(execution-only, trivial host fn) measured the crossing at **~189 ns/call vs wasmi
+~12 ns and wasmtime ~3 ns** — a 16× gap, three times worse than the compute gap, on
+exactly the traffic the product runs.
+
+Profile said: ~35–40% allocator (libsystem_malloc innards), plus per-call
+`Engine::func_sig`/`TypeRegistry` walks. The path allocated ≥4 `Vec`s per call
+(param-type collect, results-defaults collect, `pop_params`' `split_off` + collect)
+and re-materialized the signature from the engine registry every time.
+
+Landed (each A/B-measured):
+- **`HostSig` cached on `FuncEntity::Host` at registration** (param types + result
+  defaults behind an `Arc`) — the per-call path never touches the type registry.
+- **Reused arg/result scratch buffers on `StoreInner`** (taken/returned per call;
+  re-entrant calls take a fresh pair, so only nesting allocates): `pop_params_into` /
+  `push_results_slice` make the boundary allocation-free in steady state. 189 → 61 ns.
+- **Hand-rolled the 1-element decode/encode loops + inlined the scratch accessors**
+  (iterator-adaptor overhead was ~9% at per-call frequency): 61 → **~54 ns/call**.
+
+Net: **ping ×100k 18.9 → 5.4 ms (3.5×)**. What's left per call, in profile order: the
+dispatch-loop exit/re-entry through `Outcome::HostCall` (~36% — the loop prologue and
+frame re-derivation run per crossing), the driver match (~10%), park/unpark `Option`
+churn (~6%), `catch_unwind` + `Caller` construction. Next tiers if the boundary stays
+hot: a typed host-call fast path that skips the `Val` layer entirely (wasmtime-style
+`IntoFunc` specialization reading operand cells directly), and keeping the dispatch
+loop resident across host calls instead of exiting through `Outcome`.

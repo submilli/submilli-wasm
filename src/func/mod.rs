@@ -68,8 +68,11 @@ impl Func {
     ) -> Func {
         let mut ctx = store.as_context_mut();
         let host_index = ctx.store_mut().push_host_func(Arc::new(func));
-        ctx.inner_mut()
-            .alloc_func(FuncEntity::Host { ty, host_index })
+        ctx.inner_mut().alloc_func(FuncEntity::Host {
+            sig: crate::store::HostSig::new(&ty),
+            ty,
+            host_index,
+        })
     }
 
     /// Creates a host function from a typed Rust closure.
@@ -84,8 +87,11 @@ impl Func {
         let (ty, cb) = func.into_func(&engine);
         let mut ctx = store.as_context_mut();
         let host_index = ctx.store_mut().push_host_func(cb);
-        ctx.inner_mut()
-            .alloc_func(FuncEntity::Host { ty, host_index })
+        ctx.inner_mut().alloc_func(FuncEntity::Host {
+            sig: crate::store::HostSig::new(&ty),
+            ty,
+            host_index,
+        })
     }
 
     /// Calls this function with dynamically-typed arguments.

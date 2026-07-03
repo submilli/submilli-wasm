@@ -188,15 +188,39 @@ impl Execution {
 
     /// Splits off the top `tys.len()` operand cells and decodes them to `Val`s (host-call args).
     pub(super) fn pop_params(&mut self, tys: &[ValType]) -> Vec<Val> {
-        let cells = self.values.split_off(self.values.len() - tys.len());
-        self.shadow.truncate(self.shadow.len() - tys.len());
-        cells.iter().zip(tys).map(|(&c, t)| decode(c, t)).collect()
+        let mut out = Vec::with_capacity(tys.len());
+        self.pop_params_into(tys, &mut out);
+        out
+    }
+
+    /// Alloc-free [`pop_params`](Self::pop_params): decodes the top `tys.len()` operands into
+    /// `out` (the reused host-call scratch buffer) and pops them.
+    pub(super) fn pop_params_into(&mut self, tys: &[ValType], out: &mut Vec<Val>) {
+        let base = self.values.len() - tys.len();
+        out.extend(
+            self.values[base..]
+                .iter()
+                .zip(tys)
+                .map(|(&c, t)| decode(c, t)),
+        );
+        self.values.truncate(base);
+        self.shadow.truncate(base);
     }
 
     /// Encodes and pushes host-call results back onto the operand stack.
     pub(super) fn push_results(&mut self, results: Vec<Val>) {
-        self.shadow.extend(results.iter().map(RefTag::of_val));
-        self.values.extend(results.into_iter().map(encode));
+        self.push_results_slice(&results);
+    }
+
+    /// Borrowing [`push_results`](Self::push_results) (the reused scratch buffer survives).
+    /// Indexed loops for the same reason as [`pop_params_into`](Self::pop_params_into).
+    pub(super) fn push_results_slice(&mut self, results: &[Val]) {
+        self.shadow.reserve(results.len());
+        self.values.reserve(results.len());
+        for v in results {
+            self.shadow.push(RefTag::of_val(v));
+            self.values.push(encode(*v));
+        }
     }
 
     /// Iterates the live operand/local roots: each `(handle, RefKind)` for a non-null reference

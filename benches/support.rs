@@ -69,6 +69,13 @@ macro_rules! engine_ops {
             pub fn empty_linker(e: &Engine) -> Linker {
                 w::Linker::new(e)
             }
+            /// A linker with the host-call fixture's `ping` import (`x + 1` — trivial on
+            /// purpose: the row measures the *boundary*, not host work).
+            pub fn ping_linker(e: &Engine) -> Linker {
+                let mut l = w::Linker::new(e);
+                l.func_wrap("env", "ping", |x: i32| x + 1).unwrap();
+                l
+            }
             /// Call CoreMark's `run () -> f32`, returning the score.
             pub fn run_coremark(inst: &Instance, s: &mut Store) -> f32 {
                 let f = inst
@@ -180,6 +187,28 @@ pub fn run_once_wasm() -> Vec<u8> {
     }
     w.push_str("    (call $sieve (local.get $n)))\n)\n");
     wat::parse_str(&w).unwrap()
+}
+
+/// Host-call boundary fixture: `run(n)` makes `n` data-dependent calls to the imported
+/// `ping` (`x + 1`), returning the accumulator (= `n`, so the row cross-checks itself).
+/// The loop body is minimal by design — the measurement is the guest→host→guest round
+/// trip, the dominant runtime cost for IO-heavy orchestration guests (the product
+/// workload), which no compute benchmark exercises.
+pub fn host_call_wasm() -> Vec<u8> {
+    wat::parse_str(
+        r#"(module
+  (import "env" "ping" (func $ping (param i32) (result i32)))
+  (func (export "run") (param $n i32) (result i32)
+    (local $acc i32)
+    (block $done
+      (loop $l
+        (br_if $done (i32.le_s (local.get $n) (i32.const 0)))
+        (local.set $acc (call $ping (local.get $acc)))
+        (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+        (br $l)))
+    (local.get $acc)))"#,
+    )
+    .unwrap()
 }
 
 /// `(label, sieve bound, expected prime count, best-of iters)` rows for the

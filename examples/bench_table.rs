@@ -102,6 +102,7 @@ fn main() {
     store_new_row();
     cold_start_row();
     run_once_rows(&run_once_wasm);
+    host_call_row(&support::host_call_wasm());
     execution_row();
 }
 
@@ -240,6 +241,29 @@ fn run_once_rows(wasm: &[u8]) {
             }),
         );
     }
+}
+
+/// The host-call boundary: execution-only time for 100k data-dependent calls to a
+/// trivial imported host fn (everything prebuilt). This is the dominant runtime cost
+/// for IO-heavy orchestration guests — the workload the compute rows don't represent.
+fn host_call_row(wasm: &[u8]) {
+    const N: i32 = 100_000;
+    macro_rules! cell {
+        ($eng:ident) => {{
+            let e = $eng::engine();
+            let m = $eng::compile(&e, wasm);
+            let l = $eng::ping_linker(&e);
+            let mut s = $eng::store(&e);
+            let inst = $eng::instantiate(&l, &mut s, &m);
+            best_of(20, || assert_eq!($eng::run_i32(&inst, &mut s, N), N))
+        }};
+    }
+    row(
+        "Host calls   ping x100k",
+        cell!(submilli),
+        cell!(wt),
+        cell!(wi),
+    );
 }
 
 /// Execution: CoreMark's own score (higher = faster). Single-shot per engine
