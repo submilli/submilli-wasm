@@ -1,4 +1,4 @@
-//! The exception tag type (split from `types.rs` to hold the file-size cap).
+//! The exception tag type (split from `types.rs`).
 
 use super::FuncType;
 

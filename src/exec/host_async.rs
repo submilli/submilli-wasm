@@ -1,6 +1,6 @@
 //! The async twin of [`super::host`]: drives the resumable core as a `Future`, awaiting
-//! async host calls, fuel yields, and async resource limiters. Split out of `host.rs` for
-//! the file-size cap; the whole module is `async`-feature-gated (see `exec::mod`).
+//! async host calls, fuel yields, and async resource limiters. Split out of `host.rs`;
+//! the whole module is `async`-feature-gated (see `exec::mod`).
 
 // `host_index` indexes the store's own `async_host_funcs` (registered together — #33 carve-out).
 #![allow(clippy::indexing_slicing)]

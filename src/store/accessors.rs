@@ -1,5 +1,5 @@
 //! Handle → entity accessors for [`StoreInner`]: bounds- and provenance-checked (#34) reads
-//! of the store's arenas, split from `inner.rs` for the file-size cap. All are `#[inline]` —
+//! of the store's arenas, split from `inner.rs`. All are `#[inline]` —
 //! they sit on the interpreter's per-op paths, and the dispatch loop monomorphizes in the
 //! consumer crate (cross-crate inlining needs the attribute).
 

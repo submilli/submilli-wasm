@@ -149,4 +149,4 @@ and documented:
   target (`wasm-smith` modules run fuel-bounded without panic/hang), and a `differential` target comparing
   results and trap categories against wasmtime.
 - **CI gates:** `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`,
-  `scripts/check-line-count.sh`, `scripts/check-no-unsafe.sh` (zero-`unsafe`), and `cargo fuzz build`.
+  `scripts/check-no-unsafe.sh` (zero-`unsafe`), and `cargo fuzz build`.

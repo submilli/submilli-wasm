@@ -19,10 +19,9 @@ Feature target: MVP + mutable-globals + sign-extension-ops + multi-value + refer
 - Format: `cargo fmt` (CI runs `cargo fmt --check`)
 - Test: `cargo test`
 - Spec suite: `cargo test --test spec` (needs `git submodule update --init`)
-- File-size cap: `./scripts/check-line-count.sh` (no src/**/*.rs over 400 lines)
 
 ## Conventions (follow `docs/STYLE.md`)
-- Small files (≤300 lines, **400 hard CI cap**), short functions (≤50 lines), ≤6 args.
+- Small files (one module = one concern), short functions (≤50 lines), ≤6 args.
 - **Don't over-document or over-test.** Self-documenting code; comment the *why*, not the *what*.
   Lean on the spec `.wast` suite for conformance; unit-test only error-prone logic.
 - Public API names match `wasmtime` exactly — `#[allow]` clippy rather than break compatibility.

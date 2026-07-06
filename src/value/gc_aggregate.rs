@@ -1,5 +1,5 @@
 //! GC aggregate references: `structref`/`arrayref` (and their `*Pre` allocators). Split out of
-//! [`gc_ref`](super::gc_ref) to stay under the file-size cap; the core handle types (`Rooted`,
+//! [`gc_ref`](super::gc_ref); the core handle types (`Rooted`,
 //! `AnyRef`) and the shared heap-slot helpers live there.
 
 use crate::canon::{Layout, RefKind};

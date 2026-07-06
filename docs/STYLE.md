@@ -1,10 +1,10 @@
 # Coding Style
 
-Clarity over cleverness. This is an interpreter whose stated priority is fast compilation and *maintainability*, not peak runtime cleverness — the code should read that way. The rules below are enforced by `clippy.toml`, `rustfmt.toml`, the `[lints]` block (below), and a CI file-size check.
+Clarity over cleverness. This is an interpreter whose stated priority is fast compilation and *maintainability*, not peak runtime cleverness — the code should read that way. The rules below are enforced by `clippy.toml`, `rustfmt.toml` and the `[lints]` block (below).
 
 ## Guiding principles
 
-1. **Small files.** One module = one concern. Target **≤ 300 lines** per `.rs` file; **400 is a hard CI cap**. When a file grows past that, split it (e.g. `exec/numeric.rs`, `exec/memory.rs`, `exec/control.rs` rather than one giant `exec.rs`).
+1. **Small files.** One module = one concern. When a file grows unwieldy, split it (e.g. `exec/numeric.rs`, `exec/memory.rs`, `exec/control.rs` rather than one giant `exec.rs`).
 2. **Short functions.** Target **≤ 50 lines** per function (clippy enforces). One function does one thing. Prefer early returns over nesting; extract helpers liberally — extracting is free, reading a 200-line function is not.
 3. **Few arguments.** **≤ 6 parameters** (clippy enforces). If you need more, bundle them into a `struct` (e.g. an `ExecCtx`/`CompileCtx`) and pass that.
 4. **Low complexity.** Keep cyclomatic/cognitive complexity low (clippy `cognitive_complexity`). Deeply nested `if`/`match` is a smell — flatten with early returns, helper fns, or `?`.

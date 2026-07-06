@@ -592,7 +592,7 @@ the all-code-executed fixture + eager wasmi: sieve(1k) **697 µs (submilli) vs 8
   the erased `br_if`). Interleaved A/B: **+2–3% CoreMark, sieve(1M) 43 → 45 runs/3s** —
   real but modest; the data-dependent branch itself (the misprediction) survives fusion,
   only the dispatch disappears. Kept.
-- File-cap fallout: `Op` payload types → `module/op_types.rs`; branch lowering + patch
+- Split out: `Op` payload types → `module/op_types.rs`; branch lowering + patch
   machinery → `compile/control/branch.rs`.
 
 Session cumulative: CoreMark **192 → ~660 (≈3.4×)**, sieve(1M) **250 → ~67 ms (≈3.7×)**;
@@ -750,7 +750,7 @@ Round 4 — **the async boundary** (the product's real IO path — async host fn
   point (required — a sync dispatch loop cannot await; going lower means fiber-style
   stacks, which both need `unsafe` and are the wasmtime approach), and the per-call
   `Box<dyn Future>` the wasmtime-compatible API shape mandates.
-- File-cap fallout: the async driver + helpers moved to `exec/host_async.rs`.
+- Split out: the async driver + helpers moved to `exec/host_async.rs`.
 
 Round 5 — **amortized GC-pressure safepoints** (owner's design): the §14 fix stopped
 *default* engines from paying the per-op mailbox check, but a threshold-configured engine
