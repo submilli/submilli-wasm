@@ -11,20 +11,29 @@ use crate::Result;
 
 const CANON_F32: u32 = 0x7fc0_0000;
 const CANON_F64: u64 = 0x7ff8_0000_0000_0000;
+const QUIET_F32: u32 = 0x0040_0000;
+const QUIET_F64: u64 = 0x0008_0000_0000_0000;
 
 pub(super) fn canon_f32(r: f32, had_nan: bool) -> f32 {
-    if r.is_nan() && !had_nan {
-        f32::from_bits(CANON_F32)
-    } else {
+    if !r.is_nan() {
         r
+    } else if had_nan {
+        // Set the quiet bit explicitly: baseline x86_64 lowers ceil/floor/
+        // trunc/nearest to libcalls that propagate a signaling-NaN input
+        // unquieted (ARM quiets in hardware, so this is a no-op there).
+        f32::from_bits(r.to_bits() | QUIET_F32)
+    } else {
+        f32::from_bits(CANON_F32)
     }
 }
 
 pub(super) fn canon_f64(r: f64, had_nan: bool) -> f64 {
-    if r.is_nan() && !had_nan {
-        f64::from_bits(CANON_F64)
-    } else {
+    if !r.is_nan() {
         r
+    } else if had_nan {
+        f64::from_bits(r.to_bits() | QUIET_F64)
+    } else {
+        f64::from_bits(CANON_F64)
     }
 }
 
