@@ -1,6 +1,5 @@
-//! Phase-3 gate: async/concurrency integration tests driving the public async API
-//! exactly as a wasmtime embedder would. Proves the `docs/PLAN.md` Phase-3 acceptance
-//! criteria — async-host I/O completion, fuel/epoch yield-and-resume, and concurrent
+//! Async/concurrency integration tests driving the public async API
+//! exactly as a wasmtime embedder would: proves — async-host I/O completion, fuel/epoch yield-and-resume, and concurrent
 //! stores on one shared `Engine` making independent progress.
 //!
 //! Compiled only under `--features async` (empty otherwise, so default `cargo test`

@@ -6,8 +6,7 @@ how each guarantee is enforced, what it explicitly does **not** guarantee, and t
 **must** apply for safe multi-tenant operation.
 
 It describes guarantees that exist in-tree today; every claim below maps to a concrete mechanism and test.
-Design rationale lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (§7 run loop, §8 instantiation,
-§14 GC); the per-task history is in [`docs/TASKS.md`](docs/TASKS.md) (Phase 8, #30–#36).
+Design rationale lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (§7 run loop, §8 instantiation, §14 GC).
 
 ## 1. Scope & trust boundary
 

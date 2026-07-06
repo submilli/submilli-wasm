@@ -1,6 +1,6 @@
 # Testing & Conformance Vectors
 
-How we prove correctness, where the authoritative test vectors live, and how to run them. The spec `.wast` suite is the per-phase gate (see [PLAN.md](./PLAN.md) "Done when").
+How we prove correctness, where the authoritative test vectors live, and how to run them. The spec `.wast` suite is the gate for every feature.
 
 ## 1. Where the test vectors live
 

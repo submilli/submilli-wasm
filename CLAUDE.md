@@ -8,8 +8,6 @@ Feature target: MVP + mutable-globals + sign-extension-ops + multi-value + refer
 
 ## Docs (read these first)
 - `docs/ARCHITECTURE.md` — the design (interpreter core, value model, runtime, API, GC, EH).
-- `docs/PLAN.md` — the build phases 0–8 (scope + acceptance per phase; Phase 8 = security).
-- `docs/TASKS.md` — fine-grained task checklist (#1–#36) with live status.
 - `docs/TESTING.md` — spec `.wast` conformance harness + where the test vectors live.
 - `docs/STYLE.md` — coding style (enforced by clippy/rustfmt/CI).
 
@@ -32,7 +30,7 @@ Feature target: MVP + mutable-globals + sign-extension-ops + multi-value + refer
 
 ## Security (untrusted multi-tenant guests — non-negotiable)
 The interpreter runs untrusted, mutually-distrusting guest code. Treat every wasm-reachable
-path as adversarial. See `SECURITY.md` (threat model) and `docs/PLAN.md` Phase 8.
+path as adversarial. See `SECURITY.md` (threat model).
 - **Zero-on-allocation.** Every guest-visible allocation MUST be fully initialized before the
   guest can read it — linear memory, tables, locals, GC objects. A guest must never observe a
   prior tenant's freed memory or the allocator's stale bytes. Use `vec![0; n]` / `resize(.., v)`
@@ -56,5 +54,4 @@ path as adversarial. See `SECURITY.md` (threat model) and `docs/PLAN.md` Phase 8
 - **Contain host-fn panics** at the call boundary; one tenant must not poison the shared engine.
 
 ## Workflow
-Work is tracked as tasks (see the task list). Currently in Phase 0 → Phase 1.
 Pinned reference: `wasmtime` 45.x (dev-dependency for compatibility/differential tests).
