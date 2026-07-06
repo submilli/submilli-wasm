@@ -1,10 +1,20 @@
 [package]
 name = "submilli-wasm"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
-description = "A WebAssembly interpreter with a wasmtime-compatible API"
+description = "A WebAssembly interpreter with a wasmtime-compatible API, built for fast compilation and startup"
 license = "Apache-2.0"
 repository = "https://github.com/submilli/submilli-wasm"
+readme = "README.md"
+keywords = ["wasm", "webassembly", "interpreter", "wasmtime", "runtime"]
+categories = ["wasm", "virtualization"]
+# Ship only what `cargo build` needs; tests/benches/docs live on GitHub
+# (the 12 MB spec-testsuite submodule must never end up in the package).
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE", "SECURITY.md"]
+
+[package.metadata.docs.rs]
+# Document the full surface: `async` and `simd` are off by default.
+all-features = true
 
 [lib]
 name = "submilli_wasm"
