@@ -1,9 +1,74 @@
-//! `submilli-wasm`: a WebAssembly interpreter with a `wasmtime`-compatible API.
+//! A WebAssembly interpreter with a [`wasmtime`]-compatible API, built for fast
+//! compilation and startup rather than peak execution speed.
 //!
-//! Fast-compilation-first, stack-based interpreter. See `docs/ARCHITECTURE.md`.
+//! Most engines JIT-compile a module because they expect to run it many times.
+//! This one is for the opposite workload — code that is compiled, run once, and
+//! thrown away (its home is a product running LLM-generated modules). Compilation
+//! is a single fused validate+lower pass over the bytes, `Store` creation is
+//! free, and the guest↔host call boundary is tens of nanoseconds — while pure
+//! compute runs at interpreter speed, slower than any JIT.
 //!
-//! The public surface mirrors `wasmtime` 45.x so embedder code is drop-in
-//! (`use submilli_wasm as wasmtime;`). The interpreter is filled in incrementally.
+//! The full **Wasm 3.0** feature set is supported — including GC, exception
+//! handling, tail calls, memory64, and (behind the `simd` feature) fixed-width
+//! SIMD — and every guest is treated as hostile: the crate is `unsafe`-free,
+//! guest-reachable paths trap instead of panicking, and memory, stack, fuel,
+//! epochs, and allocations are all bounded per [`Store`].
+//!
+//! # Example
+//!
+//! ```
+//! use submilli_wasm::{Engine, Linker, Module, Store};
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let engine = Engine::default();
+//! let mut store = Store::new(&engine, ());
+//! let mut linker = Linker::new(&engine);
+//! linker.func_wrap("host", "add", |a: i32, b: i32| a + b)?;
+//!
+//! let wasm = wat::parse_str(
+//!     r#"(module
+//!         (import "host" "add" (func $add (param i32 i32) (result i32)))
+//!         (func (export "run") (param i32) (result i32)
+//!             (call $add (local.get 0) (i32.const 35))))"#,
+//! )?;
+//! let module = Module::new(&engine, &wasm)?;
+//! let instance = linker.instantiate(&mut store, &module)?;
+//! let run = instance.get_typed_func::<i32, i32>(&mut store, "run")?;
+//! assert_eq!(run.call(&mut store, 7)?, 42);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Drop-in `wasmtime` replacement
+//!
+//! The public surface mirrors `wasmtime` 45.x — `Engine`, `Store<T>`, `Module`,
+//! `Linker`, typed and untyped calls, host functions sync and async, fuel,
+//! epochs, [`ResourceLimiter`], `Trap`/`WasmBacktrace` via `downcast_ref` — so
+//! an existing embedder can switch with a Cargo package rename and no code
+//! changes:
+//!
+//! ```toml
+//! [dependencies]
+//! wasmtime = { package = "submilli-wasm", version = "0.1", features = ["async"] }
+//! ```
+//!
+//! The surface grows by need rather than by completeness; if a method you use
+//! is missing, an issue or PR is welcome.
+//!
+//! # Cargo features
+//!
+//! - **`async`** — `call_async`, `func_wrap_async`/`func_new_async`, async
+//!   resource limiters, and fuel/epoch yielding to the executor.
+//! - **`simd`** — the fixed-width SIMD (`v128`) and relaxed-SIMD proposals;
+//!   off by default to keep compile time and binary size lean.
+//!
+//! # More
+//!
+//! The story, benchmarks, and design docs live in the
+//! [repository](https://github.com/submilli/submilli-wasm); the threat model in
+//! [`SECURITY.md`](https://github.com/submilli/submilli-wasm/blob/main/SECURITY.md).
+//!
+//! [`wasmtime`]: https://docs.rs/wasmtime
 
 // TODO: remove these as `todo!()` stubs are replaced by real bodies.
 // They fire only because placeholder bodies don't yet read their fields/params.
