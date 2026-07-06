@@ -16,9 +16,8 @@ pub use gc_aggregate::{ArrayRef, ArrayRefPre, StructRef, StructRefPre};
 pub use gc_ref::{AnyRef, ExnRef, ExternRef, RootScope, Rooted};
 pub use gc_type::{ArrayType, ExnType, FieldType, Finality, RecGroupType, StorageType, StructType};
 pub use rec_group::{
-    ArraySuperType, CompositeType, FieldTemplate, FuncSuperType, HeapTypeTemplate, PendingArrayId,
-    PendingFuncId, PendingStructId, RecGroup, RecGroupBuilder, StorageTypeTemplate,
-    StructSuperType, ValTypeTemplate,
+    ArrayTypeBuilder, ForwardRefElementBuilder, ForwardRefFieldBuilder, ForwardRefFuncValBuilder,
+    FuncTypeBuilder, PendingType, RecGroup, RecGroupBuilder, StructTypeBuilder,
 };
 pub use tag_type::TagType;
 pub use types::{

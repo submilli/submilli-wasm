@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used)]
 
 use submilli_wasm::{
-    AnyRef, ArrayRef, ArrayRefPre, ArrayType, Engine, FieldTemplate, FieldType, Finality, Instance,
-    Module, Mutability, RecGroupBuilder, Rooted, StorageType, Store, StructRef, StructRefPre,
-    StructSuperType, StructType, Val, ValType,
+    AnyRef, ArrayRef, ArrayRefPre, ArrayType, Engine, FieldType, Finality, Instance, Module,
+    Mutability, RecGroupBuilder, Rooted, StorageType, Store, StructRef, StructRefPre, StructType,
+    Val, ValType,
 };
 
 #[test]
@@ -203,21 +203,23 @@ fn self_referential_struct_round_trip() {
     let engine = Engine::default();
     let mut store = Store::new(&engine, ());
 
-    // struct $node { mut i32 value; mut (ref null $node) next }  — self-reference via the label.
+    // struct $node { mut i32 value; mut (ref null $node) next }  — self-reference via the handle.
     let mut builder = RecGroupBuilder::new(&engine);
     let node = builder.declare_struct();
-    builder.define_struct_with_finality_and_supertype(
-        node,
-        Finality::Final,
-        None::<StructSuperType>,
-        [
-            FieldTemplate::new(Mutability::Var, ValType::I32),
-            FieldTemplate::ref_(Mutability::Var, true, node),
-        ],
-    );
+    builder
+        .define_struct(node)
+        .field(FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::I32),
+        ))
+        .forward_ref_field(node)
+        .mutability(Mutability::Var)
+        .nullable(true)
+        .finish()
+        .finish();
     let group = builder.build().unwrap();
     assert_eq!(group.len(), 1);
-    let node_ty: StructType = group.struct_(node);
+    let node_ty: StructType = group.get_struct(node).unwrap();
 
     // Allocate two nodes; link the first to the second through the self-referential field.
     let pre = StructRefPre::new(&mut store, node_ty);
@@ -249,10 +251,18 @@ fn mutually_recursive_and_cross_builder_identity() {
         let mut b = RecGroupBuilder::new(&engine);
         let a = b.declare_struct();
         let bb = b.declare_struct();
-        b.define_struct(a, [FieldTemplate::ref_(Mutability::Var, true, bb)]);
-        b.define_struct(bb, [FieldTemplate::ref_(Mutability::Var, true, a)]);
+        b.define_struct(a)
+            .forward_ref_field(bb)
+            .mutability(Mutability::Var)
+            .finish()
+            .finish();
+        b.define_struct(bb)
+            .forward_ref_field(a)
+            .mutability(Mutability::Var)
+            .finish()
+            .finish();
         let g = b.build().unwrap();
-        (g.struct_(a), g.struct_(bb))
+        (g.get_struct(a).unwrap(), g.get_struct(bb).unwrap())
     };
     let (a1, b1) = build();
     let (a2, b2) = build();
@@ -262,38 +272,57 @@ fn mutually_recursive_and_cross_builder_identity() {
 }
 
 #[test]
-fn rec_group_errors_on_undefined_member() {
+fn rec_group_build_errors_and_edge_cases() {
     let engine = Engine::default();
-    let mut b = RecGroupBuilder::new(&engine);
-    let _s = b.declare_struct(); // never defined
-    assert!(b.build().is_err());
+    let i32_field = || FieldType::new(Mutability::Const, StorageType::ValType(ValType::I32));
 
-    // A built type can be a supertype of a later, separately-built type.
-    let mut base = RecGroupBuilder::new(&engine);
-    let base_id = base.add_struct([FieldTemplate::new(Mutability::Const, ValType::I32)]);
-    // base must be non-final to be a supertype.
+    // Declared but never defined (no `finish`) is a build error; an empty group is fine.
+    let mut b = RecGroupBuilder::new(&engine);
+    let _s = b.declare_struct();
+    assert!(b.build().is_err());
+    assert!(RecGroupBuilder::new(&engine).build().unwrap().is_empty());
+
+    // A non-final registered struct can be the supertype of a later, separately-built one.
     let mut nf = RecGroupBuilder::new(&engine);
     let nf_id = nf.declare_struct();
-    nf.define_struct_with_finality_and_supertype(
-        nf_id,
-        Finality::NonFinal,
-        None::<StructSuperType>,
-        [FieldTemplate::new(Mutability::Const, ValType::I32)],
-    );
+    nf.define_struct(nf_id)
+        .finality(Finality::NonFinal)
+        .field(i32_field())
+        .finish();
     let base_group = nf.build().unwrap();
-    let _ = base;
-    let _ = base_id;
+    let base_ty = base_group.get_struct(nf_id).unwrap();
 
     let mut sub = RecGroupBuilder::new(&engine);
     let sub_id = sub.declare_struct();
-    sub.define_struct_with_finality_and_supertype(
-        sub_id,
-        Finality::Final,
-        Some(StructSuperType::Type(base_group.struct_(nf_id))),
-        [
-            FieldTemplate::new(Mutability::Const, ValType::I32),
-            FieldTemplate::new(Mutability::Const, ValType::I32),
-        ],
-    );
+    sub.define_struct(sub_id)
+        .supertype(base_ty.clone())
+        .field(i32_field())
+        .field(i32_field())
+        .finish();
     assert!(sub.build().is_ok());
+
+    // Subtyping a *final* type is rejected at build().
+    let mut bad = RecGroupBuilder::new(&engine);
+    let final_id = bad.declare_struct();
+    bad.define_struct(final_id).field(i32_field()).finish();
+    let final_group = bad.build().unwrap();
+    let mut bad = RecGroupBuilder::new(&engine);
+    let bad_id = bad.declare_struct();
+    bad.define_struct(bad_id)
+        .supertype(final_group.get_struct(final_id).unwrap())
+        .field(i32_field())
+        .finish();
+    assert!(bad.build().is_err());
+
+    // Fields that don't match the supertype's prefix are rejected at build().
+    let mut bad = RecGroupBuilder::new(&engine);
+    let bad_id = bad.declare_struct();
+    bad.define_struct(bad_id)
+        .supertype(base_ty)
+        .field(FieldType::new(
+            Mutability::Const,
+            StorageType::ValType(ValType::I64),
+        ))
+        .finish();
+    assert!(bad.build().is_err());
 }

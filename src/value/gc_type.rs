@@ -92,6 +92,10 @@ impl StructType {
         self.id
     }
 
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
     pub fn field(&self, i: usize) -> Option<FieldType> {
         self.engine.struct_fields(self.id).into_iter().nth(i)
     }
@@ -141,6 +145,10 @@ impl ArrayType {
 
     pub(crate) fn canonical_id(&self) -> CanonicalTypeId {
         self.id
+    }
+
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub fn field_type(&self) -> FieldType {

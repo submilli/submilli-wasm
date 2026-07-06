@@ -135,11 +135,6 @@ impl Engine {
         self.release_types(&[g]);
     }
 
-    /// Adds one registration to group `g` (a `RecGroup` was cloned).
-    pub(crate) fn incref_group(&self, g: GroupId) {
-        self.types_write().incref_group(g);
-    }
-
     /// The number of live (registered) rec groups — for leak/reclamation tests.
     pub(crate) fn live_group_count(&self) -> usize {
         self.types_read().live_group_count()
@@ -148,6 +143,16 @@ impl Engine {
     /// Whether canonical type `sub` is a declared subtype of `sup`.
     pub(crate) fn is_subtype(&self, sub: CanonicalTypeId, sup: CanonicalTypeId) -> bool {
         self.types_read().is_subtype(sub, sup)
+    }
+
+    /// Whether `other` is the same engine instance (handle identity).
+    pub(crate) fn same(&self, other: &Engine) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The declared finality of a live canonical type.
+    pub(crate) fn type_finality(&self, id: CanonicalTypeId) -> Finality {
+        self.types_read().finality(id)
     }
 
     /// The kind (func/struct/array) of a canonical type id, if registered.

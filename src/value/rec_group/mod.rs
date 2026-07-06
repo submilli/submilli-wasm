@@ -1,54 +1,117 @@
 //! `RecGroupBuilder` — the embedder API for declaring a whole recursion group of GC types at once
 //! (mirrors wasmtime PR #13687). Self-referential / mutually-recursive host types can't be built
 //! with `StructType::new` alone (a type would need its own id before it exists); here you
-//! `declare_*` to get a kind-typed label, use it as a forward reference while `define_*`-ing
-//! siblings, and `build()` registers the whole group in one interning step.
+//! `declare_*` to get a [`PendingType`] handle, use it as a forward reference while defining
+//! siblings (via the `forward_ref_*` builder methods), and `build()` validates and registers the
+//! whole group in one interning step.
 //!
-//! The public `*Template` types ([`template`]) mirror `HeapType`/`ValType`/`StorageType`/
-//! `FieldType` but can also hold a pending label; [`lower`] turns them into module IR.
+//! Each type is defined via a nested builder (e.g. [`RecGroupBuilder::define_struct`]) and
+//! committed by calling `finish` on that builder; a definition never finished is treated as
+//! though the type was never defined. Already-registered types (and abstract heap types) are
+//! used directly via the normal [`FieldType`](crate::FieldType)/[`ValType`](crate::ValType)
+//! APIs; the `forward_ref_*` methods are only for references to same-group siblings.
+//!
+//! The order of `declare_*` calls fixes the members' order within the rec group, which is
+//! semantically significant: two groups with the same types in a different order are distinct.
 
+mod builders;
 mod lower;
-mod template;
+mod validate;
 
-pub use template::{
-    ArraySuperType, FieldTemplate, FuncSuperType, HeapTypeTemplate, PendingArrayId, PendingFuncId,
-    PendingStructId, StorageTypeTemplate, StructSuperType, ValTypeTemplate,
+pub use builders::{
+    ArrayTypeBuilder, ForwardRefElementBuilder, ForwardRefFieldBuilder, ForwardRefFuncValBuilder,
+    FuncTypeBuilder, StructTypeBuilder,
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::canon::{AggKind, CanonicalTypeId, GroupId, ModuleType};
 use crate::engine::Engine;
-use crate::value::{ArrayType, Finality, FuncType, StructType};
+use crate::value::{
+    ArrayType, FieldType, Finality, FuncType, HeapType, StorageType, StructType, ValType,
+};
 use crate::{Error, Result};
 
-/// Distinguishes labels from different builders so a label can't be used with the wrong group.
+/// Distinguishes handles from different builders so a handle can't be used with the wrong group.
 static NEXT_BUILDER_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// One member definition accumulated by the builder.
+/// A handle to a type being defined in a [`RecGroupBuilder`].
+///
+/// Obtained from [`RecGroupBuilder::declare_struct`] and friends; used both to define the type
+/// (via [`RecGroupBuilder::define_struct`] and friends) and to forward-reference it from sibling
+/// definitions (via the `forward_ref_*` builder methods). It records the kind it was declared
+/// as, so a forward reference lowers to the right concrete heap type before the target's body
+/// is defined.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct PendingType {
+    builder_id: usize,
+    index: u32,
+    kind: AggKind,
+}
+
+/// A struct field / array element accumulated by a builder: a registered [`FieldType`] or a
+/// forward reference to a sibling.
+enum FieldDef {
+    Registered(FieldType),
+    Forward {
+        target: PendingType,
+        mutable: bool,
+        nullable: bool,
+    },
+}
+
+/// A function param/result accumulated by a builder.
+enum ValDef {
+    Registered(ValType),
+    Forward { target: PendingType, nullable: bool },
+}
+
+/// A member's declared supertype: a sibling (by group index) or an already-registered type.
+enum SuperDef {
+    Forward(u32),
+    Struct(StructType),
+    Array(ArrayType),
+    Func(FuncType),
+}
+
+/// One member definition committed by a nested builder's `finish`.
 enum MemberDef {
     Struct {
         finality: Finality,
-        supertype: Option<StructSuperType>,
-        fields: Vec<FieldTemplate>,
+        supertype: Option<SuperDef>,
+        fields: Vec<FieldDef>,
     },
     Array {
         finality: Finality,
-        supertype: Option<ArraySuperType>,
-        field: FieldTemplate,
+        supertype: Option<SuperDef>,
+        element: FieldDef,
     },
     Func {
         finality: Finality,
-        supertype: Option<FuncSuperType>,
-        params: Vec<ValTypeTemplate>,
-        results: Vec<ValTypeTemplate>,
+        supertype: Option<SuperDef>,
+        params: Vec<ValDef>,
+        results: Vec<ValDef>,
     },
+}
+
+impl MemberDef {
+    fn supertype(&self) -> Option<&SuperDef> {
+        match self {
+            MemberDef::Struct { supertype, .. }
+            | MemberDef::Array { supertype, .. }
+            | MemberDef::Func { supertype, .. } => supertype.as_ref(),
+        }
+    }
 }
 
 /// Builds a whole recursion group of GC types, allowing forward references between members.
 pub struct RecGroupBuilder {
     engine: Engine,
     builder_id: usize,
+    /// The first error encountered while adding types (e.g. a type from a different engine).
+    /// Surfaced by [`build`](Self::build); the chaining builder methods stay infallible.
+    error: Option<Error>,
+    /// The committed definition of each member, or `None` if its builder never `finish`ed.
     members: Vec<Option<MemberDef>>,
 }
 
@@ -65,183 +128,159 @@ impl RecGroupBuilder {
         RecGroupBuilder {
             engine: engine.clone(),
             builder_id: NEXT_BUILDER_ID.fetch_add(1, Ordering::Relaxed),
+            error: None,
             members: Vec::new(),
         }
     }
 
-    fn declare(&mut self) -> u32 {
+    fn declare(&mut self, kind: AggKind) -> PendingType {
         let index = u32::try_from(self.members.len()).expect("too many types in a rec group");
         self.members.push(None);
-        index
-    }
-
-    /// Reserves a struct slot, returning a label usable as a forward reference.
-    pub fn declare_struct(&mut self) -> PendingStructId {
-        PendingStructId::new(self.builder_id, self.declare())
-    }
-
-    /// Reserves an array slot.
-    pub fn declare_array(&mut self) -> PendingArrayId {
-        PendingArrayId::new(self.builder_id, self.declare())
-    }
-
-    /// Reserves a function-type slot.
-    pub fn declare_func(&mut self) -> PendingFuncId {
-        PendingFuncId::new(self.builder_id, self.declare())
-    }
-
-    /// Defines a previously-declared struct (final, no supertype).
-    pub fn define_struct(
-        &mut self,
-        id: PendingStructId,
-        fields: impl IntoIterator<Item = FieldTemplate>,
-    ) -> &mut Self {
-        self.define_struct_with_finality_and_supertype(
-            id,
-            Finality::Final,
-            None::<StructSuperType>,
-            fields,
-        )
-    }
-
-    /// Defines a previously-declared struct with explicit finality + optional supertype.
-    /// The supertype accepts anything convertible into a [`StructSuperType`] — a sibling
-    /// [`PendingStructId`] or an already-registered [`StructType`] (matching wasmtime).
-    pub fn define_struct_with_finality_and_supertype(
-        &mut self,
-        id: PendingStructId,
-        finality: Finality,
-        supertype: Option<impl Into<StructSuperType>>,
-        fields: impl IntoIterator<Item = FieldTemplate>,
-    ) -> &mut Self {
-        assert_eq!(id.builder_id, self.builder_id, "label from another builder");
-        self.members[id.index as usize] = Some(MemberDef::Struct {
-            finality,
-            supertype: supertype.map(Into::into),
-            fields: fields.into_iter().collect(),
-        });
-        self
-    }
-
-    /// Declares + defines a struct in one step.
-    pub fn add_struct(
-        &mut self,
-        fields: impl IntoIterator<Item = FieldTemplate>,
-    ) -> PendingStructId {
-        let id = self.declare_struct();
-        self.define_struct(id, fields);
-        id
-    }
-
-    /// Defines a previously-declared array (final, no supertype).
-    pub fn define_array(&mut self, id: PendingArrayId, field: FieldTemplate) -> &mut Self {
-        self.define_array_with_finality_and_supertype(
-            id,
-            Finality::Final,
-            None::<ArraySuperType>,
-            field,
-        )
-    }
-
-    /// Defines a previously-declared array with explicit finality + optional supertype.
-    /// The supertype accepts anything convertible into an [`ArraySuperType`].
-    pub fn define_array_with_finality_and_supertype(
-        &mut self,
-        id: PendingArrayId,
-        finality: Finality,
-        supertype: Option<impl Into<ArraySuperType>>,
-        field: FieldTemplate,
-    ) -> &mut Self {
-        assert_eq!(id.builder_id, self.builder_id, "label from another builder");
-        self.members[id.index as usize] = Some(MemberDef::Array {
-            finality,
-            supertype: supertype.map(Into::into),
-            field,
-        });
-        self
-    }
-
-    /// Declares + defines an array in one step.
-    pub fn add_array(&mut self, field: FieldTemplate) -> PendingArrayId {
-        let id = self.declare_array();
-        self.define_array(id, field);
-        id
-    }
-
-    /// Defines a previously-declared function type (final, no supertype). Params/results accept
-    /// anything convertible into [`ValTypeTemplate`] — e.g. a plain [`ValType`](crate::ValType).
-    pub fn define_func<P, R>(&mut self, id: PendingFuncId, params: P, results: R) -> &mut Self
-    where
-        P: IntoIterator,
-        P::Item: Into<ValTypeTemplate>,
-        R: IntoIterator,
-        R::Item: Into<ValTypeTemplate>,
-    {
-        self.define_func_with_finality_and_supertype(
-            id,
-            Finality::Final,
-            None::<FuncSuperType>,
-            params,
-            results,
-        )
-    }
-
-    /// Defines a previously-declared function type with explicit finality + optional supertype.
-    /// The supertype accepts anything convertible into a [`FuncSuperType`]; params/results accept
-    /// anything convertible into [`ValTypeTemplate`].
-    pub fn define_func_with_finality_and_supertype<P, R>(
-        &mut self,
-        id: PendingFuncId,
-        finality: Finality,
-        supertype: Option<impl Into<FuncSuperType>>,
-        params: P,
-        results: R,
-    ) -> &mut Self
-    where
-        P: IntoIterator,
-        P::Item: Into<ValTypeTemplate>,
-        R: IntoIterator,
-        R::Item: Into<ValTypeTemplate>,
-    {
-        assert_eq!(id.builder_id, self.builder_id, "label from another builder");
-        self.members[id.index as usize] = Some(MemberDef::Func {
-            finality,
-            supertype: supertype.map(Into::into),
-            params: params.into_iter().map(Into::into).collect(),
-            results: results.into_iter().map(Into::into).collect(),
-        });
-        self
-    }
-
-    /// Declares + defines a function type in one step.
-    pub fn add_func<P, R>(&mut self, params: P, results: R) -> PendingFuncId
-    where
-        P: IntoIterator,
-        P::Item: Into<ValTypeTemplate>,
-        R: IntoIterator,
-        R::Item: Into<ValTypeTemplate>,
-    {
-        let id = self.declare_func();
-        self.define_func(id, params, results);
-        id
-    }
-
-    /// Registers the whole group: lowers each member to module IR (sibling labels → relative
-    /// concrete refs, already-registered types → an externals table) and interns it.
-    pub fn build(self) -> Result<RecGroup> {
-        let n = self.members.len();
-        if n == 0 {
-            return Err(Error::msg("a rec group must contain at least one type"));
+        PendingType {
+            builder_id: self.builder_id,
+            index,
+            kind,
         }
+    }
+
+    /// Declares a struct slot, returning a handle usable as a forward reference.
+    pub fn declare_struct(&mut self) -> PendingType {
+        self.declare(AggKind::Struct)
+    }
+
+    /// Declares an array slot.
+    pub fn declare_array(&mut self) -> PendingType {
+        self.declare(AggKind::Array)
+    }
+
+    /// Declares a function-type slot.
+    pub fn declare_func(&mut self) -> PendingType {
+        self.declare(AggKind::Func)
+    }
+
+    #[track_caller]
+    fn check_owns(&self, ty: PendingType) {
+        assert_eq!(
+            ty.builder_id, self.builder_id,
+            "`PendingType` used with a different `RecGroupBuilder` than it came from"
+        );
+    }
+
+    /// Records an error to be surfaced by [`build`](Self::build); only the first is kept.
+    fn record_error(&mut self, error: Error) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    fn check_engine(&mut self, same_engine: bool, what: &str) {
+        if !same_engine {
+            self.record_error(crate::format_err!(
+                "{what} is associated with a different engine"
+            ));
+        }
+    }
+
+    /// Records an error unless every concrete type reachable from `ty` belongs to this engine.
+    fn check_field_engine(&mut self, ty: &FieldType, what: &str) {
+        if let StorageType::ValType(v) = ty.element_type() {
+            self.check_val_engine(v, what);
+        }
+    }
+
+    fn check_val_engine(&mut self, ty: &ValType, what: &str) {
+        let same = match ty {
+            ValType::Ref(rt) => match rt.heap_type() {
+                HeapType::ConcreteStruct(t) => t.engine().same(&self.engine),
+                HeapType::ConcreteArray(t) => t.engine().same(&self.engine),
+                HeapType::ConcreteFunc(t) => t.engine().same(&self.engine),
+                _ => true,
+            },
+            _ => true,
+        };
+        self.check_engine(same, what);
+    }
+
+    /// Begins defining `ty` as a struct; commit with [`StructTypeBuilder::finish`] (committing
+    /// replaces any previous definition).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle came from another builder or was not declared via
+    /// [`declare_struct`](Self::declare_struct).
+    #[track_caller]
+    pub fn define_struct(&mut self, ty: PendingType) -> StructTypeBuilder<'_> {
+        self.check_owns(ty);
+        assert_eq!(
+            ty.kind,
+            AggKind::Struct,
+            "handle was not declared as a struct type"
+        );
+        StructTypeBuilder::new(self, ty.index)
+    }
+
+    /// Begins defining `ty` as an array; commit with [`ArrayTypeBuilder::finish`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle came from another builder or was not declared via
+    /// [`declare_array`](Self::declare_array).
+    #[track_caller]
+    pub fn define_array(&mut self, ty: PendingType) -> ArrayTypeBuilder<'_> {
+        self.check_owns(ty);
+        assert_eq!(
+            ty.kind,
+            AggKind::Array,
+            "handle was not declared as an array type"
+        );
+        ArrayTypeBuilder::new(self, ty.index)
+    }
+
+    /// Begins defining `ty` as a function type; commit with [`FuncTypeBuilder::finish`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle came from another builder or was not declared via
+    /// [`declare_func`](Self::declare_func).
+    #[track_caller]
+    pub fn define_func(&mut self, ty: PendingType) -> FuncTypeBuilder<'_> {
+        self.check_owns(ty);
+        assert_eq!(
+            ty.kind,
+            AggKind::Func,
+            "handle was not declared as a function type"
+        );
+        FuncTypeBuilder::new(self, ty.index)
+    }
+
+    /// Registers the whole group: lowers each member to module IR (sibling handles → relative
+    /// concrete refs, already-registered types → an externals table), interns it, and validates
+    /// declared supertypes. An empty group is allowed.
+    pub fn build(self) -> Result<RecGroup> {
+        let RecGroupBuilder {
+            engine,
+            builder_id,
+            error,
+            members,
+        } = self;
+        if let Some(error) = error {
+            return Err(error);
+        }
+
+        let n = members.len();
+        let mut defs = Vec::with_capacity(n);
+        for (i, m) in members.into_iter().enumerate() {
+            defs.push(
+                m.ok_or_else(|| Error::msg(format!("type {i} was declared but never defined")))?,
+            );
+        }
+
         let mut externals = Vec::new();
-        let mut members = Vec::with_capacity(n);
+        let mut lowered = Vec::with_capacity(n);
         let mut kinds = Vec::with_capacity(n);
-        for (i, m) in self.members.iter().enumerate() {
-            let def = m
-                .as_ref()
-                .ok_or_else(|| Error::msg(format!("type {i} was declared but never defined")))?;
+        for def in &defs {
             let (finality, supertype, body, kind) = lower::lower(def, n, &mut externals);
-            members.push(ModuleType {
+            lowered.push(ModuleType {
                 group: 0,
                 finality,
                 supertype,
@@ -249,30 +288,30 @@ impl RecGroupBuilder {
             });
             kinds.push(kind);
         }
+
         // The group is interned with one registration, which this `RecGroup` adopts (released on
         // drop). Extracted `StructType`/etc. handles take their own registrations via `from_id`.
-        let (ids, group) = self.engine.intern_host_group(&members, &externals);
-        Ok(RecGroup {
-            engine: self.engine,
-            builder_id: self.builder_id,
+        let (ids, group) = engine.intern_host_group(&lowered, &externals);
+        let group = RecGroup {
+            engine: engine.clone(),
+            builder_id,
             group,
             ids,
             kinds,
-        })
+        };
+
+        // Supertypes are validated only now, once forward references resolve to registered
+        // types. On failure `group` is dropped, which releases the registration.
+        for (i, def) in defs.iter().enumerate() {
+            validate::supertype(&engine, &group, i, def.supertype())?;
+        }
+        Ok(group)
     }
 }
 
-/// One member of a built [`RecGroup`].
-#[derive(Clone, Debug)]
-pub enum CompositeType {
-    Struct(StructType),
-    Array(ArrayType),
-    Func(FuncType),
-}
-
 /// A registered recursion group: the canonical types produced by [`RecGroupBuilder::build`].
-/// Holds one registration on the group (`Clone` increfs, `Drop` decrefs), keeping all its member
-/// types alive while it lives.
+/// Holds one registration on the group (released on `Drop`), keeping all its member types alive
+/// while it lives; types retrieved via the getters hold their own registrations.
 #[derive(Debug)]
 pub struct RecGroup {
     engine: Engine,
@@ -282,19 +321,6 @@ pub struct RecGroup {
     kinds: Vec<AggKind>,
 }
 
-impl Clone for RecGroup {
-    fn clone(&self) -> Self {
-        self.engine.incref_group(self.group);
-        RecGroup {
-            engine: self.engine.clone(),
-            builder_id: self.builder_id,
-            group: self.group,
-            ids: self.ids.clone(),
-            kinds: self.kinds.clone(),
-        }
-    }
-}
-
 impl Drop for RecGroup {
     fn drop(&mut self) {
         self.engine.release_group(self.group);
@@ -302,48 +328,52 @@ impl Drop for RecGroup {
 }
 
 impl RecGroup {
+    /// The number of types in this rec group.
     pub fn len(&self) -> usize {
         self.ids.len()
     }
 
+    /// Whether this rec group was built without declaring any types.
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
 
-    /// The registered struct type for label `id`.
-    pub fn struct_(&self, id: PendingStructId) -> StructType {
-        let i = self.check(id.builder_id, id.index, AggKind::Struct);
-        StructType::from_id(&self.engine, self.ids[i])
+    #[track_caller]
+    fn index_of(&self, ty: PendingType) -> usize {
+        assert_eq!(
+            ty.builder_id, self.builder_id,
+            "`PendingType` used with a different `RecGroup` than it came from"
+        );
+        ty.index as usize
     }
 
-    /// The registered array type for label `id`.
-    pub fn array(&self, id: PendingArrayId) -> ArrayType {
-        let i = self.check(id.builder_id, id.index, AggKind::Array);
-        ArrayType::from_id(&self.engine, self.ids[i])
+    /// The struct type for the given handle, or `None` if it was declared as a different kind.
+    pub fn get_struct(&self, ty: PendingType) -> Option<StructType> {
+        let i = self.index_of(ty);
+        (self.kinds[i] == AggKind::Struct).then(|| StructType::from_id(&self.engine, self.ids[i]))
     }
 
-    /// The registered function type for label `id`.
-    pub fn func(&self, id: PendingFuncId) -> FuncType {
-        let i = self.check(id.builder_id, id.index, AggKind::Func);
-        FuncType::from_id(&self.engine, self.ids[i])
+    /// The array type for the given handle, or `None` if it was declared as a different kind.
+    pub fn get_array(&self, ty: PendingType) -> Option<ArrayType> {
+        let i = self.index_of(ty);
+        (self.kinds[i] == AggKind::Array).then(|| ArrayType::from_id(&self.engine, self.ids[i]))
     }
 
-    /// Every member of the group, in declaration order.
-    pub fn types(&self) -> impl ExactSizeIterator<Item = CompositeType> + '_ {
+    /// The function type for the given handle, or `None` if it was declared as a different kind.
+    pub fn get_func(&self, ty: PendingType) -> Option<FuncType> {
+        let i = self.index_of(ty);
+        (self.kinds[i] == AggKind::Func).then(|| FuncType::from_id(&self.engine, self.ids[i]))
+    }
+
+    /// Every member of the group in declaration order, each as a concrete [`HeapType`].
+    pub fn types(&self) -> impl ExactSizeIterator<Item = HeapType> + '_ {
         self.ids
             .iter()
             .zip(&self.kinds)
             .map(|(&id, &kind)| match kind {
-                AggKind::Struct => CompositeType::Struct(StructType::from_id(&self.engine, id)),
-                AggKind::Array => CompositeType::Array(ArrayType::from_id(&self.engine, id)),
-                AggKind::Func => CompositeType::Func(FuncType::from_id(&self.engine, id)),
+                AggKind::Struct => HeapType::ConcreteStruct(StructType::from_id(&self.engine, id)),
+                AggKind::Array => HeapType::ConcreteArray(ArrayType::from_id(&self.engine, id)),
+                AggKind::Func => HeapType::ConcreteFunc(FuncType::from_id(&self.engine, id)),
             })
-    }
-
-    fn check(&self, builder_id: usize, index: u32, kind: AggKind) -> usize {
-        assert_eq!(builder_id, self.builder_id, "label from another builder");
-        let i = index as usize;
-        assert_eq!(self.kinds[i], kind, "label kind mismatch");
-        i
     }
 }

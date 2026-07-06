@@ -78,10 +78,10 @@ pub use crate::store::{
 };
 pub use crate::trap::Trap;
 pub use crate::value::{
-    AnyRef, ArrayRef, ArrayRefPre, ArraySuperType, ArrayType, CompositeType, ExnRef, ExnRefPre,
-    ExnType, ExportType, ExternRef, ExternType, FieldTemplate, FieldType, Finality, FuncSuperType,
-    FuncType, GlobalType, HeapType, HeapTypeTemplate, ImportType, MemoryType, Mutability,
-    PendingArrayId, PendingFuncId, PendingStructId, RecGroup, RecGroupBuilder, RecGroupType, Ref,
-    RefType, RootScope, Rooted, StorageType, StorageTypeTemplate, StructRef, StructRefPre,
-    StructSuperType, StructType, TableType, TagType, Val, ValType, ValTypeTemplate, V128,
+    AnyRef, ArrayRef, ArrayRefPre, ArrayType, ArrayTypeBuilder, ExnRef, ExnRefPre, ExnType,
+    ExportType, ExternRef, ExternType, FieldType, Finality, ForwardRefElementBuilder,
+    ForwardRefFieldBuilder, ForwardRefFuncValBuilder, FuncType, FuncTypeBuilder, GlobalType,
+    HeapType, ImportType, MemoryType, Mutability, PendingType, RecGroup, RecGroupBuilder,
+    RecGroupType, Ref, RefType, RootScope, Rooted, StorageType, StructRef, StructRefPre,
+    StructType, StructTypeBuilder, TableType, TagType, Val, ValType, V128,
 };

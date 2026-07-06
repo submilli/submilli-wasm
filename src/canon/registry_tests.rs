@@ -67,8 +67,8 @@ fn refcount_reclaims_only_at_zero() {
 mod reclaim {
     #![allow(clippy::unwrap_used)]
     use crate::value::{
-        ArrayType, FieldTemplate, FieldType, Finality, Mutability, RecGroupBuilder, StorageType,
-        StructRef, StructRefPre, StructSuperType, StructType, Val, ValType,
+        ArrayType, FieldType, Finality, Mutability, RecGroupBuilder, StorageType, StructRef,
+        StructRefPre, StructType, Val, ValType,
     };
     use crate::{Engine, Store};
 
@@ -107,10 +107,11 @@ mod reclaim {
         for _ in 0..100 {
             let mut b = RecGroupBuilder::new(&engine);
             let node = b.declare_struct();
-            b.define_struct(
-                node,
-                [FieldTemplate::ref_(Mutability::Var, true, node)], // self-referential
-            );
+            b.define_struct(node)
+                .forward_ref_field(node) // self-referential
+                .mutability(Mutability::Var)
+                .finish()
+                .finish();
             let _g = b.build().unwrap();
         }
         assert_eq!(engine.live_group_count(), base); // no unbounded growth
@@ -123,25 +124,19 @@ mod reclaim {
         // A non-final base group, then a separate group whose member subtypes it.
         let mut bb = RecGroupBuilder::new(&engine);
         let base_id = bb.declare_struct();
-        bb.define_struct_with_finality_and_supertype(
-            base_id,
-            Finality::NonFinal,
-            None::<StructSuperType>,
-            [FieldTemplate::from(i32_field(Mutability::Const))],
-        );
+        bb.define_struct(base_id)
+            .finality(Finality::NonFinal)
+            .field(i32_field(Mutability::Const))
+            .finish();
         let base_group = bb.build().unwrap();
 
         let mut sb = RecGroupBuilder::new(&engine);
         let sub_id = sb.declare_struct();
-        sb.define_struct_with_finality_and_supertype(
-            sub_id,
-            Finality::Final,
-            Some(StructSuperType::Type(base_group.struct_(base_id))),
-            [
-                FieldTemplate::from(i32_field(Mutability::Const)),
-                FieldTemplate::from(i32_field(Mutability::Const)),
-            ],
-        );
+        sb.define_struct(sub_id)
+            .supertype(base_group.get_struct(base_id).unwrap())
+            .field(i32_field(Mutability::Const))
+            .field(i32_field(Mutability::Const))
+            .finish();
         let sub_group = sb.build().unwrap();
         assert_eq!(engine.live_group_count(), base + 2);
 
