@@ -32,7 +32,8 @@ jobs:
       - name: Build all fuzz targets
         # Explicit --target: the prebuilt cargo-fuzz is musl-linked and defaults to
         # its own build triple, and ASan can't link against static musl libc.
-        run: cargo fuzz build --target "$(rustc -vV | sed -n 's/host: //p')"
+        run: |
+          cargo fuzz build --target "$(rustc -vV | sed -n 's/host: //p')"
 
   run:
     name: Fuzz ${{ matrix.target }}
@@ -55,7 +56,8 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} --target "$(rustc -vV | sed -n 's/host: //p')" -- -max_total_time=180 -rss_limit_mb=4096
+        run: |
+          cargo fuzz run ${{ matrix.target }} --target "$(rustc -vV | sed -n 's/host: //p')" -- -max_total_time=180 -rss_limit_mb=4096
       - name: Upload crashing inputs
         if: failure()
         uses: actions/upload-artifact@v4
