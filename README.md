@@ -61,6 +61,16 @@ epochs, `Trap` and `WasmBacktrace` via `downcast_ref`. Our own embedding code mo
 over with little more than a dependency swap — though as said above, the surface is
 what our product needed, and it grows one missing method at a time.
 
+And the swap really is one line, thanks to Cargo's package rename:
+
+```toml
+[dependencies]
+wasmtime = { package = "submilli-wasm", version = "0.1", features = ["async"] }
+```
+
+Every `use wasmtime::…` in the embedder keeps compiling — now against the
+interpreter. Or, starting fresh:
+
 ```rust
 use submilli_wasm::{Engine, Linker, Module, Store};
 
