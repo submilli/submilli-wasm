@@ -24,6 +24,17 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
+      - name: Cache benchmark fixtures
+        uses: actions/cache@v4
+        with:
+          path: |
+            benches/wasm/spidermonkey.wasm
+            benches/wasm/pulldown-cmark.wasm
+          key: bench-fixtures-${{ hashFiles('scripts/fetch-bench-wasm.sh') }}
+
+      - name: Fetch benchmark fixtures
+        run: ./scripts/fetch-bench-wasm.sh
+
       - name: Format
         run: cargo fmt --all --check
 
