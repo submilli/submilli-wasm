@@ -1,6 +1,6 @@
 [package]
 name = "submilli-wasm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A WebAssembly interpreter with a wasmtime-compatible API, built for fast compilation and startup"
 license = "Apache-2.0"
