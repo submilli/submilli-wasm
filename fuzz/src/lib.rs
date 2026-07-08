@@ -229,6 +229,16 @@ fn diff_wasmtime(wasm: &[u8]) -> Vec<(String, Outcome)> {
     if store.set_fuel(FUEL).is_err() {
         return vec![];
     }
+    // Wasmtime 45 workaround: instantiating a module whose passive element segment holds a
+    // non-null externref const-expr (e.g. `extern.convert_any (ref.i31 ...)`) panics if the
+    // store's lazily-created GC heap doesn't exist yet. Allocating (and instantly unrooting)
+    // a throwaway externref forces the heap into existence first.
+    {
+        let mut scope = wasmtime::RootScope::new(&mut store);
+        if wasmtime::ExternRef::new(&mut scope, ()).is_err() {
+            return vec![];
+        }
+    }
     let Ok(instance) = Instance::new(&mut store, &module, &[]) else {
         return vec![];
     };
@@ -382,6 +392,14 @@ mod tests {
         for s in 0..64 {
             interpret(&seed_bytes(s));
         }
+    }
+
+    /// CI crash regression: these bytes smith a module whose passive element segment holds an
+    /// `extern.convert_any (ref.i31 ...)` const-expr, which panicked wasmtime 45's instantiation
+    /// when the store's GC heap wasn't allocated yet (worked around in `diff_wasmtime`).
+    #[test]
+    fn differential_passive_externref_elem_does_not_panic_wasmtime() {
+        differential(&[170, 175, 0, 0, 0, 0, 47, 47, 0, 23, 89, 193, 193]);
     }
 
     // Heavyweight (wasmtime debug-Cranelift-compiles every generated module), so it's `#[ignore]`d out
