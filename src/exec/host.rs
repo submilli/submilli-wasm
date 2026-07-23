@@ -10,14 +10,32 @@ use super::epoch::apply_epoch_deadline;
 use super::exn::surface_exception;
 use super::frame::Delimiter;
 use super::{cell, Execution, Outcome};
+use crate::canon::RefKind;
 use crate::exception::ThrownException;
 use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
 use crate::instance::Instance;
 use crate::module::code::Code;
-use crate::store::{FuncEntity, Store};
+use crate::store::{FuncEntity, Store, StoreInner};
 use crate::value::{Ref, Val, ValType};
 use crate::Result;
+
+/// Roots every reference param for the host call's duration. `pop_params_into` removed them
+/// from the operand root shadow, so without this a collection triggered from inside the call
+/// (any host-side allocation can hit the GC budget) would free an object the host still holds.
+/// Registered after the call's `roots_mark`, so the existing truncate unwinds them together
+/// with the call's own host-created roots.
+pub(super) fn root_ref_params(inner: &mut StoreInner, params: &[Val]) {
+    for v in params {
+        match v {
+            Val::AnyRef(Some(r)) => inner.push_gc_root(r.raw(), RefKind::Any),
+            Val::ExternRef(Some(r)) => inner.push_gc_root(r.raw(), RefKind::Extern),
+            Val::ExnRef(Some(r)) => inner.push_gc_root(r.raw(), RefKind::Exn),
+            // Funcs are store entities (never collected); numerics and nulls carry no referent.
+            _ => {}
+        }
+    }
+}
 
 /// Decodes the final operand cells back to public `Val`s using the entry function's result types
 /// (the stack is untyped; the caller's signature supplies the types — see `cell`).
@@ -125,7 +143,7 @@ fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Resu
                 return Err(crate::Error::msg("fuel yield requires an async store"))
             }
             Outcome::EpochDeadline => {
-                if let Err(e) = apply_epoch_deadline(store) {
+                if let Err(e) = apply_epoch_deadline(exec, store) {
                     return Err(exec.attach_suspension_backtrace(&store.inner, e));
                 }
             }
@@ -183,6 +201,7 @@ impl Execution {
         // pin every one, defeating collection. Returned values survive via `push_results` (operand
         // roots); anything the host stored into a global/table/pending-exception is rooted there.
         let roots_mark = store.inner.gc_roots_mark();
+        root_ref_params(&mut store.inner, &params);
         let cb = store.host_funcs[host_index as usize].clone();
         // Park the shared execution so a host fn that re-enters wasm (`Func::call`) runs on these
         // same stacks; reclaim it after the call (a re-entrant call re-parks it on its way out). The

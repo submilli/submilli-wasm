@@ -50,7 +50,7 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
                 store.inner.refuel_from_reserve();
             }
             Outcome::EpochDeadline => {
-                if let Err(e) = apply_epoch_deadline_async(store).await {
+                if let Err(e) = apply_epoch_deadline_async(exec, store).await {
                     return Err(exec.attach_suspension_backtrace(&store.inner, e));
                 }
             }
@@ -124,6 +124,7 @@ impl Execution {
         };
         // Scope the host-created GC roots for the call's duration (see `invoke_host`).
         let roots_mark = store.inner.gc_roots_mark();
+        super::host::root_ref_params(&mut store.inner, &params);
         ((params, results), roots_mark, host_index)
     }
 

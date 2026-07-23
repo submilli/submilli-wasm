@@ -2,6 +2,7 @@
 //! consult the store's callback and either trap, extend-and-continue, or (async) yield. Split out of
 //! the driver (`host`) to keep that file small.
 
+use super::Execution;
 use crate::store::{Store, UpdateDeadline};
 use crate::trap::Trap;
 use crate::Result;
@@ -32,12 +33,31 @@ pub(super) async fn yield_now() {
 
 /// Invokes the store's epoch-deadline callback (defaulting to `Interrupt`), leaving it
 /// reinstalled. The returned `UpdateDeadline` is acted on by the (sync/async) caller.
-fn take_epoch_action<T>(store: &mut Store<T>) -> Result<UpdateDeadline> {
+///
+/// The callback is host code holding the store context, so it gets the full `invoke_host`
+/// treatment: park the execution (a GC allocation in the callback collects with the guest's
+/// live operands as roots — without parking they are invisible and would be freed), scope
+/// the GC roots it creates, and contain a panic (#33).
+fn take_epoch_action<T>(exec: &mut Execution, store: &mut Store<T>) -> Result<UpdateDeadline> {
     let mut cb = store.epoch_callback.take();
-    let action = match cb.as_mut() {
-        Some(f) => f(store.as_context_mut()),
-        None => Ok(UpdateDeadline::Interrupt),
+    let Some(f) = cb.as_mut() else {
+        return Ok(UpdateDeadline::Interrupt);
     };
+    let roots_mark = store.inner.gc_roots_mark();
+    store.inner.swap_exec(exec); // park (see `invoke_host`)
+    let action = match super::guard::catch_host(|| f(store.as_context_mut())) {
+        Ok(action) => action,
+        Err(payload) => {
+            super::guard::restore_after_panic(&mut store.inner, roots_mark);
+            super::guard::reraise(payload);
+        }
+    };
+    store.inner.swap_exec(exec); // reclaim
+    store.inner.gc_roots_truncate(roots_mark);
+    if action.is_ok() {
+        // See `invoke_host`: a callback that returned normally leaves no pending exception.
+        store.inner.take_pending_exception();
+    }
     store.epoch_callback = cb;
     action
 }
@@ -50,8 +70,8 @@ fn extend_epoch_deadline<T>(store: &mut Store<T>, delta: u64) {
 
 /// Applies the store's epoch-deadline policy in a *sync* context: trap, or
 /// extend-and-continue. `Yield` requires async, so it traps here.
-pub(super) fn apply_epoch_deadline<T>(store: &mut Store<T>) -> Result<()> {
-    match take_epoch_action(store)? {
+pub(super) fn apply_epoch_deadline<T>(exec: &mut Execution, store: &mut Store<T>) -> Result<()> {
+    match take_epoch_action(exec, store)? {
         UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
         UpdateDeadline::Continue(delta) => {
             extend_epoch_deadline(store, delta);
@@ -65,8 +85,11 @@ pub(super) fn apply_epoch_deadline<T>(store: &mut Store<T>) -> Result<()> {
 /// Async epoch-deadline policy: like [`apply_epoch_deadline`] but `Yield(delta)` yields
 /// to the executor and then extends the deadline (rather than trapping).
 #[cfg(feature = "async")]
-pub(super) async fn apply_epoch_deadline_async<T>(store: &mut Store<T>) -> Result<()> {
-    match take_epoch_action(store)? {
+pub(super) async fn apply_epoch_deadline_async<T>(
+    exec: &mut Execution,
+    store: &mut Store<T>,
+) -> Result<()> {
+    match take_epoch_action(exec, store)? {
         UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
         UpdateDeadline::Continue(delta) => {
             extend_epoch_deadline(store, delta);

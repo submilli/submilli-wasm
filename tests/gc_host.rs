@@ -326,3 +326,110 @@ fn rec_group_build_errors_and_edge_cases() {
         .finish();
     assert!(bad.build().is_err());
 }
+
+/// Host-call params must survive a collection triggered from *inside* the call. The run loop
+/// pops params off the operand stack (out of the collector's root shadow), so they are
+/// reachable only through the host-call root bracket; churning past the tiny reservation
+/// forces a mid-call collection that would otherwise free the guest's struct while the host
+/// still holds it.
+#[test]
+fn host_call_params_survive_host_triggered_collection() {
+    use submilli_wasm::{Caller, Collector, Config, Func, FuncType, HeapType, RefType};
+
+    let mut cfg = Config::new();
+    cfg.collector(Collector::Auto).gc_heap_reservation(64 << 10);
+    let engine = Engine::new(&cfg).unwrap();
+    let mut store = Store::new(&engine, ());
+
+    let churn_engine = engine.clone();
+    let anyref = ValType::Ref(RefType::new(true, HeapType::Any));
+    let pin = Func::new(
+        &mut store,
+        FuncType::new(&engine, [anyref], [ValType::I32]),
+        move |mut caller: Caller<'_, ()>, params, results| {
+            // ~320 KiB of host-built garbage against a 64 KiB budget → collection mid-call.
+            let st = StructType::new(
+                &churn_engine,
+                [FieldType::new(
+                    Mutability::Var,
+                    StorageType::ValType(ValType::I64),
+                )],
+            )?;
+            let pre = StructRefPre::new(&mut caller, st);
+            for _ in 0..20_000 {
+                StructRef::new(&mut caller, &pre, &[Val::I64(0)])?;
+            }
+            let Val::AnyRef(Some(param)) = params[0] else {
+                return Err(submilli_wasm::Error::msg("expected a struct param"));
+            };
+            results[0] = param.unwrap_struct(&caller)?.field(&mut caller, 0)?;
+            Ok(())
+        },
+    );
+
+    let wat = r#"(module
+        (type $s (struct (field i32)))
+        (import "h" "pin" (func $pin (param anyref) (result i32)))
+        (func (export "run") (result i32)
+            (call $pin (struct.new $s (i32.const 42)))))"#;
+    let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
+    let inst = Instance::new(&mut store, &module, &[pin.into()]).unwrap();
+    let run = inst.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    assert_eq!(run.call(&mut store, ()).unwrap(), 42);
+}
+
+/// The epoch-deadline callback is host code too: a collection it triggers must see the guest's
+/// live operand stack as roots (the callback runs with the execution parked, like a host call).
+/// The guest allocates a struct, then a host call increments the epoch past the deadline, so
+/// the callback fires — exactly once, deterministically — at the next op, with the struct on
+/// the operand stack; its churn past the tiny reservation forces a collection right there.
+#[test]
+fn operand_stack_survives_epoch_callback_collection() {
+    use submilli_wasm::{Caller, Collector, Config, Func, FuncType, UpdateDeadline};
+
+    let mut cfg = Config::new();
+    cfg.collector(Collector::Auto)
+        .gc_heap_reservation(64 << 10)
+        .epoch_interruption(true);
+    let engine = Engine::new(&cfg).unwrap();
+    let mut store = Store::new(&engine, ());
+
+    let churn_engine = engine.clone();
+    store.epoch_deadline_callback(move |mut ctx| {
+        let st = StructType::new(
+            &churn_engine,
+            [FieldType::new(
+                Mutability::Var,
+                StorageType::ValType(ValType::I64),
+            )],
+        )?;
+        let pre = StructRefPre::new(&mut ctx, st);
+        for _ in 0..20_000 {
+            StructRef::new(&mut ctx, &pre, &[Val::I64(0)])?;
+        }
+        Ok(UpdateDeadline::Continue(u64::MAX))
+    });
+    store.set_epoch_deadline(1);
+
+    let arm_engine = engine.clone();
+    let arm = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        move |_caller: Caller<'_, ()>, _params, _results| {
+            arm_engine.increment_epoch();
+            Ok(())
+        },
+    );
+
+    let wat = r#"(module
+        (type $s (struct (field i32)))
+        (import "h" "arm" (func $arm))
+        (func (export "run") (result i32)
+            (struct.new $s (i32.const 42))
+            (call $arm)
+            (struct.get $s 0)))"#;
+    let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
+    let inst = Instance::new(&mut store, &module, &[arm.into()]).unwrap();
+    let run = inst.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    assert_eq!(run.call(&mut store, ()).unwrap(), 42);
+}

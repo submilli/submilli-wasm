@@ -157,9 +157,10 @@ impl<T: 'static> Store<T> {
     /// Ensures the GC heap can hold a `charge`-byte **host-built** object (`StructRef`/`ArrayRef::new`):
     /// collect-then-grow through the limiter, **synchronously**. Unlike the guest path
     /// (`Execution::gc_reserve`, which suspends to reach the `T`-generic limiter), host code already
-    /// holds the `Store<T>`, so it consults the limiter inline. This is a safe point because
-    /// `invoke_host` parks the live guest operands (and the call's params) in `gc_roots` for the
-    /// call's duration, so a collection here sees them as roots. Mirrors `gc_reserve`: growth within
+    /// holds the `Store<T>`, so it consults the limiter inline. This is a safe point because host
+    /// code only runs with the execution parked (`invoke_host` / the epoch callback): the guest's
+    /// live operands are reachable via the parked execution (`exec_roots`) and the call's params
+    /// via `gc_roots`, so a collection here sees them all. Mirrors `gc_reserve`: growth within
     /// the pre-authorized free budget is granted directly (no collection, no limiter); only growth
     /// beyond it collects first, then grows through the limiter (a denial traps). Kept in lockstep
     /// with `Execution::gc_reserve`.
