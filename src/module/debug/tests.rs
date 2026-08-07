@@ -120,3 +120,44 @@ fn wasm_backtrace_off_drops_offsets_and_names() {
     assert!(module.code(0).offsets().is_none());
     assert_eq!(inner.debug.func_name(0), None);
 }
+
+/// The `name` section's module subsection surfaces through [`Module::name`], matching
+/// `wasmtime::Module::name`.
+#[test]
+fn module_name_from_name_section() {
+    let bytes = wat::parse_str(r#"(module $submilli_pkg (func (export "f")))"#).unwrap();
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).unwrap();
+    assert_eq!(module.name(), Some("submilli_pkg"));
+}
+
+/// A module with no module-name subsection reports `None` rather than guessing.
+#[test]
+fn module_name_absent_is_none() {
+    let bytes = wat::parse_str(r#"(module (func (export "f")))"#).unwrap();
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).unwrap();
+    assert_eq!(module.name(), None);
+}
+
+/// Module identity is not backtrace detail: `wasm_backtrace(false)` still drops function names,
+/// but must not erase the module name, which embedders key security decisions on.
+#[test]
+fn module_name_survives_wasm_backtrace_off() {
+    let bytes = wat::parse_str(r#"(module $submilli_pkg (func (export "f")))"#).unwrap();
+    let engine = Engine::new(Config::new().wasm_backtrace(false)).unwrap();
+    let module = Module::new(&engine, &bytes).unwrap();
+    assert_eq!(module.name(), Some("submilli_pkg"));
+    assert_eq!(module.inner().debug.func_name(0), None);
+}
+
+/// The module name is part of the compiled artifact, like function names.
+#[test]
+fn module_name_survives_serialize_round_trip() {
+    let bytes = wat::parse_str(r#"(module $submilli_pkg (func (export "f")))"#).unwrap();
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).unwrap();
+    let artifact = module.serialize().unwrap();
+    let restored = unsafe { Module::deserialize(&engine, &artifact) }.unwrap();
+    assert_eq!(restored.name(), Some("submilli_pkg"));
+}
