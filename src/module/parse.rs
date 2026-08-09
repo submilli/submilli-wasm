@@ -116,7 +116,7 @@ fn decode_payload(
         Payload::CodeSectionStart { range, .. } => {
             m.debug.set_code_base(range.start as u32);
         }
-        Payload::CustomSection(reader) if keep_offsets || keep_dwarf => {
+        Payload::CustomSection(reader) => {
             retain_debug_section(m, &reader, keep_offsets, keep_dwarf);
         }
         _ => {}
@@ -139,6 +139,8 @@ fn parse_tables(m: &mut ModuleInner, reader: wasmparser::TableSectionReader<'_>)
 }
 
 /// Retains the `name`/`.debug_*` custom sections for backtraces, per the keep flags (#29a/#29c).
+/// The `name` section is always read so the module subsection survives `wasm_backtrace(false)`;
+/// `keep_offsets` still gates the function names inside it.
 fn retain_debug_section(
     m: &mut ModuleInner,
     reader: &wasmparser::CustomSectionReader<'_>,
@@ -146,9 +148,9 @@ fn retain_debug_section(
     keep_dwarf: bool,
 ) {
     let name = reader.name();
-    if keep_offsets && name == "name" {
+    if name == "name" {
         m.debug
-            .add_name_section(reader.data(), reader.data_offset());
+            .add_name_section(reader.data(), reader.data_offset(), keep_offsets);
     } else if keep_dwarf && name.starts_with(".debug") {
         m.debug.add_dwarf_section(name, reader.data());
     }

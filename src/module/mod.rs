@@ -221,6 +221,12 @@ impl Module {
             .map(|e| self.0.export_extern_type(e.kind))
     }
 
+    /// The module's name from the `name` custom section's module subsection, if present.
+    /// Mirrors `wasmtime::Module::name`.
+    pub fn name(&self) -> Option<&str> {
+        self.0.debug.module_name()
+    }
+
     /// Internal access to the compiled representation (for instantiation/exec).
     pub(crate) fn inner(&self) -> &ModuleInner {
         &self.0

@@ -41,6 +41,8 @@ pub(crate) struct DebugSections {
     dwarf: HashMap<String, Box<[u8]>>,
     /// Function index → name, from the `name` custom section.
     func_names: HashMap<u32, Box<str>>,
+    /// The module-name subsection of the `name` custom section, if present.
+    module_name: Option<Box<str>>,
     /// Module-relative byte offset of the code section body; DWARF code addresses are measured
     /// from here (see [`lookup`](Self::lookup)).
     code_base: u32,
@@ -66,17 +68,25 @@ impl DebugSections {
             .insert(name.to_string(), data.to_vec().into_boxed_slice());
     }
 
-    /// Eagerly parses the `name` custom section's function-name subsection. Malformed entries are
-    /// skipped (never fatal) — names are a best-effort symbolication aid.
-    pub(crate) fn add_name_section(&mut self, data: &[u8], offset: usize) {
+    /// Eagerly parses the `name` custom section. Malformed entries are skipped (never fatal) —
+    /// names are a best-effort symbolication aid.
+    ///
+    /// The module subsection is retained unconditionally, while function names honour
+    /// `keep_func_names` (`Config::wasm_backtrace`). The module name is module identity, not
+    /// backtrace detail: embedders key on it, so a backtrace knob must not silently erase it.
+    /// One `Option<Box<str>>` regardless of module size.
+    pub(crate) fn add_name_section(&mut self, data: &[u8], offset: usize, keep_func_names: bool) {
         let reader = NameSectionReader::new(BinaryReader::new(data, offset));
         for sub in reader {
-            let Ok(Name::Function(map)) = sub else {
-                continue;
-            };
-            for naming in map {
-                let Ok(naming) = naming else { break };
-                self.func_names.insert(naming.index, naming.name.into());
+            match sub {
+                Ok(Name::Module { name, .. }) => self.module_name = Some(name.into()),
+                Ok(Name::Function(map)) if keep_func_names => {
+                    for naming in map {
+                        let Ok(naming) = naming else { break };
+                        self.func_names.insert(naming.index, naming.name.into());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -84,6 +94,11 @@ impl DebugSections {
     /// The name of the function at `func_index`, from the `name` section, if present.
     pub(crate) fn func_name(&self, func_index: u32) -> Option<&str> {
         self.func_names.get(&func_index).map(|s| &**s)
+    }
+
+    /// The module's own name, from the `name` section's module subsection, if present.
+    pub(crate) fn module_name(&self) -> Option<&str> {
+        self.module_name.as_deref()
     }
 
     /// The name of the subprogram covering an absolute (module-relative) `code_offset`, from DWARF.
