@@ -10,6 +10,7 @@ use pollster::block_on;
 
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::func::{Caller, Func};
 use crate::instance::Instance;
 use crate::module::Module;
 use crate::store::{Store, UpdateDeadline};
@@ -42,6 +43,15 @@ const LOOP_MODULE: &str = "(module (func (export \"run\") (param i32) (result i3
         local.get 0 i32.const 1 i32.sub local.set 0
         br $l))
     i32.const 42))";
+
+/// Calls the imported `host` once per iteration, counting down from the parameter.
+const CALLS_HOST_MODULE: &str = "(module (import \"\" \"host\" (func $host))
+    (func (export \"run\") (param i32)
+        (block $b (loop $l
+            local.get 0 i32.eqz br_if $b
+            call $host
+            local.get 0 i32.const 1 i32.sub local.set 0
+            br $l))))";
 
 fn epoch_async_engine() -> Engine {
     let mut config = Config::new();
@@ -146,4 +156,25 @@ fn fuel_async_yield_interval_guards() {
     let sync = Engine::new(&cfg).unwrap();
     let mut store = Store::new(&sync, ());
     assert!(store.fuel_async_yield_interval(Some(10)).is_err());
+}
+
+#[test]
+fn caller_set_fuel_refuels_under_yield_interval() {
+    let engine = fuel_async_engine();
+    let m = module(&engine, CALLS_HOST_MODULE);
+    let mut store = Store::new(&engine, ());
+    // Far less than the loop needs without refuels.
+    store.set_fuel(20).unwrap();
+    // A slice smaller than one iteration's cost, so every refilled slice runs dry.
+    store.fuel_async_yield_interval(Some(3)).unwrap();
+    let host = Func::wrap(&mut store, |mut c: Caller<'_, ()>| c.set_fuel(30));
+    let inst = block_on(Instance::new_async(&mut store, &m, &[host.into()])).unwrap();
+    let run = inst.get_func(&mut store, "run").unwrap();
+    let (res, pendings) = drive(run.call_async(&mut store, &[Val::I32(1_000)], &mut []));
+    res.unwrap();
+    // Each refill re-splits into a 3-unit slice + reserve, so the run keeps yielding.
+    assert!(
+        pendings >= 1_000,
+        "expected a yield per refilled slice, got {pendings}"
+    );
 }

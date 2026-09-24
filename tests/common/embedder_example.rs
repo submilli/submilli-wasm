@@ -50,6 +50,15 @@ fn typed_host_fns(store: &mut Store<HostState>) {
         },
     );
 
+    // Host fn metering the guest: tops fuel back up mid-call.
+    let _refuel = Func::wrap(
+        &mut *store,
+        |mut caller: Caller<'_, HostState>| -> Result<()> {
+            let left = caller.get_fuel()?;
+            caller.set_fuel(left.max(1_000))
+        },
+    );
+
     // Host fn reading guest memory through the caller (the canonical pattern).
     let _peek = Func::wrap(
         &mut *store,
