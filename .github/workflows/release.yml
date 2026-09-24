@@ -1,5 +1,7 @@
 # Publishes to crates.io when a version tag is pushed:
 #   git tag v0.1.0 && git push origin v0.1.0
+# or manually (Actions → Release → Run workflow, or `gh workflow run release.yml`)
+# from `main` or a version tag; a manual run from `main` publishes Cargo.toml's version.
 # Needs the CARGO_REGISTRY_TOKEN repo secret (crates.io API token with
 # publish-new + publish-update scopes). docs.rs builds automatically after.
 name: Release
@@ -7,6 +9,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,8 +26,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Tag matches crate version
+      - name: Ref is a version tag matching the crate, or main
         run: |
+          if [ "${GITHUB_REF_TYPE}" = "branch" ]; then
+            if [ "${GITHUB_REF_NAME}" != "main" ]; then
+              echo "manual releases must run from main or a version tag, not ${GITHUB_REF_NAME}" >&2
+              exit 1
+            fi
+            exit 0
+          fi
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "submilli-wasm") | .version')
           if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
