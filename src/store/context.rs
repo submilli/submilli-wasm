@@ -71,6 +71,15 @@ impl<'a, T: 'static> StoreContextMut<'a, T> {
         self.0.get_fuel()
     }
 
+    pub fn set_fuel(&mut self, fuel: u64) -> Result<()> {
+        self.0.set_fuel(fuel)
+    }
+
+    #[cfg(feature = "async")]
+    pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
+        self.0.fuel_async_yield_interval(interval)
+    }
+
     /// Throws `exception` from a host function (see [`Store::throw`](crate::Store::throw)).
     pub fn throw<R>(
         &mut self,

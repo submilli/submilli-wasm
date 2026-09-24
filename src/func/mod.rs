@@ -305,6 +305,19 @@ impl<T: 'static> Caller<'_, T> {
     pub fn engine(&self) -> &Engine {
         self.store.engine()
     }
+
+    pub fn get_fuel(&self) -> Result<u64> {
+        self.store.get_fuel()
+    }
+
+    pub fn set_fuel(&mut self, fuel: u64) -> Result<()> {
+        self.store.set_fuel(fuel)
+    }
+
+    #[cfg(feature = "async")]
+    pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
+        self.store.fuel_async_yield_interval(interval)
+    }
 }
 
 impl<T: 'static> AsContext for Caller<'_, T> {

@@ -282,7 +282,7 @@ fn unbounded_recursion_traps_stack_overflow() {
 
 // --- fuel metering ---
 
-use crate::Config;
+use crate::{Caller, Config, Func};
 
 /// `count(n)` loops n times and returns n; each iteration runs a fixed op count.
 const COUNTER: &str = "(module (func (export \"count\") (param i32) (result i32)
@@ -335,6 +335,41 @@ fn fuel_exhaustion_traps() {
     let inst = Instance::new(&mut store, &m, &[]).unwrap();
     let r = call(&mut store, inst, "count", vec![Val::I32(1_000_000)]);
     assert_eq!(trap_of(r), Trap::OutOfFuel);
+}
+
+/// `run(n)` calls the imported `host` n times in a loop.
+const CALLS_HOST: &str = "(module (import \"\" \"host\" (func $host))
+    (func (export \"run\") (param i32)
+        (block $b (loop $l
+            local.get 0 i32.eqz br_if $b
+            call $host
+            local.get 0 i32.const 1 i32.sub local.set 0
+            br $l))))";
+
+/// Instantiates [`CALLS_HOST`] with `host` as its import and runs it for `n` iterations.
+fn run_with_host(
+    engine: &Engine,
+    fuel: u64,
+    host: impl Fn(Caller<'_, ()>) -> Result<()> + Send + Sync + 'static,
+    n: i32,
+) -> Result<Vec<Val>> {
+    let m = module(engine, CALLS_HOST);
+    let mut store = Store::new(engine, ());
+    store.set_fuel(fuel).unwrap();
+    let f = Func::wrap(&mut store, host);
+    let inst = Instance::new(&mut store, &m, &[Extern::Func(f)]).unwrap();
+    call(&mut store, inst, "run", vec![Val::I32(n)])
+}
+
+// Guards the run loop against caching fuel across a host call (only CI-run coverage; the
+// async variant needs `--features async`).
+#[test]
+fn caller_set_fuel_refuels_mid_call() {
+    let engine = fuel_engine();
+    // 50 units can't cover 1000 iterations; topping up on every host call can.
+    let starve = run_with_host(&engine, 50, |_| Ok(()), 1_000);
+    assert_eq!(trap_of(starve), Trap::OutOfFuel);
+    run_with_host(&engine, 50, |mut c| c.set_fuel(50), 1_000).unwrap();
 }
 
 // --- epoch interruption ---
