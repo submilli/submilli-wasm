@@ -1,0 +1,11 @@
+(module
+    (memory (export "memory") i64 1)
+    (table (export "table") i64 1 funcref)
+    (func (export "grow_memory") (result i64)
+        i64.const 4294967296 memory.grow)
+    (func (export "grow_table") (result i64)
+        ref.null func i64.const 4294967296 table.grow)
+    (func (export "get")
+        i64.const 4294967296 table.get drop)
+    (func (export "set")
+        i64.const 4294967296 ref.null func table.set))

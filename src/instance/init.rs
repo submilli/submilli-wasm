@@ -323,7 +323,7 @@ fn apply_active_elems(
     };
     for (seg, refs) in module.inner().elems.iter().zip(evaluated) {
         if let ElemMode::Active { table, offset } = &seg.mode {
-            let dst = const_to_usize(eval_const(inner, &ctx, offset)?)?;
+            let dst = const_to_usize(eval_const(inner, &ctx, offset)?, Trap::TableOutOfBounds)?;
             apply_active_elem(inner, tables[*table as usize], dst, refs)?;
         }
     }
@@ -363,7 +363,7 @@ fn init_datas(
             funcs: &[],
             globals,
         };
-        let dst = const_to_usize(eval_const(inner, &ctx, offset)?)?;
+        let dst = const_to_usize(eval_const(inner, &ctx, offset)?, Trap::MemoryOutOfBounds)?;
         let mem = memories[*memory as usize];
         let len = seg.bytes.len();
         let mem_len = inner.memory(mem).bytes.len();
@@ -376,10 +376,10 @@ fn init_datas(
     Ok(())
 }
 
-fn const_to_usize(v: Val) -> Result<usize> {
+fn const_to_usize(v: Val, overflow: Trap) -> Result<usize> {
     match v {
         Val::I32(x) => Ok(x as u32 as usize),
-        Val::I64(x) => Ok(x as u64 as usize),
+        Val::I64(x) => usize::try_from(x as u64).map_err(|_| overflow.into()),
         _ => Err(Error::msg("segment offset is not an integer")),
     }
 }

@@ -8,6 +8,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  wasm32:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["", "--all-features"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/wasm32 -> ../../target/wasm32-smoke
+      - name: Build interpreter and smoke tests for Wasm
+        run: >-
+          cargo build --locked --manifest-path tests/wasm32/Cargo.toml
+          --target wasm32-unknown-unknown --target-dir target/wasm32-smoke
+          ${{ matrix.features }}
+      - name: Run interpreter inside Wasm
+        run: node tests/wasm32/run.mjs target/wasm32-smoke/wasm32-unknown-unknown/debug/wasm32-smoke.wasm
+
   ci:
     runs-on: ubuntu-latest
     steps:

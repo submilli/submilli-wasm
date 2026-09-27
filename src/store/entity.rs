@@ -175,7 +175,8 @@ impl MemoryEntity {
     /// are forbidden and already blocked by the crate's zero-`unsafe` invariant. The same holds for
     /// `grow` below and `TableEntity::new`/`grow`. See `SECURITY.md` (#36) for the full statement.
     pub(crate) fn new(ty: MemoryType) -> Result<Self> {
-        let len = (ty.minimum() as usize)
+        let len = usize::try_from(ty.minimum())
+            .map_err(|_| alloc_err())?
             .checked_mul(PAGE_SIZE)
             .ok_or_else(alloc_err)?;
         let mut bytes = Vec::new();
@@ -204,7 +205,7 @@ impl MemoryEntity {
         if new > max {
             return None;
         }
-        let new_bytes = (new as usize).checked_mul(PAGE_SIZE)?;
+        let new_bytes = usize::try_from(new).ok()?.checked_mul(PAGE_SIZE)?;
         self.bytes
             .try_reserve_exact(new_bytes.saturating_sub(self.bytes.len()))
             .ok()?;
@@ -217,7 +218,7 @@ impl TableEntity {
     /// Allocates the initial backing store (every slot the typed `init` ref). Fallible like
     /// [`MemoryEntity::new`] so an over-large declared *initial* size errors rather than aborting.
     pub(crate) fn new(ty: TableType, init: Ref) -> Result<Self> {
-        let len = ty.minimum() as usize;
+        let len = usize::try_from(ty.minimum()).map_err(|_| alloc_err())?;
         let mut elems = Vec::new();
         elems.try_reserve_exact(len).map_err(|_| alloc_err())?;
         elems.resize(len, init);
@@ -229,11 +230,14 @@ impl TableEntity {
     }
 
     pub(crate) fn get(&self, index: u64) -> Option<Ref> {
-        self.elems.get(index as usize).cloned()
+        self.elems.get(usize::try_from(index).ok()?).cloned()
     }
 
     pub(crate) fn set(&mut self, index: u64, val: Ref) -> bool {
-        match self.elems.get_mut(index as usize) {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        match self.elems.get_mut(index) {
             Some(slot) => {
                 *slot = val;
                 true
@@ -258,8 +262,9 @@ impl TableEntity {
         if new > max {
             return None;
         }
-        self.elems.try_reserve_exact(delta as usize).ok()?;
-        self.elems.resize(new as usize, init);
+        let new = usize::try_from(new).ok()?;
+        self.elems.try_reserve_exact(new - self.elems.len()).ok()?;
+        self.elems.resize(new, init);
         Some(old)
     }
 

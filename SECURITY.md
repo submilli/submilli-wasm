@@ -76,6 +76,10 @@ the call boundary (`catch_unwind` → restore store state → re-raise, matching
 shared type-registry lock is poison-recovering, so one tenant's host-fn panic cannot poison the shared
 engine or other tenants. Tested by `tests/panic_safety.rs`.
 
+This containment requires unwinding. With `panic=abort` (the default for
+`wasm32-unknown-unknown`), a host-function panic aborts the outer Wasm execution;
+host functions must return errors instead of panicking. Guest traps remain normal `Result` errors.
+
 ### Store isolation — cross-store handle misuse is caught
 A handle (`Func`/`Memory`/`Global`/`Table`/`Tag`/`Instance`) minted by store A and used against store B is
 detected and faults, rather than silently resolving to the wrong entity. This is never UB (it was already

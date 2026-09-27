@@ -12,9 +12,13 @@ use crate::{Error, Result};
 
 /// Wasm pages → bytes (the limiter works in bytes for memory). Saturating so a hostile `memory64`
 /// page count (up to 2^48) can't overflow-panic the limiter check — a saturated `usize::MAX` simply
-/// exceeds any finite limit/ceiling and is denied.
+/// reports an unrepresentable request without truncating it. Backing allocations check it again.
 fn bytes(pages: u64) -> usize {
-    (pages as usize).saturating_mul(PAGE_SIZE)
+    host_count(pages).saturating_mul(PAGE_SIZE)
+}
+
+fn host_count(count: u64) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX)
 }
 
 impl<T: 'static> Store<T> {
@@ -106,9 +110,9 @@ impl<T: 'static> Store<T> {
     ) -> Result<Option<u64>> {
         let (current, max) = {
             let e = self.inner.table(handle);
-            (e.size() as usize, e.ty.maximum().map(|m| m as usize))
+            (e.size() as usize, e.ty.maximum().map(host_count))
         };
-        let desired = current.saturating_add(delta as usize);
+        let desired = current.saturating_add(host_count(delta));
         let allowed = self
             .with_sync_limiter(|l| l.table_growing(current, desired, max))?
             .transpose()?
@@ -223,9 +227,9 @@ impl<T: 'static> Store<T> {
     /// table at instantiation). With no limiter, the finite default ceiling is the bound.
     pub(crate) fn limiter_allows_table(&mut self, initial: u64, max: Option<u64>) -> Result<bool> {
         Ok(self
-            .with_sync_limiter(|l| l.table_growing(0, initial as usize, max.map(|m| m as usize)))?
+            .with_sync_limiter(|l| l.table_growing(0, host_count(initial), max.map(host_count)))?
             .transpose()?
-            .unwrap_or(initial as usize <= DEFAULT_TABLE_CEILING_ELEMS))
+            .unwrap_or(host_count(initial) <= DEFAULT_TABLE_CEILING_ELEMS))
     }
 }
 
@@ -310,7 +314,7 @@ impl<T: 'static> Store<T> {
         initial: u64,
         max: Option<u64>,
     ) -> Result<bool> {
-        self.table_growing_async(0, initial as usize, max.map(|m| m as usize))
+        self.table_growing_async(0, host_count(initial), max.map(host_count))
             .await
     }
 
@@ -323,9 +327,9 @@ impl<T: 'static> Store<T> {
     ) -> Result<Option<u64>> {
         let (current, max) = {
             let e = self.inner.table(handle);
-            (e.size() as usize, e.ty.maximum().map(|m| m as usize))
+            (e.size() as usize, e.ty.maximum().map(host_count))
         };
-        let desired = current.saturating_add(delta as usize);
+        let desired = current.saturating_add(host_count(delta));
         let allowed = self.table_growing_async(current, desired, max).await?;
         if allowed {
             if let Some(old) = self.inner.table_mut(handle).grow(delta, init) {

@@ -1,0 +1,16 @@
+[package]
+name = "wasm32-smoke"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Keep native-only reference engines from the root's dev-dependencies out of this build.
+[workspace]
+
+[features]
+async = ["submilli-wasm/async"]
+simd = ["submilli-wasm/simd"]
+
+[dependencies]
+submilli-wasm = { path = "../.." }
+wat = "1"
