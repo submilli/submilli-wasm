@@ -189,11 +189,19 @@ fn array_write_i8_and_i16() {
     assert_eq!(units.get(&store, 2).unwrap().unwrap_i32(), 0xFFFF);
     assert!(units.write_i16(&mut store, 2, &[0, 0]).is_err());
     assert!(units.write_i8(&mut store, 0, &[0]).is_err());
+    // An empty write is allowed at the end, not past it.
+    units.write_i16(&mut store, 3, &[]).unwrap();
+    assert!(units.write_i16(&mut store, 4, &[]).is_err());
+    assert!(bytes.write_i8(&mut store, 6, &[]).is_err());
 
     let const_ty = ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I8));
     let const_pre = ArrayRefPre::new(&mut store, const_ty);
     let frozen = ArrayRef::new_from_i8_slice(&mut store, &const_pre, &[1]).unwrap();
     assert!(frozen.write_i8(&mut store, 0, &[2]).is_err());
+    let const_i16_ty = ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I16));
+    let const_i16_pre = ArrayRefPre::new(&mut store, const_i16_ty);
+    let frozen_units = ArrayRef::new_from_i16_slice(&mut store, &const_i16_pre, &[1]).unwrap();
+    assert!(frozen_units.write_i16(&mut store, 0, &[2]).is_err());
 }
 
 #[test]

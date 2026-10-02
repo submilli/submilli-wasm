@@ -2,6 +2,8 @@
 //! [`gc_ref`](super::gc_ref); the core handle types (`Rooted`,
 //! `AnyRef`) and the shared heap-slot helpers live there.
 
+use core::ops::Range;
+
 use crate::canon::{Layout, RefKind};
 use crate::store::{
     anyref_handle_slot, read_slot, slot_accepts, write_slot, AsContext, AsContextMut, GcObject,
@@ -206,23 +208,27 @@ impl ArrayRef {
     /// This bypasses the transient `Val` slice used by [`ArrayRef::new_fixed`]
     /// and copies the packed element body directly.
     pub fn new_from_i8_slice(
-        store: impl AsContextMut,
+        mut store: impl AsContextMut,
         allocator: &ArrayRefPre,
         elems: &[u8],
     ) -> Result<Rooted<ArrayRef>> {
-        Self::validate_packed_allocator(allocator, StorageType::I8)?;
-        Self::alloc_packed(store, allocator, elems.to_vec())
+        let mut ctx = store.as_context_mut();
+        let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I8, elems.len())?;
+        ctx.0.gc_reserve_host(charge)?;
+        Self::finish_packed(ctx.inner_mut(), allocator, elems.to_vec())
     }
 
     /// Async sibling of [`ArrayRef::new_from_i8_slice`].
     #[cfg(feature = "async")]
     pub async fn new_from_i8_slice_async<T: 'static>(
-        store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data = T>,
         allocator: &ArrayRefPre,
         elems: &[u8],
     ) -> Result<Rooted<ArrayRef>> {
-        Self::validate_packed_allocator(allocator, StorageType::I8)?;
-        Self::alloc_packed_async(store, allocator, elems.to_vec()).await
+        let mut ctx = store.as_context_mut();
+        let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I8, elems.len())?;
+        ctx.store_mut().gc_reserve_host_async(charge).await?;
+        Self::finish_packed(ctx.inner_mut(), allocator, elems.to_vec())
     }
 
     /// Allocates an `i16` array initialized from the given 16-bit units.
@@ -230,65 +236,48 @@ impl ArrayRef {
     /// Like [`ArrayRef::new_from_i8_slice`], this packs the element body directly instead of
     /// going through a transient `Val` per element.
     pub fn new_from_i16_slice(
-        store: impl AsContextMut,
+        mut store: impl AsContextMut,
         allocator: &ArrayRefPre,
         elems: &[u16],
     ) -> Result<Rooted<ArrayRef>> {
-        Self::validate_packed_allocator(allocator, StorageType::I16)?;
-        Self::alloc_packed(store, allocator, i16_body(elems))
+        let mut ctx = store.as_context_mut();
+        let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I16, elems.len())?;
+        ctx.0.gc_reserve_host(charge)?;
+        Self::finish_packed(ctx.inner_mut(), allocator, i16_body(elems))
     }
 
     /// Async sibling of [`ArrayRef::new_from_i16_slice`].
     #[cfg(feature = "async")]
     pub async fn new_from_i16_slice_async<T: 'static>(
-        store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data = T>,
         allocator: &ArrayRefPre,
         elems: &[u16],
     ) -> Result<Rooted<ArrayRef>> {
-        Self::validate_packed_allocator(allocator, StorageType::I16)?;
-        Self::alloc_packed_async(store, allocator, i16_body(elems)).await
+        let mut ctx = store.as_context_mut();
+        let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I16, elems.len())?;
+        ctx.store_mut().gc_reserve_host_async(charge).await?;
+        Self::finish_packed(ctx.inner_mut(), allocator, i16_body(elems))
     }
 
-    fn validate_packed_allocator(allocator: &ArrayRefPre, expected: StorageType) -> Result<()> {
+    /// The limiter charge for a packed array of `count` elements, after checking the allocator's
+    /// element type is `expected` and the count fits an array length. Callers reserve it before
+    /// building the body, so an oversized slice traps before the host copies it.
+    fn packed_charge(
+        inner: &StoreInner,
+        allocator: &ArrayRefPre,
+        expected: StorageType,
+        count: usize,
+    ) -> Result<usize> {
         if allocator.ty.element_type() != expected {
             return Err(Error::msg(format!(
                 "element type mismatch: cannot initialize a non-{expected:?} array from a slice"
             )));
         }
-        Ok(())
-    }
-
-    /// Allocates an array whose packed element body is `body` (already laid out for the type).
-    fn alloc_packed(
-        mut store: impl AsContextMut,
-        allocator: &ArrayRefPre,
-        body: Vec<u8>,
-    ) -> Result<Rooted<ArrayRef>> {
-        let byte_len = Self::packed_body_len(allocator, &body)?;
-        let mut ctx = store.as_context_mut();
-        let charge = ctx.inner().gc_object_charge(byte_len);
-        ctx.0.gc_reserve_host(charge)?;
-        Self::finish_packed(ctx.inner_mut(), allocator, body)
-    }
-
-    #[cfg(feature = "async")]
-    async fn alloc_packed_async<T: 'static>(
-        mut store: impl AsContextMut<Data = T>,
-        allocator: &ArrayRefPre,
-        body: Vec<u8>,
-    ) -> Result<Rooted<ArrayRef>> {
-        let byte_len = Self::packed_body_len(allocator, &body)?;
-        let mut ctx = store.as_context_mut();
-        let charge = ctx.inner().gc_object_charge(byte_len);
-        ctx.store_mut().gc_reserve_host_async(charge).await?;
-        Self::finish_packed(ctx.inner_mut(), allocator, body)
-    }
-
-    /// The body's byte length, after checking its element count fits the `u32` array length.
-    fn packed_body_len(allocator: &ArrayRefPre, body: &[u8]) -> Result<usize> {
-        let count = body.len() / allocator.layout.stride().max(1);
         u32::try_from(count).map_err(|_| Error::msg("array too large"))?;
-        Ok(body.len())
+        let byte_len = count
+            .checked_mul(allocator.layout.stride())
+            .ok_or_else(|| Error::msg("array too large"))?;
+        Ok(inner.gc_object_charge(byte_len))
     }
 
     fn finish_packed(
@@ -456,13 +445,7 @@ impl Rooted<ArrayRef> {
             return Err(Error::msg("array element is not mutable"));
         }
         let stride = Layout::for_array(&field_ty).stride();
-        let range = usize::try_from(offset)
-            .ok()
-            .and_then(|offset| {
-                let start = offset.checked_mul(stride)?;
-                let end = count.checked_mul(stride)?.checked_add(start)?;
-                Some(start..end)
-            })
+        let range = element_byte_range(offset, count, stride)
             .ok_or_else(|| Error::msg("array write range overflows"))?;
         let obj = inner
             .gc_object_mut(slot)
@@ -513,4 +496,12 @@ impl From<Rooted<ArrayRef>> for Rooted<AnyRef> {
 /// Lays out 16-bit units as a packed `i16` array body (little-endian, matching `write_slot`).
 fn i16_body(elems: &[u16]) -> Vec<u8> {
     elems.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
+
+/// The byte range of elements `offset..offset + count` in a body with `stride`-byte elements, or
+/// `None` if it overflows.
+fn element_byte_range(offset: u32, count: usize, stride: usize) -> Option<Range<usize>> {
+    let start = usize::try_from(offset).ok()?.checked_mul(stride)?;
+    let end = count.checked_mul(stride)?.checked_add(start)?;
+    Some(start..end)
 }
