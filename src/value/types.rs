@@ -182,11 +182,17 @@ impl FuncType {
     }
 
     pub fn params(&self) -> impl ExactSizeIterator<Item = ValType> {
-        self.engine.func_sig(self.id).0.into_iter()
+        self.signature().0.into_iter()
     }
 
     pub fn results(&self) -> impl ExactSizeIterator<Item = ValType> {
-        self.engine.func_sig(self.id).1.into_iter()
+        self.signature().1.into_iter()
+    }
+
+    // This handle holds a reference on its type, so the lookup cannot miss while it lives; the
+    // `wasmtime` signatures above have no error to report one with.
+    fn signature(&self) -> (Vec<ValType>, Vec<ValType>) {
+        self.engine.func_sig(self.id).unwrap_or_default()
     }
 }
 

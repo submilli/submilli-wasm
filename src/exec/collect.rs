@@ -12,7 +12,6 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::{Execution, StepOutcome};
-use crate::canon::Layout;
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::StoreInner;
@@ -80,17 +79,16 @@ impl Execution {
     ) -> Result<Option<usize>> {
         let module = inner.instance(instance).module.clone();
         let data_len = match op {
-            Op::StructNew(ty) | Op::StructNewDefault(ty) => match module.inner().layout(*ty) {
-                Layout::Struct { size, .. } => *size,
-                Layout::Array { .. } => unreachable!("struct.new on an array type"),
-            },
+            Op::StructNew(ty) | Op::StructNewDefault(ty) => {
+                module.inner().struct_layout(*ty)?.size()
+            }
             Op::ArrayNew(ty) | Op::ArrayNewDefault(ty) => {
-                let stride = module.inner().layout(*ty).stride();
+                let stride = module.inner().array_layout(*ty)?.stride();
                 array_bytes(self.peek_count(), stride)?
             }
-            Op::ArrayNewFixed { ty, n } => module.inner().layout(*ty).body_size(*n as usize),
+            Op::ArrayNewFixed { ty, n } => module.inner().array_layout(*ty)?.body_size(*n as usize),
             Op::ArrayNewData { ty, data } => {
-                let stride = module.inner().layout(*ty).stride();
+                let stride = module.inner().array_layout(*ty)?.stride();
                 let dropped = inner.instance(instance).dropped_data[*data as usize];
                 let seg = if dropped {
                     0
@@ -100,7 +98,7 @@ impl Execution {
                 seg_clamped_charge(self.peek_count(), stride, seg)
             }
             Op::ArrayNewElem { ty, elem } => {
-                let stride = module.inner().layout(*ty).stride();
+                let stride = module.inner().array_layout(*ty)?.stride();
                 let seg = inner.instance(instance).elems[*elem as usize]
                     .len()
                     .saturating_mul(stride);

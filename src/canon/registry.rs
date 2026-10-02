@@ -191,8 +191,9 @@ impl TypeRegistry {
             .map(|t| t.kind)
     }
 
-    pub(crate) fn finality(&self, id: CanonicalTypeId) -> Finality {
-        self.types[id.index()].as_ref().expect("live type").finality
+    /// `None` if `id` is not a live type.
+    pub(crate) fn finality(&self, id: CanonicalTypeId) -> Option<Finality> {
+        Some(self.types.get(id.index())?.as_ref()?.finality)
     }
 
     /// Number of currently-registered (live) rec groups — for leak/reclamation tests.
@@ -202,30 +203,34 @@ impl TypeRegistry {
 
     /// Clones a func type's canonical (params, results) under the lock — phase 1 of materialization
     /// (the handle-building phase 2 runs lock-free, see the free `func_sig`).
-    pub(super) fn func_body_raw(&self, id: CanonicalTypeId) -> (Vec<CVal>, Vec<CVal>) {
-        match &self.types[id.index()].as_ref().expect("live type").body {
-            CBody::Func(p, r) => (p.clone(), r.clone()),
-            _ => (Vec::new(), Vec::new()),
+    /// `None` if `id` is not a live func type.
+    pub(super) fn func_body_raw(&self, id: CanonicalTypeId) -> Option<(Vec<CVal>, Vec<CVal>)> {
+        match self.body(id)? {
+            CBody::Func(p, r) => Some((p.clone(), r.clone())),
+            _ => None,
         }
     }
 
     /// Clones a struct type's canonical fields under the lock (phase 1).
-    pub(super) fn struct_fields_raw(&self, id: CanonicalTypeId) -> Vec<CField> {
-        match &self.types[id.index()].as_ref().expect("live type").body {
-            CBody::Struct(fields) => fields.clone(),
-            _ => Vec::new(),
+    /// `None` if `id` is not a live struct type.
+    pub(super) fn struct_fields_raw(&self, id: CanonicalTypeId) -> Option<Vec<CField>> {
+        match self.body(id)? {
+            CBody::Struct(fields) => Some(fields.clone()),
+            _ => None,
         }
     }
 
     /// Clones an array type's canonical element under the lock (phase 1).
-    pub(super) fn array_field_raw(&self, id: CanonicalTypeId) -> CField {
-        match &self.types[id.index()].as_ref().expect("live type").body {
-            CBody::Array(f) => f.clone(),
-            _ => CField {
-                mutable: false,
-                storage: CStore::Packed(0),
-            },
+    /// `None` if `id` is not a live array type.
+    pub(super) fn array_field_raw(&self, id: CanonicalTypeId) -> Option<CField> {
+        match self.body(id)? {
+            CBody::Array(f) => Some(f.clone()),
+            _ => None,
         }
+    }
+
+    fn body(&self, id: CanonicalTypeId) -> Option<&CBody> {
+        Some(&self.types.get(id.index())?.as_ref()?.body)
     }
 
     // --- interning internals ---
@@ -309,14 +314,21 @@ impl TypeRegistry {
 
     /// Adds a registration to the group owning `id` (a handle was cloned / materialized).
     pub(crate) fn incref_type(&mut self, id: CanonicalTypeId) {
-        let g = self.type_to_group[id.index()].expect("live type");
-        self.incref_group(g);
+        if let Some(g) = self.group_of(id) {
+            self.incref_group(g);
+        }
     }
 
     /// Removes a registration from the group owning `id` (a handle was dropped).
     pub(crate) fn decref_type(&mut self, id: CanonicalTypeId) {
-        let g = self.type_to_group[id.index()].expect("live type");
-        self.decref_group(g);
+        if let Some(g) = self.group_of(id) {
+            self.decref_group(g);
+        }
+    }
+
+    /// The group owning `id`, or `None` if `id` is not a live type.
+    fn group_of(&self, id: CanonicalTypeId) -> Option<GroupId> {
+        *self.type_to_group.get(id.index())?
     }
 
     fn build_key(

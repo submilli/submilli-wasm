@@ -97,11 +97,16 @@ impl StructType {
     }
 
     pub fn field(&self, i: usize) -> Option<FieldType> {
-        self.engine.struct_fields(self.id).into_iter().nth(i)
+        self.fields().nth(i)
     }
 
+    // This handle holds a reference on its type, so the lookup cannot miss while it lives; the
+    // `wasmtime` signature has no error to report one with.
     pub fn fields(&self) -> impl ExactSizeIterator<Item = FieldType> {
-        self.engine.struct_fields(self.id).into_iter()
+        self.engine
+            .struct_fields(self.id)
+            .unwrap_or_default()
+            .into_iter()
     }
 }
 
@@ -151,12 +156,16 @@ impl ArrayType {
         &self.engine
     }
 
+    // This handle holds a reference on its type, so the lookup cannot miss while it lives; the
+    // `wasmtime` signature has no error to report one with.
     pub fn field_type(&self) -> FieldType {
-        self.engine.array_field(self.id)
+        self.engine
+            .array_field(self.id)
+            .unwrap_or_else(|_| FieldType::new(Mutability::Const, StorageType::I8))
     }
 
     pub fn element_type(&self) -> StorageType {
-        self.engine.array_field(self.id).element_type().clone()
+        self.field_type().element_type().clone()
     }
 }
 

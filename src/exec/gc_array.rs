@@ -16,7 +16,7 @@
 
 use super::gc::anyref_slot;
 use super::Execution;
-use crate::canon::{CanonicalTypeId, Layout, Slot};
+use crate::canon::{ArrayLayout, CanonicalTypeId, Layout, Slot};
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::{
@@ -64,19 +64,19 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
-        let stride = module.inner().layout(ty).stride();
+        let layout = module.inner().array_layout(ty)?;
         let count = self.pop_i32() as u32 as usize;
         // `byte_len` (count Ã stride) was already bounded by `gc_reserve` before this op ran
         // (limiter or abort cap), so a too-large array has already trapped â no abort-cap re-check
         // here, which would otherwise cap a limiter-approved large array.
-        let byte_len = elem_bytes(count, stride)?;
+        let byte_len = elem_bytes(count, layout.stride())?;
         let mut data = vec![0u8; byte_len];
         let fill = if default {
-            default_for_slot(module.inner().layout(ty).elem_at(0))
+            default_for_slot(layout.elem_at(0))
         } else {
-            self.pop_val_for(module.inner().layout(ty).elem_at(0))
+            self.pop_val_for(layout.elem_at(0))
         };
-        write_each(module.inner().layout(ty), &mut data, count, fill);
+        write_each(layout, &mut data, count, fill);
         self.alloc_array(inner, type_id, data)
     }
 
@@ -89,7 +89,7 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
-        let layout = module.inner().layout(ty);
+        let layout = module.inner().array_layout(ty)?;
         let count = n as usize;
         let mut data = vec![0u8; layout.body_size(count)];
         for i in (0..count).rev() {
@@ -108,7 +108,7 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
-        let stride = module.inner().layout(ty).stride();
+        let stride = module.inner().array_layout(ty)?.stride();
         let count = self.pop_i32() as u32 as usize;
         let offset = self.pop_i32() as u32 as usize;
         let byte_len = elem_bytes(count, stride)?;
@@ -131,7 +131,7 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
-        let layout = module.inner().layout(ty);
+        let layout = module.inner().array_layout(ty)?;
         let count = self.pop_i32() as u32 as usize;
         let offset = self.pop_i32() as u32 as usize;
         let refs = self.segment_refs(inner, instance, elem);
@@ -152,7 +152,7 @@ impl Execution {
         ext: Option<bool>,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let layout = module.inner().layout(ty);
+        let layout = module.inner().array_layout(ty)?;
         let idx = self.pop_i32() as u32 as usize;
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
@@ -167,7 +167,7 @@ impl Execution {
 
     fn array_set(&mut self, inner: &mut StoreInner, instance: Instance, ty: u32) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let layout = module.inner().layout(ty);
+        let layout = module.inner().array_layout(ty)?;
         let v = self.pop_val_for(layout.elem_at(0));
         let idx = self.pop_i32() as u32 as usize;
         let r = self.pop_anyref();
@@ -188,14 +188,14 @@ impl Execution {
         // recovered from the object's canonical type via the engine registry. Typically called once
         // per array (a loop bound), so this lookup is amortized.
         let type_id = inner.gc_object(obj).expect("live gc slot").header.type_id;
-        let stride = Layout::for_array(&inner.engine().array_field(type_id)).stride();
+        let stride = Layout::for_array(&inner.engine().array_field(type_id)?).stride();
         self.push(Val::I32(arr_len(inner, obj, stride) as i32));
         Ok(())
     }
 
     fn array_fill(&mut self, inner: &mut StoreInner, instance: Instance, ty: u32) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let layout = module.inner().layout(ty);
+        let layout = module.inner().array_layout(ty)?;
         let len = self.pop_i32() as u32 as usize;
         let v = self.pop_val_for(layout.elem_at(0));
         let idx = self.pop_i32() as u32 as usize;
@@ -221,7 +221,7 @@ impl Execution {
         dst_ty: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let stride = module.inner().layout(dst_ty).stride();
+        let stride = module.inner().array_layout(dst_ty)?.stride();
         let len = self.pop_i32() as u32 as usize;
         let src_idx = self.pop_i32() as u32 as usize;
         let src_r = self.pop_anyref();
@@ -259,7 +259,7 @@ impl Execution {
         data: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let stride = module.inner().layout(ty).stride();
+        let stride = module.inner().array_layout(ty)?.stride();
         let len = self.pop_i32() as u32 as usize;
         let src = self.pop_i32() as u32 as usize;
         let dst = self.pop_i32() as u32 as usize;
@@ -293,7 +293,7 @@ impl Execution {
         elem: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let layout = module.inner().layout(ty);
+        let layout = module.inner().array_layout(ty)?;
         let len = self.pop_i32() as u32 as usize;
         let src = self.pop_i32() as u32 as usize;
         let dst = self.pop_i32() as u32 as usize;
@@ -329,7 +329,13 @@ impl Execution {
     }
 
     /// The element slot at `idx`, bounds-checked against the object's element count.
-    fn elem_slot(&self, inner: &StoreInner, obj: u32, layout: &Layout, idx: usize) -> Result<Slot> {
+    fn elem_slot(
+        &self,
+        inner: &StoreInner,
+        obj: u32,
+        layout: ArrayLayout,
+        idx: usize,
+    ) -> Result<Slot> {
         if idx < arr_len(inner, obj, layout.stride()) {
             Ok(layout.elem_at(idx))
         } else {
@@ -372,7 +378,7 @@ fn range(start: usize, len: usize, total: usize, trap: Trap) -> Result<()> {
 }
 
 /// Writes `count` copies of `v` into a fresh array body via the type's element slot.
-fn write_each(layout: &Layout, data: &mut [u8], count: usize, v: Val) {
+fn write_each(layout: ArrayLayout, data: &mut [u8], count: usize, v: Val) {
     for i in 0..count {
         write_slot(layout.elem_at(i), data, v);
     }

@@ -4,7 +4,7 @@
 
 use core::ops::Range;
 
-use crate::canon::{Layout, RefKind};
+use crate::canon::{ArrayLayout, Layout, RefKind, StructLayout};
 use crate::store::{
     anyref_handle_slot, read_slot, slot_accepts, write_slot, AsContext, AsContextMut, GcObject,
     StoreInner,
@@ -37,7 +37,7 @@ pub struct StructRef {
 #[derive(Debug)]
 pub struct StructRefPre {
     ty: StructType,
-    layout: Layout,
+    layout: StructLayout,
 }
 
 impl StructRefPre {
@@ -59,13 +59,8 @@ impl StructRef {
         allocator: &StructRefPre,
         fields: &[Val],
     ) -> Result<Rooted<StructRef>> {
-        let Layout::Struct {
-            fields: slots,
-            size,
-        } = &allocator.layout
-        else {
-            unreachable!("struct pre carries a struct layout");
-        };
+        let slots = allocator.layout.fields();
+        let size = allocator.layout.size();
         if fields.len() != slots.len() {
             return Err(Error::msg("wrong number of struct fields"));
         }
@@ -78,11 +73,11 @@ impl StructRef {
         let mut ctx = store.as_context_mut();
         // Reserve through the limiter (collect-then-grow) before building the body — the field
         // values are host-held `Val`s (rooted if they are GC refs), so a collection here is safe.
-        let charge = ctx.inner().gc_object_charge(*size);
+        let charge = ctx.inner().gc_object_charge(size);
         ctx.0.gc_reserve_host(charge)?;
         let inner = ctx.inner_mut();
         inner.pin_gc_type(type_id); // keep the type alive for the object's (store) lifetime
-        let mut data = vec![0u8; *size];
+        let mut data = vec![0u8; size];
         for (slot, v) in slots.iter().zip(fields) {
             write_slot(*slot, &mut data, *v);
         }
@@ -98,9 +93,9 @@ impl Rooted<StructRef> {
         let inner = ctx.inner();
         let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
-        let layout = Layout::for_struct(&inner.engine().struct_fields(obj.header.type_id));
+        let layout = Layout::for_struct(&inner.engine().struct_fields(obj.header.type_id)?);
         let field = layout
-            .get_field(index)
+            .field(index)
             .ok_or_else(|| Error::msg("struct field index out of bounds"))?;
         Ok(read_slot(field, &obj.data))
     }
@@ -130,14 +125,16 @@ impl Rooted<StructRef> {
         let inner = ctx.inner_mut();
         let slot = self.gc_slot_checked(inner)?;
         let type_id = gc_object(inner, slot)?.header.type_id;
-        let fields = inner.engine().struct_fields(type_id);
+        let fields = inner.engine().struct_fields(type_id)?;
         let field_ty = fields
             .get(index)
             .ok_or_else(|| Error::msg("struct field index out of bounds"))?;
         if field_ty.mutability() != Mutability::Var {
             return Err(Error::msg("struct field is not mutable"));
         }
-        let field = Layout::for_struct(&fields).field(index);
+        let field = Layout::for_struct(&fields)
+            .field(index)
+            .ok_or_else(|| Error::msg("struct field index out of bounds"))?;
         if !slot_accepts(field, &value) {
             return Err(Error::msg("struct field value has the wrong type"));
         }
@@ -171,7 +168,7 @@ pub struct ArrayRef {
 #[derive(Debug)]
 pub struct ArrayRefPre {
     ty: ArrayType,
-    layout: Layout,
+    layout: ArrayLayout,
 }
 
 impl ArrayRefPre {
@@ -333,7 +330,7 @@ impl Rooted<ArrayRef> {
         let inner = ctx.inner();
         let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
-        let stride = Layout::for_array(&inner.engine().array_field(obj.header.type_id)).stride();
+        let stride = Layout::for_array(&inner.engine().array_field(obj.header.type_id)?).stride();
         Ok(obj.array_len(stride))
     }
 
@@ -343,7 +340,7 @@ impl Rooted<ArrayRef> {
         let inner = ctx.inner();
         let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
-        let layout = Layout::for_array(&inner.engine().array_field(obj.header.type_id));
+        let layout = Layout::for_array(&inner.engine().array_field(obj.header.type_id)?);
         if index >= obj.array_len(layout.stride()) {
             return Err(Error::msg("array index out of bounds"));
         }
@@ -384,7 +381,7 @@ impl Rooted<ArrayRef> {
     ) -> Result<&[u8]> {
         let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
-        let field_ty = inner.engine().array_field(obj.header.type_id);
+        let field_ty = inner.engine().array_field(obj.header.type_id)?;
         if *field_ty.element_type() != expected {
             return Err(Error::msg(format!(
                 "element type mismatch: cannot copy a non-{expected:?} array into a slice"
@@ -435,7 +432,7 @@ impl Rooted<ArrayRef> {
     ) -> Result<&[u8]> {
         let slot = self.gc_slot_checked(inner)?;
         let obj = gc_object(inner, slot)?;
-        let field_ty = inner.engine().array_field(obj.header.type_id);
+        let field_ty = inner.engine().array_field(obj.header.type_id)?;
         if *field_ty.element_type() != expected {
             return Err(Error::msg(format!(
                 "element type mismatch: cannot read a non-{expected:?} array into a slice"
@@ -484,7 +481,7 @@ impl Rooted<ArrayRef> {
         let slot = self.gc_slot_checked(inner)?;
         let field_ty = inner
             .engine()
-            .array_field(gc_object(inner, slot)?.header.type_id);
+            .array_field(gc_object(inner, slot)?.header.type_id)?;
         if *field_ty.element_type() != expected {
             return Err(Error::msg(format!(
                 "element type mismatch: cannot write a slice into a non-{expected:?} array"
@@ -511,7 +508,7 @@ impl Rooted<ArrayRef> {
         let inner = ctx.inner_mut();
         let slot = self.gc_slot_checked(inner)?;
         let type_id = gc_object(inner, slot)?.header.type_id;
-        let field_ty = inner.engine().array_field(type_id);
+        let field_ty = inner.engine().array_field(type_id)?;
         let len = gc_object(inner, slot)?.array_len(Layout::for_array(&field_ty).stride());
         if index >= len {
             return Err(Error::msg("array index out of bounds"));

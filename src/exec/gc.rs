@@ -7,7 +7,6 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 
 use super::Execution;
-use crate::canon::Layout;
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::{
@@ -57,13 +56,11 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
-        let layout = module.inner().layout(ty);
-        let Layout::Struct { fields, size } = layout else {
-            unreachable!("struct.new on non-struct type");
-        };
-        let mut data = vec![0u8; *size];
+        let layout = module.inner().struct_layout(ty)?;
+        let fields = layout.fields();
+        let mut data = vec![0u8; layout.size()];
         if default {
-            for &slot in fields.as_ref() {
+            for &slot in fields {
                 write_slot(slot, &mut data, default_for_slot(slot));
             }
         } else {
@@ -87,7 +84,7 @@ impl Execution {
         ext: Option<bool>,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let slot = module.inner().layout(ty).field(field as usize);
+        let slot = module.inner().struct_field(ty, field)?;
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullStructReference)?;
         let data = &inner.gc_object(obj).expect("live gc slot").data;
@@ -107,7 +104,7 @@ impl Execution {
         field: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let slot = module.inner().layout(ty).field(field as usize);
+        let slot = module.inner().struct_field(ty, field)?;
         let v = self.pop_val_for(slot);
         let r = self.pop_anyref();
         let obj = anyref_slot(&r, Trap::NullStructReference)?;

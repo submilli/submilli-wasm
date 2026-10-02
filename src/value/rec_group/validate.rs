@@ -36,15 +36,15 @@ pub(super) fn supertype(
         SuperDef::Func(t) => t.canonical_id(),
     };
     ensure!(
-        engine.type_finality(sup_id) == Finality::NonFinal,
+        engine.type_finality(sup_id) == Some(Finality::NonFinal),
         "cannot create a subtype of a final supertype"
     );
 
     let sub_id = group.ids[i];
     match kind {
         AggKind::Struct => {
-            let sub = engine.struct_fields(sub_id);
-            let sup = engine.struct_fields(sup_id);
+            let sub = engine.struct_fields(sub_id)?;
+            let sup = engine.struct_fields(sup_id)?;
             let matches = sub.len() >= sup.len()
                 && sub
                     .iter()
@@ -55,8 +55,8 @@ pub(super) fn supertype(
         AggKind::Array => ensure!(
             field_matches(
                 engine,
-                &engine.array_field(sub_id),
-                &engine.array_field(sup_id)
+                &engine.array_field(sub_id)?,
+                &engine.array_field(sup_id)?
             ),
             "array field type must match its supertype's field type"
         ),
@@ -98,8 +98,11 @@ fn storage_matches(engine: &Engine, sub: &StorageType, sup: &StorageType) -> boo
 
 /// Structural function subtyping: equal arity, contravariant params, covariant results.
 fn func_matches(engine: &Engine, sub: CanonicalTypeId, sup: CanonicalTypeId) -> bool {
-    let (sub_params, sub_results) = engine.func_sig(sub);
-    let (sup_params, sup_results) = engine.func_sig(sup);
+    let (Ok((sub_params, sub_results)), Ok((sup_params, sup_results))) =
+        (engine.func_sig(sub), engine.func_sig(sup))
+    else {
+        return false;
+    };
     sub_params.len() == sup_params.len()
         && sub_results.len() == sup_results.len()
         && sup_params
