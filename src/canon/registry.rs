@@ -151,7 +151,7 @@ impl TypeRegistry {
             .iter()
             .map(|t| CType {
                 finality: t.finality,
-                supertype: t.supertype.map(&cref),
+                supertype: t.supertype.map(cref),
                 body: body_key(&t.body, &cref),
             })
             .collect();
@@ -338,7 +338,7 @@ impl TypeRegistry {
             .iter()
             .map(|t| CType {
                 finality: t.finality,
-                supertype: t.supertype.map(&cref),
+                supertype: t.supertype.map(cref),
                 body: body_key(&t.body, &cref),
             })
             .collect()
