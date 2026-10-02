@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used)]
 
 use submilli_wasm::{
-    Collector, Config, Engine, ExternRef, FieldType, Func, FuncType, GcHeapOutOfMemory, Instance,
-    Module, Mutability, RootScope, StorageType, Store, StoreLimitsBuilder, StructRef, StructRefPre,
-    StructType, Val, ValType,
+    ArrayRef, ArrayRefPre, ArrayType, Collector, Config, Engine, ExternRef, FieldType, Func,
+    FuncType, GcHeapOutOfMemory, Instance, Module, Mutability, RootScope, StorageType, Store,
+    StoreLimitsBuilder, StructRef, StructRefPre, StructType, Val, ValType,
 };
 
 fn engine_with(collector: Collector) -> Engine {
@@ -172,6 +172,34 @@ fn array_new_data_routes_through_limiter() {
     assert!(
         err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
         "array.new_data growth must be limiter-gated, got: {err:#}"
+    );
+    assert_eq!(store.gc_heap_capacity(), 0, "nothing was allocated");
+}
+
+#[test]
+fn host_slice_arrays_route_through_limiter() {
+    // The host slice constructors reserve their GC bytes through the limiter before building the
+    // body, like `new_fixed`: over a 1 KiB cap, a 2 KiB i8 or i16 array is `GcHeapOutOfMemory`.
+    let mut cfg = Config::new();
+    cfg.collector(Collector::Null).gc_heap_reservation(0);
+    let engine = Engine::new(&cfg).unwrap();
+    let mut store = Store::new(&engine, StoreLimitsBuilder::new().memory_size(1024).build());
+    store.limiter(|s| s);
+
+    let i8_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let i8_pre = ArrayRefPre::new(&mut store, i8_ty);
+    let err = ArrayRef::new_from_i8_slice(&mut store, &i8_pre, &[0; 2048]).unwrap_err();
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "i8 slice growth must be limiter-gated, got: {err:#}"
+    );
+
+    let i16_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16));
+    let i16_pre = ArrayRefPre::new(&mut store, i16_ty);
+    let err = ArrayRef::new_from_i16_slice(&mut store, &i16_pre, &[0; 1024]).unwrap_err();
+    assert!(
+        err.downcast_ref::<GcHeapOutOfMemory<()>>().is_some(),
+        "i16 slice growth must be limiter-gated, got: {err:#}"
     );
     assert_eq!(store.gc_heap_capacity(), 0, "nothing was allocated");
 }

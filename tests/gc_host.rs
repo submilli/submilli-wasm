@@ -116,6 +116,95 @@ fn array_i8_slice_roundtrip() {
 }
 
 #[test]
+fn array_i16_slice_roundtrip() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+
+    let array_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16));
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+
+    let src = [0x0000, 0x0041, 0x8000, 0xD800, 0xFFFF];
+    let array = ArrayRef::new_from_i16_slice(&mut store, &pre, &src).unwrap();
+    assert_eq!(array.len(&store).unwrap(), 5);
+
+    let mut dst = [0u16; 5];
+    array.copy_to_i16_slice(&store, &mut dst).unwrap();
+    assert_eq!(dst, src);
+
+    // The bulk body agrees with element-wise `new_fixed` + `get`.
+    let fixed = ArrayRef::new_fixed(
+        &mut store,
+        &pre,
+        &src.iter().map(|&u| Val::I32(u.into())).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut fixed_dst = [0u16; 5];
+    fixed.copy_to_i16_slice(&store, &mut fixed_dst).unwrap();
+    assert_eq!(fixed_dst, src);
+    for i in 0..src.len() as u32 {
+        assert_eq!(
+            array.get(&store, i).unwrap().unwrap_i32(),
+            fixed.get(&store, i).unwrap().unwrap_i32(),
+        );
+    }
+
+    let empty = ArrayRef::new_from_i16_slice(&mut store, &pre, &[]).unwrap();
+    assert_eq!(empty.len(&store).unwrap(), 0);
+    empty.copy_to_i16_slice(&store, &mut []).unwrap();
+
+    assert!(array.copy_to_i16_slice(&store, &mut [0u16; 6]).is_err());
+    assert!(array.copy_to_i8_slice(&store, &mut [0u8; 10]).is_err());
+
+    let i8_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let i8_pre = ArrayRefPre::new(&mut store, i8_ty);
+    assert!(ArrayRef::new_from_i16_slice(&mut store, &i8_pre, &[1, 2]).is_err());
+    let i8_array = ArrayRef::new_from_i8_slice(&mut store, &i8_pre, &[1, 2]).unwrap();
+    assert!(i8_array.copy_to_i16_slice(&store, &mut [0u16; 2]).is_err());
+}
+
+#[test]
+fn array_write_i8_and_i16() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+
+    let i8_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let i8_pre = ArrayRefPre::new(&mut store, i8_ty);
+    let bytes = ArrayRef::new_from_i8_slice(&mut store, &i8_pre, &[1, 2, 3, 4, 5]).unwrap();
+    bytes.write_i8(&mut store, 1, &[0xAA, 0xBB]).unwrap();
+    bytes.write_i8(&mut store, 5, &[]).unwrap();
+    let mut dst = [0u8; 5];
+    bytes.copy_to_i8_slice(&store, &mut dst).unwrap();
+    assert_eq!(dst, [1, 0xAA, 0xBB, 4, 5]);
+    assert!(bytes.write_i8(&mut store, 4, &[0, 0]).is_err());
+    assert!(bytes.write_i8(&mut store, u32::MAX, &[0]).is_err());
+    assert!(bytes.write_i16(&mut store, 0, &[0]).is_err());
+
+    let i16_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16));
+    let i16_pre = ArrayRefPre::new(&mut store, i16_ty);
+    let units = ArrayRef::new_from_i16_slice(&mut store, &i16_pre, &[1, 2, 3]).unwrap();
+    units.write_i16(&mut store, 1, &[0xD800, 0xFFFF]).unwrap();
+    let mut dst = [0u16; 3];
+    units.copy_to_i16_slice(&store, &mut dst).unwrap();
+    assert_eq!(dst, [1, 0xD800, 0xFFFF]);
+    assert_eq!(units.get(&store, 2).unwrap().unwrap_i32(), 0xFFFF);
+    assert!(units.write_i16(&mut store, 2, &[0, 0]).is_err());
+    assert!(units.write_i8(&mut store, 0, &[0]).is_err());
+    // An empty write is allowed at the end, not past it.
+    units.write_i16(&mut store, 3, &[]).unwrap();
+    assert!(units.write_i16(&mut store, 4, &[]).is_err());
+    assert!(bytes.write_i8(&mut store, 6, &[]).is_err());
+
+    let const_ty = ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I8));
+    let const_pre = ArrayRefPre::new(&mut store, const_ty);
+    let frozen = ArrayRef::new_from_i8_slice(&mut store, &const_pre, &[1]).unwrap();
+    assert!(frozen.write_i8(&mut store, 0, &[2]).is_err());
+    let const_i16_ty = ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I16));
+    let const_i16_pre = ArrayRefPre::new(&mut store, const_i16_ty);
+    let frozen_units = ArrayRef::new_from_i16_slice(&mut store, &const_i16_pre, &[1]).unwrap();
+    assert!(frozen_units.write_i16(&mut store, 0, &[2]).is_err());
+}
+
+#[test]
 #[cfg(feature = "async")]
 fn array_i8_slice_async() {
     let mut config = submilli_wasm::Config::new();
@@ -134,6 +223,17 @@ fn array_i8_slice_async() {
     let mut dst = [0u8; 5];
     array.copy_to_i8_slice(&store, &mut dst).unwrap();
     assert_eq!(dst, src);
+
+    let i16_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16));
+    let i16_pre = ArrayRefPre::new(&mut store, i16_ty);
+    let units = [0xD83D, 0xDE00];
+    let wide = pollster::block_on(ArrayRef::new_from_i16_slice_async(
+        &mut store, &i16_pre, &units,
+    ))
+    .unwrap();
+    let mut wide_dst = [0u16; 2];
+    wide.copy_to_i16_slice(&store, &mut wide_dst).unwrap();
+    assert_eq!(wide_dst, units);
 }
 
 #[test]
