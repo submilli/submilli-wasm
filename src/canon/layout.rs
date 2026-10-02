@@ -72,11 +72,24 @@ impl Slot {
 /// The packed byte layout of a struct or array type.
 #[derive(Clone, Debug)]
 pub(crate) enum Layout {
-    /// A struct: each field at a precomputed offset; `size` is the total body length.
-    Struct { fields: Box<[Slot]>, size: usize },
-    /// An array: a homogeneous element repeated; `stride` is the element width (`elem` carries a
-    /// dummy offset 0 — each element `k` lives at `k * stride`).
-    Array { elem: Slot, stride: usize },
+    Struct(StructLayout),
+    Array(ArrayLayout),
+}
+
+/// The packed byte layout of a struct type: each field at a precomputed offset; `size` is the
+/// total body length.
+#[derive(Clone, Debug)]
+pub(crate) struct StructLayout {
+    fields: Box<[Slot]>,
+    size: usize,
+}
+
+/// The packed byte layout of an array type: a homogeneous element repeated. `stride` is the
+/// element width (`elem` carries a dummy offset 0 — each element `k` lives at `k * stride`).
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ArrayLayout {
+    elem: Slot,
+    stride: usize,
 }
 
 impl Layout {
@@ -85,96 +98,89 @@ impl Layout {
     pub(crate) fn from_body(body: &CompositeBody) -> Option<Layout> {
         match body {
             CompositeBody::Func { .. } => None,
-            CompositeBody::Struct(fields) => {
-                let mut offset = 0;
-                let slots: Vec<Slot> = fields
-                    .iter()
-                    .map(|f| {
-                        let slot = field_slot(f, offset);
-                        offset += slot.width();
-                        slot
-                    })
-                    .collect();
-                Some(Layout::Struct {
-                    fields: slots.into_boxed_slice(),
-                    size: offset,
-                })
-            }
-            CompositeBody::Array(f) => {
-                let elem = field_slot(f, 0);
-                Some(Layout::Array {
-                    elem,
-                    stride: elem.width(),
-                })
-            }
+            CompositeBody::Struct(fields) => Some(Layout::Struct(StructLayout::of(
+                fields.iter().map(|f| |offset| field_slot(f, offset)),
+            ))),
+            CompositeBody::Array(f) => Some(Layout::Array(ArrayLayout::of(field_slot(f, 0)))),
         }
     }
 
     /// Builds a struct layout from public field descriptors (host-built `StructType`).
-    pub(crate) fn for_struct(fields: &[crate::value::FieldType]) -> Layout {
-        let mut offset = 0;
-        let slots: Vec<Slot> = fields
-            .iter()
-            .map(|f| {
-                let slot = pub_field_slot(f, offset);
-                offset += slot.width();
-                slot
-            })
-            .collect();
-        Layout::Struct {
-            fields: slots.into_boxed_slice(),
-            size: offset,
-        }
+    pub(crate) fn for_struct(fields: &[crate::value::FieldType]) -> StructLayout {
+        StructLayout::of(fields.iter().map(|f| |offset| pub_field_slot(f, offset)))
     }
 
     /// Builds an array layout from a public element descriptor (host-built `ArrayType`).
-    pub(crate) fn for_array(field: &crate::value::FieldType) -> Layout {
-        let elem = pub_field_slot(field, 0);
-        Layout::Array {
+    pub(crate) fn for_array(field: &crate::value::FieldType) -> ArrayLayout {
+        ArrayLayout::of(pub_field_slot(field, 0))
+    }
+
+    /// The struct layout, or `None` for an array.
+    pub(crate) fn as_struct(&self) -> Option<&StructLayout> {
+        match self {
+            Layout::Struct(layout) => Some(layout),
+            Layout::Array(_) => None,
+        }
+    }
+
+    /// The array layout, or `None` for a struct.
+    pub(crate) fn as_array(&self) -> Option<ArrayLayout> {
+        match self {
+            Layout::Array(layout) => Some(*layout),
+            Layout::Struct(_) => None,
+        }
+    }
+}
+
+impl StructLayout {
+    /// Lays the fields out back to back; each item builds its slot at the offset it is given.
+    fn of<F: FnOnce(usize) -> Slot>(slot_at: impl Iterator<Item = F>) -> StructLayout {
+        let mut size = 0;
+        let fields = slot_at
+            .map(|slot_at| {
+                let slot = slot_at(size);
+                size += slot.width();
+                slot
+            })
+            .collect();
+        StructLayout { fields, size }
+    }
+
+    pub(crate) fn fields(&self) -> &[Slot] {
+        &self.fields
+    }
+
+    /// The slot of field `i`, or `None` if out of range.
+    pub(crate) fn field(&self, i: usize) -> Option<Slot> {
+        self.fields.get(i).copied()
+    }
+
+    /// Total byte size of a struct body.
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl ArrayLayout {
+    fn of(elem: Slot) -> ArrayLayout {
+        ArrayLayout {
             elem,
             stride: elem.width(),
         }
     }
 
-    /// The slot of struct field `i` (panics for arrays / out of range — callers gate by kind).
-    pub(crate) fn field(&self, i: usize) -> Slot {
-        match self {
-            Layout::Struct { fields, .. } => fields[i],
-            Layout::Array { .. } => unreachable!("field() on an array layout"),
-        }
+    /// The element slot at index `i` (offset = `i * stride`).
+    pub(crate) fn elem_at(self, i: usize) -> Slot {
+        with_offset(self.elem, i * self.stride)
     }
 
-    /// The slot of struct field `i`, or `None` if out of range / not a struct (host path:
-    /// returns an error instead of panicking on bad input).
-    pub(crate) fn get_field(&self, i: usize) -> Option<Slot> {
-        match self {
-            Layout::Struct { fields, .. } => fields.get(i).copied(),
-            Layout::Array { .. } => None,
-        }
+    pub(crate) fn stride(self) -> usize {
+        self.stride
     }
 
-    /// The element slot at index `i` of an array (offset = `i * stride`).
-    pub(crate) fn elem_at(&self, i: usize) -> Slot {
-        match self {
-            Layout::Array { elem, stride } => with_offset(*elem, i * stride),
-            Layout::Struct { .. } => unreachable!("elem_at() on a struct layout"),
-        }
-    }
-
-    /// The element stride of an array layout.
-    pub(crate) fn stride(&self) -> usize {
-        match self {
-            Layout::Array { stride, .. } => *stride,
-            Layout::Struct { .. } => unreachable!("stride() on a struct layout"),
-        }
-    }
-
-    /// Total byte size of a body holding `len` elements (`len` ignored for structs).
-    pub(crate) fn body_size(&self, len: usize) -> usize {
-        match self {
-            Layout::Struct { size, .. } => *size,
-            Layout::Array { stride, .. } => len * stride,
-        }
+    /// Total byte size of a body holding `len` elements.
+    pub(crate) fn body_size(self, len: usize) -> usize {
+        len * self.stride
     }
 }
 
@@ -188,26 +194,25 @@ fn field_slot(f: &IrField, offset: usize) -> Slot {
             offset,
             kind: ScalarKind::I16,
         },
-        IrStorage::Val(IrVal::Ref { heap, .. }) => Slot::Ref {
-            offset,
-            kind: ref_kind(heap),
-        },
-        IrStorage::Val(v) => Slot::Scalar {
-            offset,
-            kind: num_kind(v),
-        },
+        IrStorage::Val(v) => val_slot(v, offset),
     }
 }
 
-fn num_kind(v: &IrVal) -> ScalarKind {
-    match v {
+fn val_slot(v: &IrVal, offset: usize) -> Slot {
+    let kind = match v {
         IrVal::I32 => ScalarKind::I32,
         IrVal::I64 => ScalarKind::I64,
         IrVal::F32 => ScalarKind::F32,
         IrVal::F64 => ScalarKind::F64,
         IrVal::V128 => ScalarKind::V128,
-        IrVal::Ref { .. } => unreachable!("ref handled as a Ref slot"),
-    }
+        IrVal::Ref { heap, .. } => {
+            return Slot::Ref {
+                offset,
+                kind: ref_kind(heap),
+            }
+        }
+    };
+    Slot::Scalar { offset, kind }
 }
 
 /// The reference hierarchy of a heap type (mirrors `Val::null_for_heap`).
@@ -223,7 +228,7 @@ fn ref_kind(heap: &IrHeap) -> RefKind {
 
 /// Maps a public `FieldType` (host descriptor) to a slot at `offset`.
 fn pub_field_slot(f: &crate::value::FieldType, offset: usize) -> Slot {
-    use crate::value::{StorageType, ValType};
+    use crate::value::StorageType;
     match f.element_type() {
         StorageType::I8 => Slot::Scalar {
             offset,
@@ -233,27 +238,26 @@ fn pub_field_slot(f: &crate::value::FieldType, offset: usize) -> Slot {
             offset,
             kind: ScalarKind::I16,
         },
-        StorageType::ValType(ValType::Ref(rt)) => Slot::Ref {
-            offset,
-            kind: pub_ref_kind(rt.heap_type()),
-        },
-        StorageType::ValType(v) => Slot::Scalar {
-            offset,
-            kind: pub_num_kind(v),
-        },
+        StorageType::ValType(v) => pub_val_slot(v, offset),
     }
 }
 
-fn pub_num_kind(v: &crate::value::ValType) -> ScalarKind {
+fn pub_val_slot(v: &crate::value::ValType, offset: usize) -> Slot {
     use crate::value::ValType;
-    match v {
+    let kind = match v {
         ValType::I32 => ScalarKind::I32,
         ValType::I64 => ScalarKind::I64,
         ValType::F32 => ScalarKind::F32,
         ValType::F64 => ScalarKind::F64,
         ValType::V128 => ScalarKind::V128,
-        ValType::Ref(_) => unreachable!("ref handled as a Ref slot"),
-    }
+        ValType::Ref(rt) => {
+            return Slot::Ref {
+                offset,
+                kind: pub_ref_kind(rt.heap_type()),
+            }
+        }
+    };
+    Slot::Scalar { offset, kind }
 }
 
 /// The reference hierarchy of a public heap type (mirrors `ref_kind` over `IrHeap`).

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGua
 use crate::canon::{AggKind, CanonicalTypeId, GroupId, ModuleType, TypeRegistry};
 use crate::config::{CollectorKind, Config};
 use crate::value::{FieldType, Finality, ValType};
-use crate::Result;
+use crate::{Error, Result};
 
 /// A compiled-code and runtime environment, shared across `Store`s and threads.
 ///
@@ -150,8 +150,8 @@ impl Engine {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// The declared finality of a live canonical type.
-    pub(crate) fn type_finality(&self, id: CanonicalTypeId) -> Finality {
+    /// The declared finality of a canonical type, or `None` if it is not live.
+    pub(crate) fn type_finality(&self, id: CanonicalTypeId) -> Option<Finality> {
         self.types_read().finality(id)
     }
 
@@ -208,19 +208,22 @@ impl Engine {
         &self.inner.types
     }
 
-    /// The materialized (params, results) of a canonical func type.
-    pub(crate) fn func_sig(&self, id: CanonicalTypeId) -> (Vec<ValType>, Vec<ValType>) {
-        crate::canon::func_sig(self, id)
+    /// The materialized (params, results) of a canonical func type; an error if `id` is not a
+    /// live func type.
+    pub(crate) fn func_sig(&self, id: CanonicalTypeId) -> Result<(Vec<ValType>, Vec<ValType>)> {
+        crate::canon::func_sig(self, id).ok_or_else(|| Error::msg("not a live func type"))
     }
 
-    /// The materialized fields of a canonical struct type.
-    pub(crate) fn struct_fields(&self, id: CanonicalTypeId) -> Vec<FieldType> {
-        crate::canon::struct_fields(self, id)
+    /// The materialized fields of a canonical struct type; an error if `id` is not a live struct
+    /// type.
+    pub(crate) fn struct_fields(&self, id: CanonicalTypeId) -> Result<Vec<FieldType>> {
+        crate::canon::struct_fields(self, id).ok_or_else(|| Error::msg("not a live struct type"))
     }
 
-    /// The materialized element of a canonical array type.
-    pub(crate) fn array_field(&self, id: CanonicalTypeId) -> FieldType {
-        crate::canon::array_field(self, id)
+    /// The materialized element of a canonical array type; an error if `id` is not a live array
+    /// type.
+    pub(crate) fn array_field(&self, id: CanonicalTypeId) -> Result<FieldType> {
+        crate::canon::array_field(self, id).ok_or_else(|| Error::msg("not a live array type"))
     }
 
     /// Whether epoch-based interruption is enabled (`Config::epoch_interruption`).

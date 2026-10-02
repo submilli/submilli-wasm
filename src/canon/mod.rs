@@ -12,7 +12,7 @@ mod layout;
 mod materialize;
 mod registry;
 
-pub(crate) use layout::{Layout, RefKind, ScalarKind, Slot};
+pub(crate) use layout::{ArrayLayout, Layout, RefKind, ScalarKind, Slot, StructLayout};
 pub(crate) use materialize::{array_field, func_sig, struct_fields};
 pub(crate) use registry::TypeRegistry;
 

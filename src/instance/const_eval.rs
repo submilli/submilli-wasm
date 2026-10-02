@@ -5,7 +5,7 @@
 // Index/width juggling on validated inputs is intentional narrowing.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::canon::{CanonicalTypeId, Layout};
+use crate::canon::CanonicalTypeId;
 use crate::extern_::Global;
 use crate::func::Func;
 use crate::module::inner::{ConstExpr, ConstOp, ElemItems};
@@ -122,13 +122,11 @@ fn const_struct(
     default: bool,
 ) -> Result<Val> {
     let type_id = ctx.module.inner().canonical_type_id(ty);
-    let layout = ctx.module.inner().layout(ty);
-    let Layout::Struct { fields, size } = layout else {
-        unreachable!("struct.new on non-struct type");
-    };
-    let mut data = vec![0u8; *size];
+    let layout = ctx.module.inner().struct_layout(ty)?;
+    let fields = layout.fields();
+    let mut data = vec![0u8; layout.size()];
     if default {
-        for &slot in fields.as_ref() {
+        for &slot in fields {
             write_slot(slot, &mut data, default_for_slot(slot));
         }
     } else {
@@ -150,7 +148,7 @@ fn const_array(
     default: bool,
 ) -> Result<Val> {
     let type_id = ctx.module.inner().canonical_type_id(ty);
-    let layout = ctx.module.inner().layout(ty);
+    let layout = ctx.module.inner().array_layout(ty)?;
     let count = pop(stack).unwrap_i32() as u32 as usize;
     let byte_len = elem_bytes(count, layout.stride())?;
     inner.gc_check_capacity(byte_len)?;
@@ -174,7 +172,7 @@ fn const_array_fixed(
     n: u32,
 ) -> Result<Val> {
     let type_id = ctx.module.inner().canonical_type_id(ty);
-    let layout = ctx.module.inner().layout(ty);
+    let layout = ctx.module.inner().array_layout(ty)?;
     let count = n as usize;
     let mut data = vec![0u8; layout.body_size(count)];
     for i in (0..count).rev() {
@@ -191,7 +189,7 @@ fn const_array_data(
     data: u32,
 ) -> Result<Val> {
     let type_id = ctx.module.inner().canonical_type_id(ty);
-    let stride = ctx.module.inner().layout(ty).stride();
+    let stride = ctx.module.inner().array_layout(ty)?.stride();
     let count = pop(stack).unwrap_i32() as u32 as usize;
     let offset = pop(stack).unwrap_i32() as u32 as usize;
     let byte_len = elem_bytes(count, stride)?;
@@ -210,7 +208,7 @@ fn const_array_elem(
     elem: u32,
 ) -> Result<Val> {
     let type_id = ctx.module.inner().canonical_type_id(ty);
-    let layout = ctx.module.inner().layout(ty);
+    let layout = ctx.module.inner().array_layout(ty)?;
     let count = pop(stack).unwrap_i32() as u32 as usize;
     let offset = pop(stack).unwrap_i32() as u32 as usize;
     let refs = elem_refs(inner, ctx, &ctx.module.inner().elems[elem as usize].items)?;

@@ -4,7 +4,8 @@
 //! `instance::init` at instantiation time.
 
 use crate::canon::{
-    self, AggKind, CanonicalTypeId, GroupId, IrGlobalType, IrHeap, IrTableType, Layout, ModuleType,
+    self, AggKind, ArrayLayout, CanonicalTypeId, GroupId, IrGlobalType, IrHeap, IrTableType,
+    Layout, ModuleType, Slot, StructLayout,
 };
 use crate::engine::Engine;
 use crate::module::op::CompiledFunc;
@@ -80,11 +81,32 @@ impl ModuleInner {
         self.type_ids[type_index as usize]
     }
 
-    /// The GC byte layout of an aggregate (struct/array) module type index.
-    pub(crate) fn layout(&self, type_index: u32) -> &Layout {
-        self.layouts[type_index as usize]
-            .as_ref()
-            .expect("aggregate type has a layout")
+    /// The GC byte layout of a struct module type index; an error if the type is not a struct.
+    pub(crate) fn struct_layout(&self, type_index: u32) -> crate::Result<&StructLayout> {
+        self.layout(type_index)
+            .and_then(Layout::as_struct)
+            .ok_or_else(|| crate::Error::msg(format!("type {type_index} is not a struct type")))
+    }
+
+    /// The slot of field `field` of a struct module type index; an error if the type is not a
+    /// struct or has no such field.
+    pub(crate) fn struct_field(&self, type_index: u32, field: u32) -> crate::Result<Slot> {
+        self.struct_layout(type_index)?
+            .field(field as usize)
+            .ok_or_else(|| {
+                crate::Error::msg(format!("type {type_index} has no struct field {field}"))
+            })
+    }
+
+    /// The GC byte layout of an array module type index; an error if the type is not an array.
+    pub(crate) fn array_layout(&self, type_index: u32) -> crate::Result<ArrayLayout> {
+        self.layout(type_index)
+            .and_then(Layout::as_array)
+            .ok_or_else(|| crate::Error::msg(format!("type {type_index} is not an array type")))
+    }
+
+    fn layout(&self, type_index: u32) -> Option<&Layout> {
+        self.layouts.get(type_index as usize)?.as_ref()
     }
 
     /// The owning engine (set by `intern`).

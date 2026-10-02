@@ -11,6 +11,10 @@ fn field(storage: IrStorage) -> IrField {
     }
 }
 
+fn array_layout(body: &CompositeBody) -> ArrayLayout {
+    Layout::from_body(body).unwrap().as_array().unwrap()
+}
+
 #[test]
 fn mixed_struct_offsets_pack_tightly() {
     // { i8, i32, ref func, i16 } → offsets 0, 1, 5, 9; size 11.
@@ -23,9 +27,9 @@ fn mixed_struct_offsets_pack_tightly() {
         })),
         field(IrStorage::I16),
     ]);
-    let Layout::Struct { fields, size } = Layout::from_body(&body).unwrap() else {
-        panic!("expected struct layout");
-    };
+    let layout = Layout::from_body(&body).unwrap();
+    let layout = layout.as_struct().unwrap();
+    let (fields, size) = (layout.fields(), layout.size());
     assert_eq!(
         fields[0],
         Slot::Scalar {
@@ -60,7 +64,7 @@ fn mixed_struct_offsets_pack_tightly() {
 #[test]
 fn packed_i8_array_has_unit_stride() {
     let body = CompositeBody::Array(field(IrStorage::I8));
-    let layout = Layout::from_body(&body).unwrap();
+    let layout = array_layout(&body);
     assert_eq!(layout.stride(), 1);
     assert_eq!(layout.body_size(100), 100);
     assert_eq!(layout.elem_at(7).offset(), 7);
@@ -72,7 +76,7 @@ fn ref_array_uses_handle_width() {
         nullable: true,
         heap: IrHeap::Extern,
     })));
-    let layout = Layout::from_body(&body).unwrap();
+    let layout = array_layout(&body);
     assert_eq!(layout.stride(), REF_WIDTH);
     assert_eq!(
         layout.elem_at(3),
@@ -86,9 +90,9 @@ fn ref_array_uses_handle_width() {
 #[test]
 fn v128_and_f64_widths() {
     let body = CompositeBody::Array(field(IrStorage::Val(IrVal::V128)));
-    assert_eq!(Layout::from_body(&body).unwrap().stride(), 16);
+    assert_eq!(array_layout(&body).stride(), 16);
     let body = CompositeBody::Array(field(IrStorage::Val(IrVal::F64)));
-    assert_eq!(Layout::from_body(&body).unwrap().stride(), 8);
+    assert_eq!(array_layout(&body).stride(), 8);
 }
 
 #[test]

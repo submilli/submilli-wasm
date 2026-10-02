@@ -49,34 +49,41 @@ pub(crate) fn mat_field(engine: &Engine, f: &CField) -> FieldType {
 
 /// The materialized (public) param + result types of a func type. Two-phase: clone the canonical
 /// body under the registry read lock, then build handles after the lock is released.
-pub(crate) fn func_sig(engine: &Engine, id: CanonicalTypeId) -> (Vec<ValType>, Vec<ValType>) {
+///
+/// `None` if `id` is not a live func type.
+pub(crate) fn func_sig(
+    engine: &Engine,
+    id: CanonicalTypeId,
+) -> Option<(Vec<ValType>, Vec<ValType>)> {
     let (p, r) = engine
         .types()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .func_body_raw(id);
-    (
+        .func_body_raw(id)?;
+    Some((
         p.iter().map(|v| mat_val(engine, v)).collect(),
         r.iter().map(|v| mat_val(engine, v)).collect(),
-    )
+    ))
 }
 
-/// The materialized fields of a struct type (two-phase, like [`func_sig`]).
-pub(crate) fn struct_fields(engine: &Engine, id: CanonicalTypeId) -> Vec<FieldType> {
+/// The materialized fields of a struct type (two-phase, like [`func_sig`]). `None` if `id` is not
+/// a live struct type.
+pub(crate) fn struct_fields(engine: &Engine, id: CanonicalTypeId) -> Option<Vec<FieldType>> {
     let fields = engine
         .types()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .struct_fields_raw(id);
-    fields.iter().map(|f| mat_field(engine, f)).collect()
+        .struct_fields_raw(id)?;
+    Some(fields.iter().map(|f| mat_field(engine, f)).collect())
 }
 
-/// The materialized element of an array type (two-phase, like [`func_sig`]).
-pub(crate) fn array_field(engine: &Engine, id: CanonicalTypeId) -> FieldType {
+/// The materialized element of an array type (two-phase, like [`func_sig`]). `None` if `id` is not
+/// a live array type.
+pub(crate) fn array_field(engine: &Engine, id: CanonicalTypeId) -> Option<FieldType> {
     let field = engine
         .types()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .array_field_raw(id);
-    mat_field(engine, &field)
+        .array_field_raw(id)?;
+    Some(mat_field(engine, &field))
 }

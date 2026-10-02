@@ -112,15 +112,17 @@ impl StoreInner {
         };
         match obj.header.kind {
             ObjKind::Struct => {
-                let fields = self.engine().struct_fields(obj.header.type_id);
-                if let Layout::Struct { fields: slots, .. } = Layout::for_struct(&fields) {
-                    for &slot in &slots {
-                        seed_slot(work, slot, &obj.data);
-                    }
+                let Ok(fields) = self.engine().struct_fields(obj.header.type_id) else {
+                    return;
+                };
+                for &slot in Layout::for_struct(&fields).fields() {
+                    seed_slot(work, slot, &obj.data);
                 }
             }
             ObjKind::Array => {
-                let field = self.engine().array_field(obj.header.type_id);
+                let Ok(field) = self.engine().array_field(obj.header.type_id) else {
+                    return;
+                };
                 let layout = Layout::for_array(&field);
                 for i in 0..obj.array_len(layout.stride()) as usize {
                     seed_slot(work, layout.elem_at(i), &obj.data);
