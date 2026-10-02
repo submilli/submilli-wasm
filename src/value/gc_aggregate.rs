@@ -400,6 +400,55 @@ impl Rooted<ArrayRef> {
         Ok(&obj.data)
     }
 
+    /// Copies elements `offset..offset + dst.len()` of this `i8` array into `dst`.
+    ///
+    /// Errors if the array is not an `i8` array or the range exceeds its length.
+    pub fn read_i8(&self, store: impl AsContext, offset: u32, dst: &mut [u8]) -> Result<()> {
+        let ctx = store.as_context();
+        let body = self.packed_range(ctx.inner(), StorageType::I8, offset, dst.len())?;
+        dst.copy_from_slice(body);
+        Ok(())
+    }
+
+    /// Copies elements `offset..offset + dst.len()` of this `i16` array into `dst` as unsigned
+    /// 16-bit units.
+    ///
+    /// Errors if the array is not an `i16` array or the range exceeds its length.
+    pub fn read_i16(&self, store: impl AsContext, offset: u32, dst: &mut [u16]) -> Result<()> {
+        let ctx = store.as_context();
+        let body = self.packed_range(ctx.inner(), StorageType::I16, offset, dst.len())?;
+        let (pairs, _) = body.as_chunks::<2>();
+        for (unit, &pair) in dst.iter_mut().zip(pairs) {
+            *unit = u16::from_le_bytes(pair);
+        }
+        Ok(())
+    }
+
+    /// The bytes of elements `offset..offset + count` of this array, after checking its element
+    /// type is `expected` and the range is in bounds.
+    fn packed_range(
+        self,
+        inner: &StoreInner,
+        expected: StorageType,
+        offset: u32,
+        count: usize,
+    ) -> Result<&[u8]> {
+        let slot = self.gc_slot_checked(inner)?;
+        let obj = gc_object(inner, slot)?;
+        let field_ty = inner.engine().array_field(obj.header.type_id);
+        if *field_ty.element_type() != expected {
+            return Err(Error::msg(format!(
+                "element type mismatch: cannot read a non-{expected:?} array into a slice"
+            )));
+        }
+        let stride = Layout::for_array(&field_ty).stride();
+        let range = element_byte_range(offset, count, stride)
+            .ok_or_else(|| Error::msg("array read range overflows"))?;
+        obj.data
+            .get(range)
+            .ok_or_else(|| Error::msg("array read out of bounds"))
+    }
+
     /// Overwrites this `i8` array's elements starting at `offset` with `src`.
     ///
     /// Errors if the array is not a mutable `i8` array or `offset + src.len()` exceeds its length.

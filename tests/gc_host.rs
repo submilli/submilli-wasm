@@ -205,6 +205,36 @@ fn array_write_i8_and_i16() {
 }
 
 #[test]
+fn array_read_i8_and_i16_ranges() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+
+    let i8_ty = ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I8));
+    let i8_pre = ArrayRefPre::new(&mut store, i8_ty);
+    let bytes = ArrayRef::new_from_i8_slice(&mut store, &i8_pre, &[1, 2, 3, 4, 5]).unwrap();
+    let mut dst = [0u8; 2];
+    bytes.read_i8(&store, 3, &mut dst).unwrap();
+    assert_eq!(dst, [4, 5]);
+    // An empty read is allowed at the end, not past it.
+    bytes.read_i8(&store, 5, &mut []).unwrap();
+    assert!(bytes.read_i8(&store, 6, &mut []).is_err());
+    assert!(bytes.read_i8(&store, 4, &mut dst).is_err());
+    assert!(bytes.read_i8(&store, u32::MAX, &mut dst).is_err());
+    assert!(bytes.read_i16(&store, 0, &mut [0u16; 1]).is_err());
+
+    let i16_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16));
+    let i16_pre = ArrayRefPre::new(&mut store, i16_ty);
+    let units = ArrayRef::new_from_i16_slice(&mut store, &i16_pre, &[1, 0xD800, 0xFFFF]).unwrap();
+    let mut dst = [0u16; 2];
+    units.read_i16(&store, 1, &mut dst).unwrap();
+    assert_eq!(dst, [0xD800, 0xFFFF]);
+    units.read_i16(&store, 3, &mut []).unwrap();
+    assert!(units.read_i16(&store, 2, &mut dst).is_err());
+    assert!(units.read_i16(&store, u32::MAX, &mut dst).is_err());
+    assert!(units.read_i8(&store, 0, &mut [0u8; 1]).is_err());
+}
+
+#[test]
 #[cfg(feature = "async")]
 fn array_i8_slice_async() {
     let mut config = submilli_wasm::Config::new();
