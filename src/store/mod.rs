@@ -186,6 +186,19 @@ impl<T: 'static> Store<T> {
         Ok(self.inner.fuel())
     }
 
+    /// Consumes up to `units` of fuel in place and returns the amount consumed (less than
+    /// `units` when the store held less, leaving it at zero). Unlike `get_fuel` + `set_fuel`,
+    /// this keeps the countdown to the next `fuel_async_yield_interval` yield. Not part of the
+    /// `wasmtime` API: it is for a host function charging fuel for its own work.
+    pub fn consume_fuel(&mut self, units: u64) -> Result<u64> {
+        if !self.inner.engine().consume_fuel() {
+            return Err(Error::msg(
+                "fuel is not configured; set `Config::consume_fuel(true)`",
+            ));
+        }
+        Ok(self.inner.consume_fuel(units))
+    }
+
     pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) {
         let deadline = self
             .inner

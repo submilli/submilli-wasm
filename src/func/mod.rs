@@ -314,6 +314,10 @@ impl<T: 'static> Caller<'_, T> {
         self.store.set_fuel(fuel)
     }
 
+    pub fn consume_fuel(&mut self, units: u64) -> Result<u64> {
+        self.store.consume_fuel(units)
+    }
+
     #[cfg(feature = "async")]
     pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
         self.store.fuel_async_yield_interval(interval)

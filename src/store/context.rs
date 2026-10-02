@@ -75,6 +75,10 @@ impl<'a, T: 'static> StoreContextMut<'a, T> {
         self.0.set_fuel(fuel)
     }
 
+    pub fn consume_fuel(&mut self, units: u64) -> Result<u64> {
+        self.0.consume_fuel(units)
+    }
+
     #[cfg(feature = "async")]
     pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
         self.0.fuel_async_yield_interval(interval)

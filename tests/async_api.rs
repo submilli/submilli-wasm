@@ -138,6 +138,24 @@ fn fuel_yield_runs_to_completion() {
 }
 
 #[test]
+fn consume_fuel_draws_on_the_reserve_before_the_active_slice() {
+    let engine = engine_with(true, false);
+    let mut store = Store::new(&engine, ());
+    store.set_fuel(1_000).unwrap();
+    store.fuel_async_yield_interval(Some(64)).unwrap();
+    // Reserve first: the total drops, the active slice (64) is untouched.
+    assert_eq!(store.consume_fuel(900).unwrap(), 900);
+    assert_eq!(store.get_fuel().unwrap(), 100);
+    // Past the reserve it eats into the active slice, and stops at zero.
+    assert_eq!(store.consume_fuel(150).unwrap(), 100);
+    assert_eq!(store.get_fuel().unwrap(), 0);
+    assert_eq!(store.consume_fuel(1).unwrap(), 0);
+
+    let plain = Store::new(&Engine::default(), ());
+    assert!(plain.get_fuel().is_err());
+}
+
+#[test]
 fn epoch_yield_runs_to_completion() {
     let engine = engine_with(false, true);
     let m = module(&engine, ECHO_LOOP);

@@ -172,6 +172,17 @@ impl StoreInner {
         self.fuel_reserve = total - active;
     }
 
+    /// Consumes up to `units` of fuel, reserve first, so the active slice (the countdown to the
+    /// next async yield) only shrinks once the reserve is gone. Returns the amount consumed, which
+    /// is less than `units` when the store held less.
+    pub(crate) fn consume_fuel(&mut self, units: u64) -> u64 {
+        let from_reserve = units.min(self.fuel_reserve);
+        self.fuel_reserve -= from_reserve;
+        let from_active = (units - from_reserve).min(self.fuel);
+        self.fuel -= from_active;
+        from_reserve + from_active
+    }
+
     /// Sets the async fuel-yield interval, then re-splits the current total fuel.
     pub(crate) fn set_fuel_yield_interval(&mut self, interval: Option<u64>) {
         self.fuel_yield_interval = interval.and_then(NonZeroU64::new);
