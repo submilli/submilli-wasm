@@ -227,3 +227,50 @@ fn details_disabled_keeps_frames_drops_file_line() {
         assert_eq!(sym.line(), None, "no DWARF line");
     }
 }
+
+#[test]
+fn module_visitor_stops_without_capturing_outer_frames() {
+    let engine = Engine::new(Config::new().wasm_backtrace(false)).unwrap();
+    let mut store = Store::new(&engine, (0usize, 0usize));
+    let probe = Func::wrap(
+        &mut store,
+        |mut caller: Caller<'_, (usize, usize)>| -> submilli_wasm::Result<()> {
+            let depth = WasmBacktrace::force_capture(&caller).frames().len();
+            let mut visits = 0;
+            WasmBacktrace::visit_modules(&caller, |_| {
+                visits += 1;
+                std::ops::ControlFlow::Break(())
+            })?;
+            *caller.data_mut() = (depth, visits);
+            Ok(())
+        },
+    );
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"(module
+        (import "h" "probe" (func $probe))
+        (func $run (export "run") (param i32)
+            local.get 0 i32.eqz
+            if call $probe
+            else local.get 0 i32.const 1 i32.sub call $run end))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let instance = Instance::new(&mut store, &module, &[Extern::Func(probe)]).unwrap();
+    let run = instance
+        .get_typed_func::<i32, ()>(&mut store, "run")
+        .unwrap();
+    for depth in [32, 64] {
+        run.call(&mut store, depth).unwrap();
+        assert_eq!(*store.data(), (depth as usize + 1, 1));
+    }
+    let mut visits = 0;
+    WasmBacktrace::visit_modules(&store, |_| {
+        visits += 1;
+        std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(visits, 0);
+}

@@ -55,6 +55,16 @@ impl WasmBacktrace {
         crate::exec::trace::from_parked(store.as_context().inner())
     }
 
+    /// Visits active frame modules, innermost first, without allocating or
+    /// symbolizing a backtrace. `Break` stops the walk; backtrace settings do
+    /// not affect caller attribution.
+    pub fn visit_modules(
+        store: impl AsContext,
+        visit: impl FnMut(&Module) -> std::ops::ControlFlow<()>,
+    ) -> crate::Result<()> {
+        crate::exec::trace::visit_modules(store.as_context().inner(), visit)
+    }
+
     /// The captured frames, most-recent first.
     pub fn frames(&self) -> &[FrameInfo] {
         &self.frames

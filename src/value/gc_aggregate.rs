@@ -215,6 +215,31 @@ impl ArrayRef {
         Self::finish_packed(ctx.inner_mut(), allocator, elems.to_vec())
     }
 
+    /// Allocates a zero-filled `i8` array directly under the GC limiter.
+    pub fn new_zeroed_i8(
+        mut store: impl AsContextMut,
+        allocator: &ArrayRefPre,
+        len: u32,
+    ) -> Result<Rooted<ArrayRef>> {
+        let mut ctx = store.as_context_mut();
+        let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I8, len as usize)?;
+        ctx.0.gc_reserve_host(charge)?;
+        Self::finish_packed(ctx.inner_mut(), allocator, zeroed_body(len as usize)?)
+    }
+
+    /// Allocates an `i64` array from unsigned bit patterns, without transient `Val`s.
+    pub fn new_from_i64_slice(
+        mut store: impl AsContextMut,
+        allocator: &ArrayRefPre,
+        elems: &[u64],
+    ) -> Result<Rooted<ArrayRef>> {
+        let mut ctx = store.as_context_mut();
+        let storage = StorageType::ValType(crate::ValType::I64);
+        let charge = Self::packed_charge(ctx.inner(), allocator, storage, elems.len())?;
+        ctx.0.gc_reserve_host(charge)?;
+        Self::finish_packed(ctx.inner_mut(), allocator, i64_body(elems)?)
+    }
+
     /// Async sibling of [`ArrayRef::new_from_i8_slice`].
     #[cfg(feature = "async")]
     pub async fn new_from_i8_slice_async<T: 'static>(
@@ -367,6 +392,20 @@ impl Rooted<ArrayRef> {
         let (pairs, _) = body.as_chunks::<2>();
         for (unit, &pair) in dst.iter_mut().zip(pairs) {
             *unit = u16::from_le_bytes(pair);
+        }
+        Ok(())
+    }
+
+    /// Copies an `i64` array into unsigned bit patterns. Lengths must match.
+    pub fn copy_to_i64_slice(&self, store: impl AsContext, dst: &mut [u64]) -> Result<()> {
+        let ctx = store.as_context();
+        let body = self.packed_body(
+            ctx.inner(),
+            StorageType::ValType(crate::ValType::I64),
+            dst.len(),
+        )?;
+        for (unit, &bytes) in dst.iter_mut().zip(body.as_chunks::<8>().0) {
+            *unit = u64::from_le_bytes(bytes);
         }
         Ok(())
     }
@@ -542,6 +581,25 @@ impl From<Rooted<ArrayRef>> for Rooted<AnyRef> {
 /// Lays out 16-bit units as a packed `i16` array body (little-endian, matching `write_slot`).
 fn i16_body(elems: &[u16]) -> Vec<u8> {
     elems.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
+
+fn zeroed_body(len: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.try_reserve_exact(len).map_err(Error::new)?;
+    body.resize(len, 0);
+    Ok(body)
+}
+
+fn i64_body(elems: &[u64]) -> Result<Vec<u8>> {
+    let byte_len = elems
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| Error::msg("array too large"))?;
+    let mut body = zeroed_body(byte_len)?;
+    for (bytes, unit) in body.as_chunks_mut::<8>().0.iter_mut().zip(elems) {
+        *bytes = unit.to_le_bytes();
+    }
+    Ok(body)
 }
 
 /// The byte range of elements `offset..offset + count` in a body with `stride`-byte elements, or

@@ -60,6 +60,24 @@ pub(crate) fn from_parked(inner: &StoreInner) -> WasmBacktrace {
     build(inner, inner.parked_exec().frames(), None)
 }
 
+pub(crate) fn visit_modules(
+    inner: &StoreInner,
+    mut visit: impl FnMut(&crate::Module) -> std::ops::ControlFlow<()>,
+) -> crate::Result<()> {
+    for frame in inner.parked_exec().frames().iter().rev() {
+        if frame.delimiter.is_some() {
+            continue;
+        }
+        let instance = inner
+            .try_instance(frame.instance)
+            .ok_or_else(|| Error::msg("active frame has no registered instance"))?;
+        if visit(&instance.module).is_break() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl Execution {
     /// The live frame stack (for backtrace capture from the parked execution).
     pub(crate) fn frames(&self) -> &[Frame] {

@@ -563,3 +563,67 @@ fn operand_stack_survives_epoch_callback_collection() {
     let run = inst.get_typed_func::<(), i32>(&mut store, "run").unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 42);
 }
+
+#[test]
+fn bulk_i64_preserves_bits_and_checks_shapes() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let ty = ArrayType::new(
+        &engine,
+        FieldType::new(Mutability::Var, StorageType::ValType(ValType::I64)),
+    );
+    let pre = ArrayRefPre::new(&mut store, ty);
+    let values = [0, 1, u64::MAX, 1 << 63, 0x0123_4567_89AB_CDEF];
+    let array = ArrayRef::new_from_i64_slice(&mut store, &pre, &values).unwrap();
+    let mut actual = [0; 5];
+    array.copy_to_i64_slice(&store, &mut actual).unwrap();
+    assert_eq!(actual, values);
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            array.get(&store, i as u32).unwrap().unwrap_i64() as u64,
+            *value
+        );
+    }
+    assert!(array.copy_to_i64_slice(&store, &mut [0; 4]).is_err());
+    let byte_pre = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8)),
+    );
+    assert!(ArrayRef::new_from_i64_slice(&mut store, &byte_pre, &values).is_err());
+    let bytes = ArrayRef::new_zeroed_i8(&mut store, &byte_pre, 5).unwrap();
+    assert!(bytes.copy_to_i64_slice(&store, &mut actual).is_err());
+    let mut zeroes = [1; 5];
+    bytes.copy_to_i8_slice(&store, &mut zeroes).unwrap();
+    assert_eq!(zeroes, [0; 5]);
+    let empty = ArrayRef::new_from_i64_slice(&mut store, &pre, &[]).unwrap();
+    empty.copy_to_i64_slice(&store, &mut []).unwrap();
+    assert!(ArrayRef::new_zeroed_i8(&mut store, &pre, 1).is_err());
+}
+
+#[test]
+fn bulk_allocations_refuse_before_building_the_body() {
+    let mut config = submilli_wasm::Config::new();
+    config.gc_heap_reservation(0);
+    let engine = Engine::new(&config).unwrap();
+    let mut store = Store::new(
+        &engine,
+        submilli_wasm::StoreLimitsBuilder::new()
+            .memory_size(1024)
+            .build(),
+    );
+    store.limiter(|limits| limits);
+    let bytes = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8)),
+    );
+    assert!(ArrayRef::new_zeroed_i8(&mut store, &bytes, 2048).is_err());
+    let limbs = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(
+            &engine,
+            FieldType::new(Mutability::Var, StorageType::ValType(ValType::I64)),
+        ),
+    );
+    assert!(ArrayRef::new_from_i64_slice(&mut store, &limbs, &[0; 256]).is_err());
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
