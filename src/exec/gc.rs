@@ -7,6 +7,7 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 
 use super::Execution;
+use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::{
@@ -37,7 +38,7 @@ impl Execution {
             }
             Op::StructSet { ty, field } => self.struct_set(inner, instance, *ty, *field),
             Op::RefI31 => {
-                let v = self.pop_i32();
+                let v = self.pop_i32()?;
                 self.push(anyref_value(anyref_handle_i31(v)));
                 Ok(())
             }
@@ -66,7 +67,7 @@ impl Execution {
         } else {
             // Operands sit on the stack in field order; fill from the last field back.
             for &slot in fields.iter().rev() {
-                let v = self.pop_val_for(slot);
+                let v = self.pop_val_for(slot)?;
                 write_slot(slot, &mut data, v);
             }
         }
@@ -85,9 +86,14 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let slot = module.inner().struct_field(ty, field)?;
-        let r = self.pop_anyref();
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullStructReference)?;
-        let data = &inner.gc_object(obj).expect("live gc slot").data;
+        let data = &inner
+            .gc_object(obj)
+            .ok_or(InternalError::GcMetadata(
+                "struct operand refers to a missing object",
+            ))?
+            .data;
         let v = match ext {
             None => read_slot(slot, data),
             Some(signed) => Val::I32(read_slot_packed(slot, data, signed)),
@@ -105,19 +111,26 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let slot = module.inner().struct_field(ty, field)?;
-        let v = self.pop_val_for(slot);
-        let r = self.pop_anyref();
+        let v = self.pop_val_for(slot)?;
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullStructReference)?;
-        let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
+        let data = &mut inner
+            .gc_object_mut(obj)
+            .ok_or(InternalError::GcMetadata(
+                "struct operand refers to a missing object",
+            ))?
+            .data;
         write_slot(slot, data, v);
         Ok(())
     }
 
     fn i31_get(&mut self, signed: bool) -> Result<()> {
-        let handle = match self.pop_anyref() {
+        let handle = match self.pop_anyref()? {
             Val::AnyRef(Some(r)) => r.raw(),
             Val::AnyRef(None) => return Err(Trap::NullI31Reference.into()),
-            _ => unreachable!("i31.get on non-anyref"),
+            _ => {
+                return Err(InternalError::OperandStack("i31.get operand is not an anyref").into())
+            }
         };
         let v = match decode_anyref_handle(handle) {
             // `get_u` reads the same 31-bit payload zero-extended (mask off the sign extension).
@@ -128,7 +141,9 @@ impl Execution {
                     s & 0x7FFF_FFFF
                 }
             }
-            AnyRefHandle::Slot(_) => unreachable!("i31.get on non-i31"),
+            AnyRefHandle::Slot(_) => {
+                return Err(InternalError::OperandStack("i31.get operand is not an i31").into())
+            }
         };
         self.push(Val::I32(v));
         Ok(())
@@ -142,9 +157,11 @@ pub(super) fn anyref_slot(r: &Val, null_trap: Trap) -> Result<u32> {
     match r {
         Val::AnyRef(Some(rooted)) => match decode_anyref_handle(rooted.raw()) {
             AnyRefHandle::Slot(i) => Ok(i),
-            AnyRefHandle::I31(_) => unreachable!("aggregate op on i31"),
+            AnyRefHandle::I31(_) => {
+                Err(InternalError::OperandStack("aggregate operand is an i31").into())
+            }
         },
         Val::AnyRef(None) => Err(null_trap.into()),
-        _ => unreachable!("operand validated as anyref"),
+        _ => Err(InternalError::OperandStack("aggregate operand is not an anyref").into()),
     }
 }

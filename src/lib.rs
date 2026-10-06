@@ -119,6 +119,7 @@ mod module;
 mod store;
 mod trap;
 mod value;
+mod value_match;
 
 // `bail!`/`ensure!`/`format_err!` are exported at the crate root via `#[macro_export]`.
 pub use crate::error::{Error, Result};

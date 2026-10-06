@@ -48,8 +48,8 @@ impl Execution {
     }
 
     #[inline]
-    fn pop_v128(&mut self) -> u128 {
-        self.pop().unwrap_v128().as_u128()
+    fn pop_v128(&mut self) -> Result<u128> {
+        Ok(self.pop_v128_cell()?.unwrap_v128().as_u128())
     }
 
     #[inline]
@@ -63,10 +63,11 @@ impl Execution {
         split: fn(u128) -> [T; N],
         join: fn([T; N]) -> u128,
         f: impl Fn(T, T) -> T,
-    ) {
-        let b = self.pop_v128();
-        let a = self.pop_v128();
+    ) -> Result<()> {
+        let b = self.pop_v128()?;
+        let a = self.pop_v128()?;
         self.push_v128(join(lanes::zip(split(a), split(b), f)));
+        Ok(())
     }
 
     /// Lanewise unary op (same lane count). Lane-count-changing ops (extend/narrow) are bespoke.
@@ -75,9 +76,10 @@ impl Execution {
         split: fn(u128) -> [T; N],
         join: fn([U; N]) -> u128,
         f: impl Fn(T) -> U,
-    ) {
-        let a = self.pop_v128();
+    ) -> Result<()> {
+        let a = self.pop_v128()?;
         self.push_v128(join(lanes::map(split(a), f)));
+        Ok(())
     }
 
     /// Lanewise comparison: each lane becomes an all-ones (`0xff…`) or all-zero mask.
@@ -85,12 +87,13 @@ impl Execution {
         &mut self,
         split: fn(u128) -> [T; N],
         f: impl Fn(T, T) -> bool,
-    ) {
-        let b = self.pop_v128();
-        let a = self.pop_v128();
+    ) -> Result<()> {
+        let b = self.pop_v128()?;
+        let a = self.pop_v128()?;
         let (la, lb) = (split(a), split(b));
         let mask: [bool; N] = core::array::from_fn(|i| f(la[i], lb[i]));
         self.push_v128(cmp_mask(mask));
+        Ok(())
     }
 
     /// Lanewise shift by a scalar `i32` count, masked to the lane width.
@@ -99,11 +102,12 @@ impl Execution {
         split: fn(u128) -> [T; N],
         join: fn([T; N]) -> u128,
         f: impl Fn(T, u32) -> T,
-    ) {
-        let count = self.pop_i32() as u32;
-        let a = self.pop_v128();
+    ) -> Result<()> {
+        let count = self.pop_i32()? as u32;
+        let a = self.pop_v128()?;
         let s = count % (128 / N as u32);
         self.push_v128(join(lanes::map(split(a), |x| f(x, s))));
+        Ok(())
     }
 }
 

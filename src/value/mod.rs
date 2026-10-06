@@ -20,6 +20,7 @@ pub use rec_group::{
     FuncTypeBuilder, PendingType, RecGroup, RecGroupBuilder, StructTypeBuilder,
 };
 pub use tag_type::TagType;
+pub(crate) use types::val_type_belongs_to_engine;
 pub use types::{
     ExportType, ExternType, FuncType, GlobalType, HeapType, ImportType, MemoryType, Mutability,
     RefType, TableType, ValType,

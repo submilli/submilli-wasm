@@ -5,8 +5,8 @@
 
 use submilli_wasm::{
     ArrayRef, ArrayRefPre, ArrayType, Collector, Config, Engine, ExternRef, FieldType, Func,
-    FuncType, GcHeapOutOfMemory, Instance, Module, Mutability, RootScope, StorageType, Store,
-    StoreLimitsBuilder, StructRef, StructRefPre, StructType, Val, ValType,
+    FuncType, GcHeapOutOfMemory, Global, GlobalType, Instance, Module, Mutability, RootScope,
+    StorageType, Store, StoreLimitsBuilder, StructRef, StructRefPre, StructType, Val, ValType,
 };
 
 fn engine_with(collector: Collector) -> Engine {
@@ -376,6 +376,100 @@ fn host_root_keeps_object_alive_then_stale_handle_faults() {
         stale.field(&store, 0).is_err(),
         "stale handle after slot reuse must fault"
     );
+}
+
+#[test]
+fn store_owned_values_reject_stale_gc_references() {
+    let engine = engine_with(Collector::Auto);
+    let mut store = Store::new(&engine, ());
+    let leaf_ty = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::I32),
+        )],
+    )
+    .unwrap();
+    let leaf_pre = StructRefPre::new(&mut store, leaf_ty);
+    let stale = {
+        let mut scope = RootScope::new(&mut store);
+        StructRef::new(&mut scope, &leaf_pre, &[Val::I32(1)])
+            .unwrap()
+            .to_anyref()
+    };
+    store.gc();
+    let _replacement = StructRef::new(&mut store, &leaf_pre, &[Val::I32(2)]).unwrap();
+
+    assert!(Global::new(
+        &mut store,
+        GlobalType::new(ValType::ANYREF, Mutability::Var),
+        Val::AnyRef(Some(stale)),
+    )
+    .is_err());
+
+    let holder_ty = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::ANYREF),
+        )],
+    )
+    .unwrap();
+    let holder_pre = StructRefPre::new(&mut store, holder_ty);
+    assert!(StructRef::new(&mut store, &holder_pre, &[Val::AnyRef(Some(stale))]).is_err());
+}
+
+#[test]
+fn reference_read_from_struct_is_rooted_independently_of_parent() {
+    let engine = engine_with(Collector::Auto);
+    let mut store = Store::new(&engine, ());
+    let leaf_ty = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::I32),
+        )],
+    )
+    .unwrap();
+    let leaf_pre = StructRefPre::new(&mut store, leaf_ty);
+    let holder_ty = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::ANYREF),
+        )],
+    )
+    .unwrap();
+    let holder_pre = StructRefPre::new(&mut store, holder_ty);
+    let holder = StructRef::new(&mut store, &holder_pre, &[Val::AnyRef(None)]).unwrap();
+    {
+        let mut scope = RootScope::new(&mut store);
+        let leaf = StructRef::new(&mut scope, &leaf_pre, &[Val::I32(41)]).unwrap();
+        holder
+            .set_field(&mut scope, 0, Val::AnyRef(Some(leaf.to_anyref())))
+            .unwrap();
+    }
+
+    let Val::AnyRef(Some(child)) = holder.field(&store, 0).unwrap() else {
+        panic!("holder field was not a non-null anyref");
+    };
+    holder.set_field(&mut store, 0, Val::AnyRef(None)).unwrap();
+    store.gc();
+
+    let child = child.as_struct(&store).unwrap().unwrap();
+    assert_eq!(child.field(&store, 0).unwrap().unwrap_i32(), 41);
+}
+
+#[test]
+fn reference_identity_distinguishes_gc_arenas() {
+    let engine = engine_with(Collector::Auto);
+    let mut store = Store::new(&engine, ());
+    let ty = StructType::new(&engine, []).unwrap();
+    let pre = StructRefPre::new(&mut store, ty);
+    let any = StructRef::new(&mut store, &pre, &[]).unwrap().to_anyref();
+    let external = ExternRef::new(&mut store, 7_u32).unwrap();
+
+    assert!(!submilli_wasm::Rooted::ref_eq(&store, &any, &external).unwrap());
 }
 
 #[test]

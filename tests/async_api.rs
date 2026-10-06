@@ -14,7 +14,8 @@ use std::task::{Context, Poll};
 use pollster::block_on;
 
 use submilli_wasm::{
-    Caller, Config, Engine, Extern, Func, FuncType, Instance, Module, Store, Val, ValType,
+    AsContextMut, Caller, Config, Engine, ExnRef, ExnRefPre, ExnType, Extern, Func, FuncType,
+    Instance, Module, Store, Tag, TagType, UpdateDeadline, Val, ValType,
 };
 
 // --- helpers --------------------------------------------------------------
@@ -261,4 +262,147 @@ fn sync_call_rejects_async_host_fn() {
         .call(&mut store, &[Val::I32(1)], &mut [Val::I32(0)])
         .unwrap_err();
     assert!(err.to_string().contains("synchronous context"));
+}
+
+#[test]
+fn dropped_fuel_yield_call_restores_execution() {
+    let engine = engine_with(true, false);
+    let mut store = Store::new(&engine, ());
+    store.set_fuel(1_000_000).unwrap();
+    store.fuel_async_yield_interval(Some(1)).unwrap();
+    let m = module(
+        &engine,
+        r#"(module
+            (func (export "run") (loop $l br $l))
+            (func (export "healthy") (result i32) i32.const 7))"#,
+    );
+    let inst = block_on(Instance::new_async(&mut store, &m, &[])).unwrap();
+    let run = inst.get_func(&mut store, "run").unwrap();
+
+    let mut call = Box::pin(run.call_async(&mut store, &[], &mut []));
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(call.as_mut().poll(&mut cx).is_pending());
+    drop(call);
+
+    store.set_fuel(1_000_000).unwrap();
+    let healthy = inst.get_func(&mut store, "healthy").unwrap();
+    let mut out = [Val::I32(0)];
+    block_on(healthy.call_async(&mut store, &[], &mut out)).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 7);
+}
+
+#[test]
+fn dropped_direct_async_host_call_restores_pending_exception() {
+    let engine = engine_with(false, false);
+    let mut store = Store::new(&engine, ());
+    let tag_ty = TagType::new(FuncType::new(&engine, [], []));
+    let tag = Tag::new(&mut store, &tag_ty).unwrap();
+    let pre = std::sync::Arc::new(ExnRefPre::new(
+        &mut store,
+        ExnType::from_tag_type(&tag_ty).unwrap(),
+    ));
+    let pending = Func::new_async(
+        &mut store,
+        ft(&engine, &[], &[]),
+        move |mut caller, _params, _results| {
+            let pre = pre.clone();
+            Box::new(async move {
+                let exn = ExnRef::new(&mut caller, &pre, &tag, &[])?;
+                let _: core::result::Result<(), _> = caller.as_context_mut().throw(exn);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        },
+    );
+
+    let mut call = Box::pin(pending.call_async(&mut store, &[], &mut []));
+    let waker = std::task::Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(call.as_mut().poll(&mut cx).is_pending());
+    drop(call);
+
+    assert!(store.take_pending_exception().is_none());
+    let healthy = Func::wrap(&mut store, || -> i32 { 7 });
+    let mut out = [Val::I32(0)];
+    block_on(healthy.call_async(&mut store, &[], &mut out)).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 7);
+}
+
+#[test]
+fn dropped_reentrant_fuel_yield_call_restores_outer_execution() {
+    let engine = engine_with(true, false);
+    let mut store = Store::new(&engine, ());
+    store.set_fuel(1_000_000).unwrap();
+    store.fuel_async_yield_interval(Some(1)).unwrap();
+    let reenter = Func::new(
+        &mut store,
+        ft(&engine, &[], &[]),
+        |mut caller, _params, _results| {
+            let Some(Extern::Func(inner)) = caller.get_export("inner") else {
+                panic!("missing inner export");
+            };
+            caller.as_context_mut().set_fuel(1_000_000)?;
+            caller.as_context_mut().fuel_async_yield_interval(Some(1))?;
+            let mut call = Box::pin(inner.call_async(&mut caller, &[], &mut []));
+            let waker = std::task::Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+            drop(call);
+            Ok(())
+        },
+    );
+    let m = module(
+        &engine,
+        r#"(module
+            (import "h" "reenter" (func $reenter))
+            (func (export "inner") (loop $l br $l))
+            (func (export "outer") (result i32)
+                i32.const 35 call $reenter i32.const 7 i32.add)
+            (func (export "healthy") (result i32) i32.const 9))"#,
+    );
+    let inst = block_on(Instance::new_async(
+        &mut store,
+        &m,
+        &[Extern::Func(reenter)],
+    ))
+    .unwrap();
+
+    let outer = inst.get_func(&mut store, "outer").unwrap();
+    let mut out = [Val::I32(0)];
+    block_on(outer.call_async(&mut store, &[], &mut out)).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 42);
+
+    let healthy = inst.get_func(&mut store, "healthy").unwrap();
+    block_on(healthy.call_async(&mut store, &[], &mut out)).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 9);
+}
+
+#[test]
+fn epoch_callback_recovers_dropped_reentrant_async_call() {
+    let engine = engine_with(false, true);
+    let mut store = Store::new(&engine, ());
+    let pending = Func::new_async(
+        &mut store,
+        ft(&engine, &[], &[]),
+        |_caller, _params, _results| Box::new(std::future::pending()),
+    );
+    store.epoch_deadline_callback(move |mut ctx| {
+        let mut call = Box::pin(pending.call_async(&mut ctx, &[], &mut []));
+        let waker = std::task::Waker::noop();
+        let mut poll = Context::from_waker(waker);
+        assert!(call.as_mut().poll(&mut poll).is_pending());
+        drop(call);
+        Ok(UpdateDeadline::Continue(1_000_000))
+    });
+    store.set_epoch_deadline(0);
+    let m = module(
+        &engine,
+        "(module (func (export \"outer\") (result i32) i32.const 42))",
+    );
+    let inst = block_on(Instance::new_async(&mut store, &m, &[])).unwrap();
+    let outer = inst.get_func(&mut store, "outer").unwrap();
+    let mut result = [Val::I32(0)];
+    block_on(outer.call_async(&mut store, &[], &mut result)).unwrap();
+    assert_eq!(result[0].unwrap_i32(), 42);
 }

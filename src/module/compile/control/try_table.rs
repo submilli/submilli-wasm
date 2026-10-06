@@ -33,7 +33,7 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn push_try_table(&mut self, tt: &TryTable) {
         self.fusable_cmp = None;
         let (param_count, result_count) = self.block_arity(tt.ty);
-        let base_height = self.height.saturating_sub(param_count);
+        let base_height = self.height_below(param_count);
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::TryTable,
             base_height,

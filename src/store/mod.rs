@@ -26,6 +26,8 @@ pub(crate) use gc::{
 pub(crate) use gc_codec::{
     default_for_slot, read_slot, read_slot_packed, slot_accepts, write_slot, NULL_REF,
 };
+#[cfg(feature = "async")]
+pub(crate) use inner::AsyncCallBoundary;
 pub(crate) use inner::{FuelStep, StoreInner};
 #[cfg(feature = "async")]
 pub use limits::ResourceLimiterAsync;
@@ -94,6 +96,11 @@ impl<T: 'static> core::fmt::Debug for Store<T> {
 }
 
 impl<T: 'static> Store<T> {
+    pub(crate) fn recover_async_cancellation(&mut self) {
+        #[cfg(feature = "async")]
+        self.inner.recover_cancelled_async_calls();
+    }
+
     /// Creates a new store associated with `engine`, carrying host state `data`.
     pub fn new(engine: &Engine, data: T) -> Self {
         Store {
@@ -127,6 +134,7 @@ impl<T: 'static> Store<T> {
     }
 
     pub fn data_mut(&mut self) -> &mut T {
+        self.recover_async_cancellation();
         &mut self.data
     }
 
@@ -148,26 +156,45 @@ impl<T: 'static> Store<T> {
     /// from inside a host function, the parked execution's operands are seeded too
     /// (`exec_roots`), so a guest reference on the stack survives an embedder-forced collection.
     pub fn gc(&mut self) {
-        let roots = self.inner.exec_roots();
-        self.inner.gc_collect(&roots);
+        self.recover_async_cancellation();
+        let outcome = self
+            .inner
+            .exec_roots()
+            .and_then(|roots| self.inner.gc_collect(&roots));
+        if let Err(error) = outcome {
+            if let Some(error) = error.downcast_ref::<crate::error::InternalError>() {
+                self.inner.latch_internal_error(*error);
+            }
+        }
     }
 
     /// Throws `exception` from a host function so the guest's `try_table` can catch it (#28g).
     /// Returns `Err(ThrownException)`; the generic result lets it slot into any host-fn return type.
+    ///
     pub fn throw<R>(
         &mut self,
         exception: Rooted<ExnRef>,
     ) -> core::result::Result<R, ThrownException> {
+        self.recover_async_cancellation();
+        if self.inner.exn_checked(exception).is_err() {
+            self.inner
+                .latch_internal_error(crate::error::InternalError::GcMetadata(
+                    "host attempted to throw a stale exception reference",
+                ));
+            return Err(ThrownException);
+        }
         self.inner.set_pending_exception(exception);
         Err(ThrownException)
     }
 
     /// Takes the exception that surfaced from the last call (or a host `throw`), if any.
     pub fn take_pending_exception(&mut self) -> Option<Rooted<ExnRef>> {
-        self.inner.take_pending_exception()
+        self.recover_async_cancellation();
+        self.inner.take_pending_exception_host()
     }
 
     pub fn set_fuel(&mut self, fuel: u64) -> Result<()> {
+        self.recover_async_cancellation();
         if !self.inner.engine().consume_fuel() {
             return Err(Error::msg(
                 "fuel is not configured; set `Config::consume_fuel(true)`",
@@ -187,6 +214,7 @@ impl<T: 'static> Store<T> {
     }
 
     pub fn set_epoch_deadline(&mut self, ticks_beyond_current: u64) {
+        self.recover_async_cancellation();
         let deadline = self
             .inner
             .engine()
@@ -196,6 +224,7 @@ impl<T: 'static> Store<T> {
     }
 
     pub fn epoch_deadline_trap(&mut self) {
+        self.recover_async_cancellation();
         self.epoch_callback = None;
     }
 
@@ -203,6 +232,7 @@ impl<T: 'static> Store<T> {
         &mut self,
         callback: impl FnMut(StoreContextMut<'_, T>) -> Result<UpdateDeadline> + Send + Sync + 'static,
     ) {
+        self.recover_async_cancellation();
         self.epoch_callback = Some(Box::new(callback));
     }
 
@@ -210,6 +240,7 @@ impl<T: 'static> Store<T> {
         &mut self,
         limiter: impl (FnMut(&mut T) -> &mut dyn ResourceLimiter) + Send + Sync + 'static,
     ) {
+        self.recover_async_cancellation();
         self.limiter = Some(ResourceLimiterInner::Sync(Box::new(limiter)));
     }
 
@@ -220,6 +251,7 @@ impl<T: 'static> Store<T> {
         &mut self,
         limiter: impl (FnMut(&mut T) -> &mut dyn ResourceLimiterAsync) + Send + Sync + 'static,
     ) {
+        self.recover_async_cancellation();
         self.limiter = Some(ResourceLimiterInner::Async(Box::new(limiter)));
     }
 
@@ -230,6 +262,7 @@ impl<T: 'static> Store<T> {
     }
 
     pub fn as_context_mut(&mut self) -> StoreContextMut<'_, T> {
+        self.recover_async_cancellation();
         StoreContextMut(self)
     }
 
@@ -238,6 +271,7 @@ impl<T: 'static> Store<T> {
     /// `consume_fuel` and an async store; `Some(0)` is rejected.
     #[cfg(feature = "async")]
     pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
+        self.recover_async_cancellation();
         if !self.inner.engine().consume_fuel() {
             return Err(Error::msg(
                 "fuel is not configured; set `Config::consume_fuel(true)`",
@@ -259,6 +293,7 @@ impl<T: 'static> Store<T> {
     /// deadline by `delta` ticks (instead of trapping). Requires an async store at run time.
     #[cfg(feature = "async")]
     pub fn epoch_deadline_async_yield_and_update(&mut self, delta: u64) {
+        self.recover_async_cancellation();
         self.epoch_callback = Some(Box::new(move |_| Ok(UpdateDeadline::Yield(delta))));
     }
 }

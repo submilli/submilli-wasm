@@ -62,6 +62,54 @@ fn inner_trap_isolated_outer_resumes() {
     );
 }
 
+/// An interpreter-owned ABI failure in a re-entered call cannot be swallowed by the host callback.
+/// It terminates the outer execution, cleans up the shared stacks, and leaves the store reusable.
+#[test]
+fn inner_internal_failure_terminates_outer_and_cleans_up() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let bad = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], [ValType::I32]),
+        |_caller, _args, results| {
+            results[0] = Val::I64(1);
+            Ok(())
+        },
+    );
+    let reenter = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        move |mut caller, _args, _results| {
+            let mut ignored = [Val::I32(0)];
+            let _ = bad.call(&mut caller, &[], &mut ignored);
+            Ok(())
+        },
+    );
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"(module
+                (import "h" "reenter" (func $reenter))
+                (func (export "outer") call $reenter)
+                (func (export "healthy") (result i32) i32.const 7))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let inst = Instance::new(&mut store, &module, &[Extern::Func(reenter)]).unwrap();
+
+    let outer = inst.get_func(&mut store, "outer").unwrap();
+    let error = outer.call(&mut store, &[], &mut []).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("internal result shape invariant violated"));
+
+    let healthy = inst.get_func(&mut store, "healthy").unwrap();
+    let mut result = [Val::I32(0)];
+    healthy.call(&mut store, &[], &mut result).unwrap();
+    assert_eq!(result[0].unwrap_i32(), 7);
+}
+
 /// Case 2 — an exception thrown in the inner call (no matching handler there) surfaces to the host's
 /// `Func::call` as `ThrownException`, not to the outer call.
 #[test]

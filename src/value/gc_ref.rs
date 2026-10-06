@@ -4,6 +4,7 @@
 use core::any::Any;
 use core::marker::PhantomData;
 
+use crate::canon::RefKind;
 use crate::store::{
     decode_anyref_handle, AnyRefHandle, AsContext, AsContextMut, GcObject, ObjKind, StoreContext,
     StoreContextMut,
@@ -17,11 +18,16 @@ use super::gc_aggregate::{ArrayRef, StructRef};
 /// host-created `Rooted`s captured via the GC API carry a real generation for the stale-handle
 /// check (#27g).
 const UNCHECKED_GENERATION: u32 = u32::MAX;
+const UNCHECKED_STORE: u64 = 0;
 
 /// A rooted handle to a GC value, keeping it alive within a [`RootScope`].
 /// `Copy`, regardless of the referent type (mirrors `wasmtime::Rooted`).
 pub struct Rooted<T> {
     index: u32,
+    arena: RefKind,
+    /// Store identity captured when this handle crosses the host boundary. Internal handles use
+    /// [`UNCHECKED_STORE`] because their store provenance is guaranteed by the execution path.
+    store: u64,
     /// GC-heap slot generation captured at creation (host GC handles), or
     /// [`UNCHECKED_GENERATION`]. A mismatch against the slot's current generation means the object
     /// was collected and the slot reused — a stale handle.
@@ -41,9 +47,11 @@ impl<T> Rooted<T> {
     /// Wraps a raw handle/index (an `anyref` handle for `AnyRef`, an arena index for
     /// `ExternRef`). Internal — the run loop builds reference values from raw handles. The handle is
     /// **unchecked** (no generation): internal references never dangle (precise non-moving GC).
-    pub(crate) fn from_raw(index: u32) -> Self {
+    pub(crate) fn from_raw(index: u32, arena: RefKind) -> Self {
         Rooted {
             index,
+            arena,
+            store: UNCHECKED_STORE,
             generation: UNCHECKED_GENERATION,
             _marker: PhantomData,
         }
@@ -51,10 +59,22 @@ impl<T> Rooted<T> {
 
     /// Wraps a raw handle with a captured GC-slot `generation` (a host GC handle the embedder may
     /// hold across a collection — the generation catches use after the object is collected).
-    pub(crate) fn from_raw_gen(index: u32, generation: u32) -> Self {
+    pub(crate) fn from_raw_gen(index: u32, generation: u32, store: u64, arena: RefKind) -> Self {
         Rooted {
             index,
+            arena,
+            store,
             generation,
+            _marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn from_raw_store(index: u32, store: u64, arena: RefKind) -> Self {
+        Rooted {
+            index,
+            arena,
+            store,
+            generation: UNCHECKED_GENERATION,
             _marker: PhantomData,
         }
     }
@@ -64,10 +84,30 @@ impl<T> Rooted<T> {
         self.index
     }
 
+    pub(crate) fn check_store(self, inner: &crate::store::StoreInner) {
+        inner.check_handle(self.store);
+    }
+
+    pub(crate) fn belongs_to_store(self, inner: &crate::store::StoreInner) -> bool {
+        self.store == UNCHECKED_STORE || self.store == inner.store_id()
+    }
+
+    /// Reinterprets a rooted handle without losing its stale-handle generation.
+    pub(crate) fn cast<U>(self) -> Rooted<U> {
+        Rooted {
+            index: self.index,
+            arena: self.arena,
+            store: self.store,
+            generation: self.generation,
+            _marker: PhantomData,
+        }
+    }
+
     /// Resolves this handle to a live GC-heap slot, faulting if a captured generation no longer
     /// matches the slot's — the object was collected and its slot reused, so this host handle is
     /// stale (#27g). Internal/`UNCHECKED` handles skip the generation check.
     pub(crate) fn gc_slot_checked(self, inner: &crate::store::StoreInner) -> Result<u32> {
+        inner.check_handle(self.store);
         let slot = gc_slot(inner, self.index)?;
         if self.generation != UNCHECKED_GENERATION
             && inner.gc.generation(slot) != Some(self.generation)
@@ -81,8 +121,16 @@ impl<T> Rooted<T> {
     /// slot index. Internal/`UNCHECKED` handles skip the check; a mismatch (or a missing slot, i.e.
     /// `None`) means the referent was collected and its slot possibly reused — a stale handle. Used
     /// by the reclaimable `externref`/`exn` arenas (the GC heap uses [`gc_slot_checked`](Self::gc_slot_checked)).
-    pub(crate) fn checked(self, current_generation: Option<u32>) -> Result<u32> {
-        if self.generation != UNCHECKED_GENERATION && current_generation != Some(self.generation) {
+    pub(crate) fn checked(
+        self,
+        current_generation: Option<u32>,
+        inner: &crate::store::StoreInner,
+    ) -> Result<u32> {
+        inner.check_handle(self.store);
+        let Some(current_generation) = current_generation else {
+            return Err(Error::msg("stale reference (object was collected)"));
+        };
+        if self.generation != UNCHECKED_GENERATION && current_generation != self.generation {
             return Err(Error::msg("stale reference (object was collected)"));
         }
         Ok(self.index)
@@ -91,8 +139,37 @@ impl<T> Rooted<T> {
     /// Whether `a` and `b` refer to the same GC object (reference identity). Under the grow-only
     /// arena each live object has a unique handle, so this is handle equality. An associated
     /// function (not a method), matching `wasmtime::Rooted::ref_eq`'s `(store, a, b)` shape.
-    pub fn ref_eq<U>(_store: impl AsContext, a: &Rooted<T>, b: &Rooted<U>) -> Result<bool> {
-        Ok(a.index == b.index)
+    pub fn ref_eq<U>(store: impl AsContext, a: &Rooted<T>, b: &Rooted<U>) -> Result<bool> {
+        let ctx = store.as_context();
+        ctx.inner().check_handle(a.store);
+        ctx.inner().check_handle(b.store);
+        a.validate_liveness(ctx.inner())?;
+        b.validate_liveness(ctx.inner())?;
+        Ok(a.arena == b.arena
+            && a.index == b.index
+            && (a.generation == UNCHECKED_GENERATION
+                || b.generation == UNCHECKED_GENERATION
+                || a.generation == b.generation))
+    }
+
+    fn validate_liveness(self, inner: &crate::store::StoreInner) -> Result<()> {
+        match self.arena {
+            RefKind::Any => {
+                if matches!(decode_anyref_handle(self.index), AnyRefHandle::Slot(_)) {
+                    self.gc_slot_checked(inner)?;
+                }
+            }
+            RefKind::Extern => {
+                let _ = inner.externref_checked(self.cast::<ExternRef>())?;
+            }
+            RefKind::Exn => {
+                let _ = inner.exn_checked(self.cast::<ExnRef>())?;
+            }
+            RefKind::Func => {
+                return Err(Error::msg("invalid rooted reference arena"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -171,6 +248,8 @@ impl ExternRef {
         Ok(Rooted::from_raw_gen(
             index,
             inner.externref_generation(index),
+            inner.store_id(),
+            RefKind::Extern,
         ))
     }
 }
@@ -219,13 +298,12 @@ impl Rooted<AnyRef> {
 
     /// This `anyref` as a `structref` if it is one, else `None`.
     pub fn as_struct(&self, store: impl AsContext) -> Result<Option<Rooted<StructRef>>> {
-        Ok(
-            if obj_kind(store.as_context().inner(), self.raw())? == Some(ObjKind::Struct) {
-                Some(Rooted::from_raw(self.raw()))
-            } else {
-                None
-            },
-        )
+        let ctx = store.as_context();
+        Ok(if obj_kind(ctx.inner(), *self)? == Some(ObjKind::Struct) {
+            Some(self.cast())
+        } else {
+            None
+        })
     }
 
     /// Reinterprets this `anyref` as an `arrayref`, erroring if it isn't one.
@@ -236,13 +314,12 @@ impl Rooted<AnyRef> {
 
     /// This `anyref` as an `arrayref` if it is one, else `None`.
     pub fn as_array(&self, store: impl AsContext) -> Result<Option<Rooted<ArrayRef>>> {
-        Ok(
-            if obj_kind(store.as_context().inner(), self.raw())? == Some(ObjKind::Array) {
-                Some(Rooted::from_raw(self.raw()))
-            } else {
-                None
-            },
-        )
+        let ctx = store.as_context();
+        Ok(if obj_kind(ctx.inner(), *self)? == Some(ObjKind::Array) {
+            Some(self.cast())
+        } else {
+            None
+        })
     }
 }
 
@@ -272,9 +349,12 @@ pub(super) fn gc_object(inner: &crate::store::StoreInner, slot: u32) -> Result<&
 }
 
 /// The `ObjKind` of the object an `anyref` handle points at (`None` for an `i31`).
-fn obj_kind(inner: &crate::store::StoreInner, handle: u32) -> Result<Option<ObjKind>> {
-    match decode_anyref_handle(handle) {
+fn obj_kind(inner: &crate::store::StoreInner, handle: Rooted<AnyRef>) -> Result<Option<ObjKind>> {
+    match decode_anyref_handle(handle.raw()) {
         AnyRefHandle::I31(_) => Ok(None),
-        AnyRefHandle::Slot(i) => Ok(Some(gc_object(inner, i)?.header.kind)),
+        AnyRefHandle::Slot(_) => {
+            let slot = handle.gc_slot_checked(inner)?;
+            Ok(Some(gc_object(inner, slot)?.header.kind))
+        }
     }
 }

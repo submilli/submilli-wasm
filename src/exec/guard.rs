@@ -25,10 +25,79 @@ pub(crate) fn reraise(payload: Box<dyn Any + Send>) -> ! {
 /// Restores the store state a re-entrant host call mutated — the parked execution (emptying
 /// `exec_slot`), the scoped GC roots, and the pending-exception slot — so the store stays consistent
 /// for its next use after a contained host-fn panic (#33), before the panic is [`reraise`]d.
-pub(crate) fn restore_after_panic(inner: &mut crate::store::StoreInner, roots_mark: usize) {
-    let _ = inner.take_exec();
+pub(crate) fn restore_after_panic(
+    inner: &mut crate::store::StoreInner,
+    roots_mark: usize,
+    pending: Option<crate::value::Rooted<crate::value::ExnRef>>,
+    pending_generation: u64,
+) {
+    inner.clear_internal_error();
+    #[cfg(feature = "async")]
+    inner.recover_cancelled_async_calls();
+    let mut exec = inner.take_exec();
+    match exec.discard_current_call() {
+        Ok((value_base, stop_depth)) => {
+            #[cfg(feature = "async")]
+            inner.abandon_async_call_boundary(value_base, stop_depth);
+            if stop_depth != 0 {
+                inner.park_exec(exec);
+            }
+        }
+        Err(error) => {
+            if let Some(error) = error.downcast_ref::<crate::error::InternalError>() {
+                inner.latch_internal_error(*error);
+            }
+        }
+    }
     inner.gc_roots_truncate(roots_mark);
-    inner.take_pending_exception();
+    inner.restore_pending_exception(pending, pending_generation);
+}
+
+/// Restores resources owned by a directly-called host function. There is no execution boundary to
+/// discard; an execution parked by an outer callback must remain intact.
+pub(crate) fn restore_direct_after_panic(
+    inner: &mut crate::store::StoreInner,
+    roots_mark: usize,
+    pending: Option<crate::value::Rooted<crate::value::ExnRef>>,
+    pending_generation: u64,
+) {
+    #[cfg(feature = "async")]
+    inner.recover_cancelled_async_calls();
+    inner.gc_roots_truncate(roots_mark);
+    inner.restore_pending_exception(pending, pending_generation);
+}
+
+/// Marks a suspended async host-call cleanup record if its owning future is dropped while pending.
+/// The next mutable store access performs the actual safe cleanup after the callback future has
+/// released its store borrow.
+#[cfg(feature = "async")]
+pub(crate) struct AsyncCancellation {
+    token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+#[cfg(feature = "async")]
+impl AsyncCancellation {
+    pub(crate) fn new(token: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        AsyncCancellation { token, armed: true }
+    }
+
+    pub(crate) fn token(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+        &self.token
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "async")]
+impl Drop for AsyncCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Future adapter that contains a panic from polling `F` (an async host fn's boxed future), yielding

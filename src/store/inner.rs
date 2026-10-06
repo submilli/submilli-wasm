@@ -20,6 +20,23 @@ use super::{
     ExnEntity, FuncEntity, GlobalEntity, InstanceEntity, MemoryEntity, TableEntity, TagEntity,
 };
 
+#[cfg(feature = "async")]
+#[derive(Debug)]
+pub(crate) struct AsyncCallBoundary {
+    pub(crate) value_base: usize,
+    pub(crate) stop_depth: usize,
+}
+
+#[cfg(feature = "async")]
+#[derive(Debug)]
+struct AsyncCallCleanup {
+    cancelled: Arc<AtomicBool>,
+    roots_mark: Option<usize>,
+    pending: Option<Rooted<ExnRef>>,
+    pending_generation: u64,
+    boundary: Option<AsyncCallBoundary>,
+}
+
 /// Outcome of charging one unit of fuel (see [`StoreInner::consume_fuel_step`]).
 pub(crate) enum FuelStep {
     /// Fuel was available and charged; keep running.
@@ -66,7 +83,7 @@ pub(crate) struct StoreInner {
     /// Live host-held GC roots (`Rooted` handed to the embedder via the GC host API, scoped by
     /// `RootScope`). Enumerated at collection so a host reference held across a guest collection
     /// keeps its object alive (#27g). Each is `(handle, hierarchy)`.
-    pub(super) gc_roots: Vec<(u32, crate::canon::RefKind)>,
+    pub(super) gc_roots: std::sync::RwLock<Vec<(u32, crate::canon::RefKind)>>,
     /// Canonical type ids of host-allocated GC objects, each pinned with one type-registration
     /// (decref'd on store drop) so a host object outliving its `StructType` handle keeps its type
     /// (#27i; mirrors wasmtime's `gc_host_alloc_types`).
@@ -82,6 +99,16 @@ pub(crate) struct StoreInner {
     epoch_deadline: u64,
     /// Exception surfaced from the last call / a host `throw`; taken via `take_pending_exception`.
     pub(super) pending_exception: Option<Rooted<ExnRef>>,
+    /// Monotonic identity of the last exception installed in `pending_exception`. Host-call
+    /// boundaries snapshot this so a stale pending exception cannot be paired with a later,
+    /// unrelated `ThrownException` error.
+    pub(super) pending_exception_generation: u64,
+    /// First execution invariant failure observed by an infallible public operation.
+    internal_error: Option<crate::error::InternalError>,
+    /// Cleanup records for async host calls currently suspended at `.await`. A drop token marks a
+    /// record cancelled; the next mutable store access restores it before exposing the store.
+    #[cfg(feature = "async")]
+    async_call_cleanups: Vec<AsyncCallCleanup>,
     /// The shared interpreter execution, parked for the duration of a host call so a host fn
     /// that re-enters wasm (`Func::call`) runs on the *same* operand/frame stacks (separated
     /// by a [`Delimiter`](crate::exec::Delimiter)); empty (default) outside a host call.
@@ -108,13 +135,17 @@ impl StoreInner {
             instances: Arena::default(),
             externrefs: ExternRefs::default(),
             gc,
-            gc_roots: Vec::new(),
+            gc_roots: std::sync::RwLock::new(Vec::new()),
             gc_host_alloc_types: std::collections::HashSet::new(),
             fuel: 0,
             fuel_reserve: 0,
             fuel_yield_interval: None,
             epoch_deadline: u64::MAX,
             pending_exception: None,
+            pending_exception_generation: 0,
+            internal_error: None,
+            #[cfg(feature = "async")]
+            async_call_cleanups: Vec::new(),
             exec_slot: crate::exec::Execution::default(),
             gc_request,
         }
@@ -150,8 +181,111 @@ impl StoreInner {
     /// The operand/local GC roots of the parked execution (empty when none is parked). Seeds a
     /// collection triggered from a host call (`gc_reserve_host`/`Store::gc`), where the guest's
     /// operands live on the parked execution rather than a running one.
-    pub(crate) fn exec_roots(&self) -> Vec<(u32, crate::canon::RefKind)> {
-        self.exec_slot.operand_roots().collect()
+    pub(crate) fn exec_roots(&self) -> crate::Result<Vec<(u32, crate::canon::RefKind)>> {
+        self.exec_slot.operand_roots()
+    }
+
+    pub(crate) fn has_parked_execution(&self) -> bool {
+        !self.exec_slot.is_empty()
+    }
+
+    pub(crate) fn latch_internal_error(&mut self, error: crate::error::InternalError) {
+        if self.internal_error.is_none() {
+            self.internal_error = Some(error);
+        }
+    }
+
+    pub(crate) fn take_internal_error(&mut self) -> Option<crate::Error> {
+        self.internal_error.take().map(Into::into)
+    }
+
+    pub(crate) fn internal_error(&self) -> Option<crate::Error> {
+        self.internal_error.map(Into::into)
+    }
+
+    pub(crate) fn clear_internal_error(&mut self) {
+        self.internal_error = None;
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn begin_async_call_cleanup(
+        &mut self,
+        roots_mark: Option<usize>,
+        pending: Option<Rooted<ExnRef>>,
+        pending_generation: u64,
+        boundary: Option<AsyncCallBoundary>,
+    ) -> Arc<AtomicBool> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.async_call_cleanups.push(AsyncCallCleanup {
+            cancelled: cancelled.clone(),
+            roots_mark,
+            pending,
+            pending_generation,
+            boundary,
+        });
+        cancelled
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn complete_async_call_cleanup(
+        &mut self,
+        token: &Arc<AtomicBool>,
+    ) -> crate::Result<()> {
+        let record =
+            self.async_call_cleanups
+                .last()
+                .ok_or(crate::error::InternalError::FrameStack(
+                    "missing async call cleanup record",
+                ))?;
+        if !Arc::ptr_eq(&record.cancelled, token) {
+            return Err(crate::error::InternalError::FrameStack(
+                "async call cleanup order mismatch",
+            )
+            .into());
+        }
+        self.async_call_cleanups.pop();
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn recover_cancelled_async_calls(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        while self
+            .async_call_cleanups
+            .last()
+            .is_some_and(|record| record.cancelled.load(Ordering::Acquire))
+        {
+            let Some(record) = self.async_call_cleanups.pop() else {
+                break;
+            };
+            if let Some(boundary) = record.boundary {
+                let mut exec = self.take_exec();
+                if let Err(error) = exec.discard_to(boundary.value_base, boundary.stop_depth) {
+                    if let Some(internal) = error.downcast_ref::<crate::error::InternalError>() {
+                        self.latch_internal_error(*internal);
+                    }
+                }
+                if boundary.stop_depth != 0 {
+                    self.park_exec(exec);
+                }
+            }
+            if let Some(mark) = record.roots_mark {
+                self.gc_roots_truncate(mark);
+            }
+            self.restore_pending_exception(record.pending, record.pending_generation);
+        }
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn abandon_async_call_boundary(&mut self, value_base: usize, stop_depth: usize) {
+        if let Some(index) = self.async_call_cleanups.iter().rposition(|record| {
+            record.boundary.as_ref().is_some_and(|boundary| {
+                boundary.value_base == value_base && boundary.stop_depth == stop_depth
+            })
+        }) {
+            self.async_call_cleanups.truncate(index);
+        }
     }
 
     #[inline]
@@ -219,7 +353,7 @@ impl StoreInner {
     /// mismatch is an embedder bug — not guest-reachable (a guest can't forge a foreign handle) — so
     /// it panics, matching wasmtime's "wrong store" behavior.
     #[inline]
-    pub(super) fn check_handle(&self, store: u64) {
+    pub(crate) fn check_handle(&self, store: u64) {
         assert!(
             store == 0 || store == self.store_id,
             "handle used with the wrong store (cross-store misuse)"

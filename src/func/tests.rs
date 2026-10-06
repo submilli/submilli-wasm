@@ -5,9 +5,14 @@
 use crate::engine::Engine;
 use crate::instance::Instance;
 use crate::module::Module;
+use crate::store::AsContextMut;
 use crate::store::Store;
 use crate::trap::Trap;
-use crate::value::{Val, ValType};
+use crate::value::{
+    ExnRef, ExnRefPre, ExnType, ExternRef, FieldType, Mutability, StorageType, StructRef,
+    StructRefPre, StructType, TagType, Val, ValType,
+};
+use crate::{Tag, ThrownException};
 
 fn instantiate(wat: &str) -> (Store<()>, Instance) {
     let engine = Engine::default();
@@ -116,6 +121,107 @@ fn host_func_computes_result() {
     add.call(&mut store, &[Val::I32(40), Val::I32(2)], &mut out)
         .unwrap();
     assert_eq!(out[0].unwrap_i32(), 42);
+}
+
+#[test]
+fn direct_host_call_transfers_only_returned_gc_roots() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let struct_ty = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::I32),
+        )],
+    )
+    .unwrap();
+    let pre = StructRefPre::new(&mut store, struct_ty);
+    let host = Func::new(
+        &mut store,
+        ft(&engine, &[], &[ValType::ANYREF]),
+        move |mut caller, _params, results| {
+            let returned = StructRef::new(&mut caller, &pre, &[Val::I32(1)])?;
+            let _temporary = StructRef::new(&mut caller, &pre, &[Val::I32(2)])?;
+            results[0] = Val::AnyRef(Some(returned.to_anyref()));
+            Ok(())
+        },
+    );
+    let roots_before = store.inner.gc_roots_mark();
+    let mut results = [Val::AnyRef(None)];
+    host.call(&mut store, &[], &mut results).unwrap();
+    assert_eq!(store.inner.gc_roots_mark(), roots_before + 1);
+    store.gc();
+    let Val::AnyRef(Some(returned)) = results[0] else {
+        panic!("host did not return an anyref");
+    };
+    assert!(returned.as_struct(&store).unwrap().is_some());
+}
+
+#[test]
+fn cross_store_host_result_is_an_error_and_cleans_up() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let mut other = Store::new(&engine, ());
+    let foreign = ExternRef::new(&mut other, 7_u32).unwrap();
+    let bad = Func::new(
+        &mut store,
+        ft(&engine, &[], &[ValType::EXTERNREF]),
+        move |_caller, _params, results| {
+            results[0] = Val::ExternRef(Some(foreign));
+            Ok(())
+        },
+    );
+    let mut result = [Val::ExternRef(None)];
+    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bad.call(&mut store, &[], &mut result)
+    }));
+    assert!(call.unwrap().is_err());
+
+    let healthy = Func::wrap(&mut store, || 7_i32);
+    let mut result = [Val::I32(0)];
+    healthy.call(&mut store, &[], &mut result).unwrap();
+    assert_eq!(result[0].unwrap_i32(), 7);
+}
+
+#[test]
+fn pending_snapshot_survives_overwrite_collection_and_rollback() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            "(module (tag $t (param i32))
+                (func (export \"throw\") i32.const 9 throw $t))",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let thrower = instance.get_func(&mut store, "throw").unwrap();
+    assert!(thrower
+        .call(&mut store, &[], &mut [])
+        .unwrap_err()
+        .is::<ThrownException>());
+
+    let tag_ty = TagType::new(FuncType::new(&engine, [], []));
+    let tag = Tag::new(&mut store, &tag_ty).unwrap();
+    let pre = ExnRefPre::new(&mut store, ExnType::from_tag_type(&tag_ty).unwrap());
+    let bad = Func::new(
+        &mut store,
+        ft(&engine, &[], &[ValType::I32]),
+        move |mut caller, _params, results| {
+            let replacement = ExnRef::new(&mut caller, &pre, &tag, &[])?;
+            let _ = caller.as_context_mut().throw::<()>(replacement);
+            caller.as_context_mut().store_mut().gc();
+            results[0] = Val::I64(1);
+            Ok(())
+        },
+    );
+    assert!(bad.call(&mut store, &[], &mut [Val::I32(0)]).is_err());
+
+    let original = store.take_pending_exception().unwrap();
+    store.gc();
+    assert_eq!(original.field(&mut store, 0).unwrap().unwrap_i32(), 9);
 }
 
 #[test]
@@ -260,6 +366,26 @@ fn get_export_is_none_at_top_level() {
     let mut out = [Val::I32(0)];
     probe.call(&mut store, &[], &mut out).unwrap();
     assert_eq!(out[0].unwrap_i32(), 0);
+}
+
+#[test]
+fn dynamic_host_result_type_is_checked() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let bad = Func::new(
+        &mut store,
+        ft(&engine, &[], &[ValType::I32]),
+        |_caller, _params, results| {
+            results[0] = Val::I64(7);
+            Ok(())
+        },
+    );
+    let mut results = [Val::I32(0)];
+    let err = bad.call(&mut store, &[], &mut results).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("function attempted to return an incompatible value"));
+    assert_eq!(results[0].unwrap_i32(), 0);
 }
 
 // --- typed API ---

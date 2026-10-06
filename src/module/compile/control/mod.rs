@@ -106,7 +106,7 @@ impl Translator<'_> {
         // nothing emitted before this boundary may fuse with a branch after it.
         self.fusable_cmp = None;
         let (param_count, result_count) = self.block_arity(bt);
-        let base_height = self.height.saturating_sub(param_count);
+        let base_height = self.height_below(param_count);
         self.ctrl.push(CtrlFrame {
             kind,
             base_height,
@@ -149,7 +149,7 @@ impl Translator<'_> {
             }
         }
         self.fusable_cmp = None;
-        let base_height = self.height.saturating_sub(param_count);
+        let base_height = self.height_below(param_count);
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::If,
             base_height,

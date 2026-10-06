@@ -30,7 +30,11 @@ fn ir(tys: &[ValType]) -> Vec<IrVal> {
 
 /// Compiles `wat`'s single function and runs it with `args`, returning the results.
 #[allow(clippy::too_many_lines)] // linear test harness: compile, wrap in a module shell, execute
-fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -> Result<Vec<Val>> {
+fn compile_wat(
+    wat: &str,
+    params: &[ValType],
+    results: &[ValType],
+) -> Result<(Engine, crate::module::code::Code)> {
     let engine = Engine::default();
     let bytes = wat::parse_str(wat).unwrap();
     let types = [ModuleType {
@@ -80,6 +84,11 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         module: Arc::new(inner),
         index: 0,
     };
+    Ok((engine, code))
+}
+
+fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -> Result<Vec<Val>> {
+    let (engine, code) = compile_wat(wat, params, results)?;
     let mut store = Store::new(&engine, ());
     host::execute(
         &mut store,
@@ -89,6 +98,82 @@ fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -
         args,
         results,
     )
+}
+
+#[test]
+fn operand_underflow_is_internal_uncatchable_and_store_remains_usable() {
+    let (engine, code) = compile_wat("(module (func))", &[], &[]).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance { index: 0, store: 0 };
+    let (mut exec, boundary) = host::enter(&mut store, instance, 0, code.clone(), vec![]).unwrap();
+
+    let error = exec.pop().unwrap_err();
+    assert!(error.is::<crate::error::InternalError>());
+    let error = host::finish(&mut store, exec, &boundary, &[], Err(error)).unwrap_err();
+    assert!(error.is::<crate::error::InternalError>());
+    assert!(!error.is::<super::exn::PendingException>());
+
+    assert!(host::execute(&mut store, instance, 0, code, vec![], &[])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn operand_underflow_bypasses_guest_catch_all() {
+    let (engine, mut code) = compile_wat(
+        "(module (func (block $handler (try_table (catch_all $handler) nop))))",
+        &[],
+        &[],
+    )
+    .unwrap();
+    let inner = Arc::get_mut(&mut code.module).unwrap();
+    let op = inner
+        .code
+        .ops
+        .iter_mut()
+        .find(|op| matches!(op, crate::module::op::Op::Nop))
+        .unwrap();
+    *op = crate::module::op::Op::Drop;
+
+    let mut store = Store::new(&engine, ());
+    let error = host::execute(
+        &mut store,
+        Instance { index: 0, store: 0 },
+        0,
+        code,
+        vec![],
+        &[],
+    )
+    .unwrap_err();
+    assert!(error.is::<crate::error::InternalError>());
+    assert!(!error.is::<super::exn::PendingException>());
+}
+
+#[test]
+fn inconsistent_operand_shadow_fails_without_partial_pop() {
+    let (engine, code) = compile_wat("(module (func (param i32)))", &[ValType::I32], &[]).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance { index: 0, store: 0 };
+    let (mut exec, boundary) =
+        host::enter(&mut store, instance, 0, code.clone(), vec![Val::I32(7)]).unwrap();
+    exec.shadow.pop();
+    let values_before = exec.values.len();
+
+    let error = exec.pop().unwrap_err();
+    assert!(error.is::<crate::error::InternalError>());
+    assert_eq!(
+        exec.values.len(),
+        values_before,
+        "failed pop must be transactional"
+    );
+    let error = host::finish(&mut store, exec, &boundary, &[], Err(error)).unwrap_err();
+    assert!(error.is::<crate::error::InternalError>());
+
+    assert!(
+        host::execute(&mut store, instance, 0, code, vec![Val::I32(9)], &[],)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn run_i32(wat: &str, params: &[ValType], args: Vec<Val>) -> i32 {

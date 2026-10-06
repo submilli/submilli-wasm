@@ -135,6 +135,20 @@ impl ValType {
     }
 }
 
+/// Whether every concrete type descriptor nested in `ty` belongs to `engine`. Canonical ids are
+/// registry-local and must never cross an engine boundary, even when the reference is null.
+pub(crate) fn val_type_belongs_to_engine(ty: &ValType, engine: &Engine) -> bool {
+    let ValType::Ref(reference) = ty else {
+        return true;
+    };
+    match reference.heap_type() {
+        HeapType::ConcreteStruct(ty) => ty.engine().same(engine),
+        HeapType::ConcreteArray(ty) => ty.engine().same(engine),
+        HeapType::ConcreteFunc(ty) => ty.engine().same(engine),
+        _ => true,
+    }
+}
+
 /// A function signature — an engine-interned handle (identity by canonical type id; the
 /// structure is materialized from the engine registry). Matches `wasmtime::FuncType`.
 ///
@@ -154,6 +168,13 @@ impl FuncType {
     ) -> FuncType {
         let params: Vec<ValType> = params.into_iter().collect();
         let results: Vec<ValType> = results.into_iter().collect();
+        assert!(
+            params
+                .iter()
+                .chain(&results)
+                .all(|ty| val_type_belongs_to_engine(ty, engine)),
+            "function type contains a concrete type from a different engine"
+        );
         // `intern_func_type` returns a type with one registration; this handle adopts it.
         let id = engine.intern_func_type(&params, &results);
         FuncType {
@@ -192,7 +213,9 @@ impl FuncType {
     // This handle holds a reference on its type, so the lookup cannot miss while it lives; the
     // `wasmtime` signatures above have no error to report one with.
     fn signature(&self) -> (Vec<ValType>, Vec<ValType>) {
-        self.engine.func_sig(self.id).unwrap_or_default()
+        self.engine
+            .func_sig(self.id)
+            .expect("live FuncType registration must retain its signature")
     }
 }
 

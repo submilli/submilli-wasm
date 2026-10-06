@@ -8,9 +8,7 @@ use crate::store::{
     AsContext, AsContextMut, GlobalEntity, MemoryEntity, StoreContext, StoreContextMut, StoreInner,
     TableEntity, TagEntity,
 };
-use crate::value::{
-    FuncType, GlobalType, HeapType, MemoryType, Mutability, Ref, TableType, TagType, Val, ValType,
-};
+use crate::value::{GlobalType, MemoryType, Mutability, Ref, TableType, TagType, Val, ValType};
 use crate::{Error, Result};
 
 /// An external value importable into / exportable from a module.
@@ -198,8 +196,14 @@ pub struct Global {
 
 impl Global {
     pub fn new(mut store: impl AsContextMut, ty: GlobalType, val: Val) -> Result<Global> {
-        Ok(store
-            .as_context_mut()
+        let mut ctx = store.as_context_mut();
+        if !crate::value::val_type_belongs_to_engine(ty.content(), ctx.engine()) {
+            return Err(Error::msg("global type belongs to a different engine"));
+        }
+        if !val_matches_in_store(ctx.inner(), &val, ty.content())? {
+            return Err(Error::msg("global type mismatch"));
+        }
+        Ok(ctx
             .inner_mut()
             .alloc_global(GlobalEntity { value: val, ty }))
     }
@@ -209,19 +213,21 @@ impl Global {
     }
 
     pub fn get(&self, mut store: impl AsContextMut) -> Val {
-        store.as_context_mut().inner().global(*self).value
+        let mut ctx = store.as_context_mut();
+        let value = ctx.inner().global(*self).value;
+        ctx.inner_mut().root_stored_value(value)
     }
 
     pub fn set(&self, mut store: impl AsContextMut, val: Val) -> Result<()> {
         let mut ctx = store.as_context_mut();
-        let entity = ctx.inner_mut().global_mut(*self);
-        if entity.ty.mutability() == Mutability::Const {
+        let ty = ctx.inner().global(*self).ty.clone();
+        if ty.mutability() == Mutability::Const {
             return Err(Error::msg("cannot set the value of a const global"));
         }
-        if !val_matches(&val, entity.ty.content()) {
+        if !val_matches_in_store(ctx.inner(), &val, ty.content())? {
             return Err(Error::msg("global type mismatch"));
         }
-        entity.value = val;
+        ctx.inner_mut().global_mut(*self).value = val;
         Ok(())
     }
 }
@@ -237,6 +243,11 @@ pub struct Table {
 impl Table {
     pub fn new(mut store: impl AsContextMut, ty: TableType, init: Ref) -> Result<Table> {
         let mut ctx = store.as_context_mut();
+        let element_ty = ValType::Ref(ty.element().clone());
+        if !crate::value::val_type_belongs_to_engine(&element_ty, ctx.engine()) {
+            return Err(Error::msg("table type belongs to a different engine"));
+        }
+        ensure_ref_matches(ctx.inner(), &init, ty.element(), "table type mismatch")?;
         let s = ctx.store_mut();
         if !s.limiter_allows_table(ty.minimum(), ty.maximum())? {
             return Err(Error::msg("table minimum size exceeds the store limit"));
@@ -253,6 +264,11 @@ impl Table {
         init: Ref,
     ) -> Result<Table> {
         let mut ctx = store.as_context_mut();
+        let element_ty = ValType::Ref(ty.element().clone());
+        if !crate::value::val_type_belongs_to_engine(&element_ty, ctx.engine()) {
+            return Err(Error::msg("table type belongs to a different engine"));
+        }
+        ensure_ref_matches(ctx.inner(), &init, ty.element(), "table type mismatch")?;
         let s = ctx.store_mut();
         if !s
             .limiter_allows_table_async(ty.minimum(), ty.maximum())
@@ -268,16 +284,20 @@ impl Table {
     }
 
     pub fn get(&self, mut store: impl AsContextMut, index: u64) -> Option<Ref> {
-        store.as_context_mut().inner().table(*self).get(index)
+        let mut ctx = store.as_context_mut();
+        let value = ctx.inner().table(*self).get(index)?;
+        Some(
+            ctx.inner_mut()
+                .root_stored_value(Val::from_ref(value))
+                .to_ref(),
+        )
     }
 
     pub fn set(&self, mut store: impl AsContextMut, index: u64, val: Ref) -> Result<()> {
-        if store
-            .as_context_mut()
-            .inner_mut()
-            .table_mut(*self)
-            .set(index, val)
-        {
+        let mut ctx = store.as_context_mut();
+        let element = ctx.inner().table(*self).ty.element().clone();
+        ensure_ref_matches(ctx.inner(), &val, &element, "table type mismatch")?;
+        if ctx.inner_mut().table_mut(*self).set(index, val) {
             Ok(())
         } else {
             Err(Error::msg("table index out of bounds"))
@@ -289,27 +309,41 @@ impl Table {
     }
 
     pub fn grow(&self, mut store: impl AsContextMut, delta: u64, init: Ref) -> Result<u64> {
-        match store
-            .as_context_mut()
-            .store_mut()
-            .grow_table(*self, delta, init)?
-        {
+        let mut ctx = store.as_context_mut();
+        let element = ctx.inner().table(*self).ty.element().clone();
+        ensure_ref_matches(ctx.inner(), &init, &element, "table type mismatch")?;
+        match ctx.store_mut().grow_table(*self, delta, init)? {
             Some(old) => Ok(old),
             None => Err(Error::msg("failed to grow table")),
         }
     }
 
     pub fn fill(&self, mut store: impl AsContextMut, dst: u64, val: Ref, len: u64) -> Result<()> {
-        if store
-            .as_context_mut()
-            .inner_mut()
-            .table_mut(*self)
-            .fill(dst, val, len)
-        {
+        let mut ctx = store.as_context_mut();
+        let element = ctx.inner().table(*self).ty.element().clone();
+        ensure_ref_matches(ctx.inner(), &val, &element, "table type mismatch")?;
+        if ctx.inner_mut().table_mut(*self).fill(dst, val, len) {
             Ok(())
         } else {
             Err(Error::msg("table fill out of bounds"))
         }
+    }
+}
+
+fn ensure_ref_matches(
+    inner: &StoreInner,
+    value: &Ref,
+    ty: &crate::value::RefType,
+    context: &'static str,
+) -> Result<()> {
+    if val_matches_in_store(
+        inner,
+        &Val::from_ref(value.clone()),
+        &ValType::Ref(ty.clone()),
+    )? {
+        Ok(())
+    } else {
+        Err(Error::msg(context))
     }
 }
 
@@ -325,6 +359,9 @@ pub struct Tag {
 
 impl Tag {
     pub fn new(mut store: impl AsContextMut, ty: &TagType) -> Result<Tag> {
+        if !ty.ty().engine().same(store.as_context().engine()) {
+            return Err(Error::msg("tag type belongs to a different engine"));
+        }
         Ok(store
             .as_context_mut()
             .inner_mut()
@@ -336,63 +373,9 @@ impl Tag {
     }
 }
 
-/// Coarse value/type compatibility check (numeric exact; any reference matches a
-/// reference type). Precise reference-type checking is left to validation.
-pub(crate) fn val_matches(val: &Val, ty: &ValType) -> bool {
-    matches!(
-        (val, ty),
-        (Val::I32(_), ValType::I32)
-            | (Val::I64(_), ValType::I64)
-            | (Val::F32(_), ValType::F32)
-            | (Val::F64(_), ValType::F64)
-            | (Val::V128(_), ValType::V128)
-            | (
-                Val::FuncRef(_) | Val::ExternRef(_) | Val::AnyRef(_) | Val::ExnRef(_),
-                ValType::Ref(_),
-            )
-    )
-}
-
-/// Reconciles host-provided reference arguments with their parameter's hierarchy before a wasm
-/// call. The lenient [`val_matches`] admits any reference into any reference slot — in particular a
-/// host externref (e.g. a `ref.host`) into an `anyref` parameter. The untyped operand stack stores
-/// only a bare handle, so such a *cross-hierarchy* host ref must be internalized up front (it would
-/// otherwise be misread against the anyref/GC arena instead of the externref one). Same-hierarchy
-/// arguments pass through untouched. See ARCHITECTURE §6.
-pub(crate) fn coerce_args(
-    inner: &mut StoreInner,
-    params: &[Val],
-    ty: &FuncType,
-) -> Result<Vec<Val>> {
-    params
-        .iter()
-        .zip(ty.params())
-        .map(|(&v, pty)| coerce_arg(inner, v, &pty))
-        .collect()
-}
-
-fn coerce_arg(inner: &mut StoreInner, v: Val, ty: &ValType) -> Result<Val> {
-    match (v, ty) {
-        (Val::ExternRef(Some(_)), ValType::Ref(rt)) if is_any_hierarchy(rt.heap_type()) => {
-            inner.any_convert_extern(v)
-        }
-        _ => Ok(v),
-    }
-}
-
-/// Whether a heap type belongs to the `any` hierarchy (i.e. not `func`/`extern`/`exn`).
-fn is_any_hierarchy(h: &HeapType) -> bool {
-    !matches!(
-        h,
-        HeapType::Func
-            | HeapType::NoFunc
-            | HeapType::ConcreteFunc(_)
-            | HeapType::Extern
-            | HeapType::NoExtern
-            | HeapType::Exn
-            | HeapType::NoExn
-    )
-}
+pub(crate) use crate::value_match::{
+    arg_matches_in_store, coerce_args, ensure_values_match, val_matches_in_store,
+};
 
 #[cfg(test)]
 #[path = "extern_tests.rs"]

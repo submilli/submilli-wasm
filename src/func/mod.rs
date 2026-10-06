@@ -2,6 +2,7 @@
 
 #[cfg(feature = "async")]
 mod async_func;
+mod direct_call;
 mod into_func;
 mod wasm_ty;
 
@@ -45,6 +46,10 @@ impl Func {
         Func { index, store: 0 }
     }
 
+    pub(crate) fn from_raw_store(index: u32, store: u64) -> Self {
+        Func { index, store }
+    }
+
     /// The raw store-arena index behind this funcref handle.
     pub(crate) fn raw(self) -> u32 {
         self.index
@@ -66,6 +71,10 @@ impl Func {
         ty: FuncType,
         func: impl Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<()> + Send + Sync + 'static,
     ) -> Func {
+        assert!(
+            ty.engine().same(store.as_context().engine()),
+            "function type belongs to a different engine"
+        );
         let mut ctx = store.as_context_mut();
         let host_index = ctx.store_mut().push_host_func(Arc::new(func));
         ctx.inner_mut().alloc_func(FuncEntity::Host {
@@ -105,14 +114,13 @@ impl Func {
         // fibers, so the sync driver runs fine. (If the call reaches an async host fn, the sync
         // driver still errors with "synchronous context" — the real constraint.)
         let ty = self.ty(&store);
-        check_args(params, &ty)?;
+        check_args(store.as_context().inner(), params, &ty)?;
         if results.len() != ty.results().len() {
             return Err(crate::Error::msg("wrong number of results"));
         }
         // Copy out the entity's Copy fields, releasing the borrow before we
         // re-borrow the store mutably for the call.
-        let kind = self.resolve_callee(store.as_context().inner());
-        let out = match kind {
+        let out = match self.resolve_callee(store.as_context().inner()) {
             Callee::Wasm(instance, func_index) => {
                 let mut ctx = store.as_context_mut();
                 let code = ctx.inner().instance(instance).module.code(func_index);
@@ -128,20 +136,7 @@ impl Func {
                 )?
             }
             Callee::Host(host_index) => {
-                let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();
-                let mut out = default_results(&ty);
-                // Contain a host-fn panic (#33): clear any pending exception it set via `Store::throw`
-                // before re-raising, so this store is left consistent for reuse (wasmtime parity).
-                match crate::exec::guard::catch_host(|| {
-                    cb(Caller::new(store.as_context_mut(), None), params, &mut out)
-                }) {
-                    Ok(result) => result?,
-                    Err(payload) => {
-                        store.as_context_mut().store_mut().take_pending_exception();
-                        crate::exec::guard::reraise(payload);
-                    }
-                }
-                out
+                direct_call::call_direct_host(&mut store, host_index, params, &ty)?
             }
             #[cfg(feature = "async")]
             Callee::HostAsync(_) => {
@@ -150,6 +145,8 @@ impl Func {
                 ));
             }
         };
+        let result_tys: Vec<_> = ty.results().collect();
+        validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
         results.clone_from_slice(&out);
         Ok(())
     }
@@ -215,16 +212,37 @@ fn default_results(ty: &FuncType) -> Vec<Val> {
 }
 
 /// Checks the argument count and per-value types against `ty`'s parameters.
-fn check_args(params: &[Val], ty: &FuncType) -> Result<()> {
+fn check_args(inner: &StoreInner, params: &[Val], ty: &FuncType) -> Result<()> {
     if params.len() != ty.params().len() {
         return Err(crate::Error::msg("wrong number of arguments"));
     }
     for (val, pty) in params.iter().zip(ty.params()) {
-        if !crate::extern_::val_matches(val, &pty) {
+        if !crate::extern_::arg_matches_in_store(inner, val, &pty)? {
             return Err(crate::Error::msg("argument type mismatch"));
         }
     }
     Ok(())
+}
+
+pub(super) fn validate_results(
+    inner: &mut StoreInner,
+    values: &[Val],
+    types: &[crate::value::ValType],
+) -> Result<()> {
+    let result = crate::extern_::ensure_values_match(
+        inner,
+        values,
+        types,
+        "function attempted to return an incompatible value",
+    );
+    if let Err(error) = &result {
+        if inner.has_parked_execution() {
+            if let Some(internal) = error.downcast_ref::<crate::error::InternalError>() {
+                inner.latch_internal_error(*internal);
+            }
+        }
+    }
+    result
 }
 
 /// A statically-typed view of a [`Func`].

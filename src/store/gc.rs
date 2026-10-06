@@ -9,7 +9,7 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 
 use super::gc_codec::{le_u32, NULL_REF};
-use crate::canon::CanonicalTypeId;
+use crate::canon::{CanonicalTypeId, RefKind};
 use crate::trap::Trap;
 use crate::value::{AnyRef, Rooted, Val};
 use crate::Result;
@@ -59,7 +59,7 @@ pub(crate) fn decode_anyref_handle(handle: u32) -> AnyRefHandle {
 
 /// Wraps an `anyref` handle (slot or `i31`) as a value.
 pub(crate) fn anyref_value(handle: u32) -> Val {
-    Val::AnyRef(Some(Rooted::<AnyRef>::from_raw(handle)))
+    Val::AnyRef(Some(Rooted::<AnyRef>::from_raw(handle, RefKind::Any)))
 }
 
 /// Which kind of aggregate a managed object is — its self-describing tag (the field/element
@@ -122,7 +122,7 @@ impl GcObject {
     /// The wrapped externref index, if this is an `extern` wrapper.
     pub(crate) fn extern_index(&self) -> Option<u32> {
         match self.header.kind {
-            ObjKind::Extern => Some(le_u32(&self.data)),
+            ObjKind::Extern => self.data.get(..4).map(le_u32),
             ObjKind::Struct | ObjKind::Array => None,
         }
     }
@@ -387,11 +387,18 @@ impl GcHeap {
             if !marked {
                 self.used = self.used.saturating_sub(obj.byte_size());
                 *slot = None;
-                self.generations[i] = self.generations[i].wrapping_add(1);
+                let next = self.generations[i].wrapping_add(1);
+                self.generations[i] = if next == u32::MAX { 0 } else { next };
                 self.free.push(i as u32);
             }
         }
         self.marks.clear(); // all-zero between collections
+    }
+
+    /// Aborts an in-progress mark phase without sweeping. Used when tracing discovers corrupt
+    /// metadata so a later healthy collection starts from a clean bitmap.
+    pub(crate) fn clear_marks(&mut self) {
+        self.marks.clear();
     }
 }
 

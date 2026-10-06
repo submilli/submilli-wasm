@@ -24,6 +24,7 @@ impl Execution {
         clippy::inline_always,
         clippy::too_many_arguments
     )]
+    #[allow(clippy::cognitive_complexity)] // flat bytecode dispatch; arms delegate by category
     #[inline(always)]
     pub(super) fn step(
         &mut self,
@@ -42,26 +43,38 @@ impl Execution {
             Op::F32Const(v) => self.push_f32_bits(*v),
             Op::F64Const(v) => self.push_f64_bits(*v),
             Op::Drop => {
-                self.pop();
+                self.pop()?;
             }
             Op::Select => {
-                let cond = self.pop_i32();
-                let b = self.pop_tagged();
-                let a = self.pop_tagged();
-                let (cell, tag) = if cond != 0 { a } else { b };
+                let (cell, tag) = self.pop_select()?;
                 self.push_cell(cell, tag);
             }
             Op::LocalGet(i) => {
-                let (cell, tag) = self.cell_at((base + i) as usize);
+                let local = base
+                    .checked_add(*i)
+                    .ok_or(crate::error::InternalError::FrameStack(
+                        "local index overflow",
+                    ))?;
+                let (cell, tag) = self.cell_at(local as usize)?;
                 self.push_cell(cell, tag);
             }
             Op::LocalSet(i) => {
-                let (cell, tag) = self.pop_tagged();
-                self.set_cell((base + i) as usize, cell, tag);
+                let (cell, tag) = self.pop_tagged()?;
+                let local = base
+                    .checked_add(*i)
+                    .ok_or(crate::error::InternalError::FrameStack(
+                        "local index overflow",
+                    ))?;
+                self.set_cell(local as usize, cell, tag)?;
             }
             Op::LocalTee(i) => {
-                let (cell, tag) = self.top_cell();
-                self.set_cell((base + i) as usize, cell, tag);
+                let (cell, tag) = self.top_cell()?;
+                let local = base
+                    .checked_add(*i)
+                    .ok_or(crate::error::InternalError::FrameStack(
+                        "local index overflow",
+                    ))?;
+                self.set_cell(local as usize, cell, tag)?;
             }
             Op::GlobalGet(g) => {
                 let handle = inner.instance(instance).globals[*g as usize];
@@ -70,22 +83,22 @@ impl Execution {
             }
             Op::GlobalSet(g) => {
                 let handle = inner.instance(instance).globals[*g as usize];
-                let v = cell::decode(self.pop(), inner.global(handle).ty.content());
+                let v = self.pop_typed(inner.global(handle).ty.content())?;
                 inner.global_mut(handle).value = v;
             }
             Op::Br(t) => {
-                self.take_branch(*t);
+                self.take_branch(*t)?;
                 return Ok(StepOutcome::Advance(t.ip));
             }
             Op::BrIf(t) => {
-                if self.pop_i32() != 0 {
-                    self.take_branch(*t);
+                if self.pop_i32()? != 0 {
+                    self.take_branch(*t)?;
                     return Ok(StepOutcome::Advance(t.ip));
                 }
             }
             Op::BrIfNot(t) => {
-                if self.pop_i32() == 0 {
-                    self.take_branch(*t);
+                if self.pop_i32()? == 0 {
+                    self.take_branch(*t)?;
                     return Ok(StepOutcome::Advance(t.ip));
                 }
             }
@@ -94,26 +107,27 @@ impl Execution {
                 negate,
                 target,
             } => {
-                let n = self.values.len();
-                let (a, b) = (
-                    self.values[n - 2].unwrap_i32(),
-                    self.values[n - 1].unwrap_i32(),
-                );
-                self.values.truncate(n - 2);
-                self.shadow.truncate(n - 2);
+                let (a, b) = self.pop_i32_pair()?;
                 if cmp_i32(*kind, a, b) != *negate {
-                    self.take_branch(*target);
+                    self.take_branch(*target)?;
                     return Ok(StepOutcome::Advance(target.ip));
                 }
             }
             Op::BrTable(range) => {
                 // Targets live out-of-line in `code.br_tables`: `len` cases then the default.
                 let pool = code.br_tables();
-                let cases = &pool[range.base as usize..(range.base + range.len) as usize];
-                let default = &pool[(range.base + range.len) as usize];
-                let i = self.pop_i32() as u32 as usize;
+                let end = range.base.checked_add(range.len).ok_or(
+                    crate::error::InternalError::Compiler("branch table range overflow"),
+                )? as usize;
+                let cases = pool.get(range.base as usize..end).ok_or(
+                    crate::error::InternalError::Compiler("branch table range is invalid"),
+                )?;
+                let default = pool.get(end).ok_or(crate::error::InternalError::Compiler(
+                    "branch table default is missing",
+                ))?;
+                let i = self.pop_i32()? as u32 as usize;
                 let t = cases.get(i).unwrap_or(default);
-                self.take_branch(*t);
+                self.take_branch(*t)?;
                 return Ok(StepOutcome::Advance(t.ip));
             }
             call_op @ (Op::Call(f) | Op::ReturnCall(f)) => {
@@ -141,18 +155,18 @@ impl Execution {
             Op::CallRef(_) => return self.do_call_ref(inner, instance, CallKind::Nested(next)),
             Op::ReturnCallRef(_) => return self.do_call_ref(inner, instance, CallKind::Tail),
             Op::BrOnNull(t) => {
-                let (r, tag) = self.pop_tagged();
+                let (r, tag) = self.pop_tagged_ref()?;
                 if r.is_null() {
-                    self.take_branch(*t);
+                    self.take_branch(*t)?;
                     return Ok(StepOutcome::Advance(t.ip));
                 }
                 self.push_cell(r, tag); // non-null: keep it, fall through
             }
             Op::BrOnNonNull(t) => {
-                let (r, tag) = self.pop_tagged();
+                let (r, tag) = self.pop_tagged_ref()?;
                 if !r.is_null() {
                     self.push_cell(r, tag); // non-null: keep it on the branch target
-                    self.take_branch(*t);
+                    self.take_branch(*t)?;
                     return Ok(StepOutcome::Advance(t.ip));
                 }
                 // null: reference dropped, fall through
@@ -160,7 +174,7 @@ impl Execution {
             Op::MemoryGrow(i) => {
                 // Routed through the driver so the (T-generic) limiter is consulted.
                 let memory = inner.instance(instance).memories[*i as usize];
-                let delta = self.pop_index(inner.memory(memory).ty.is_64());
+                let delta = self.pop_index(inner.memory(memory).ty.is_64())?;
                 return Ok(StepOutcome::DoGrow {
                     memory,
                     delta,
@@ -172,8 +186,8 @@ impl Execution {
                 let table = inner.instance(instance).tables[*t as usize];
                 let tt = &inner.table(table).ty;
                 let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
-                let delta = self.pop_index(is_64);
-                let init = self.pop_ref(kind).to_ref();
+                let delta = self.pop_index(is_64)?;
+                let init = self.pop_ref(kind)?.to_ref();
                 return Ok(StepOutcome::DoTableGrow {
                     table,
                     delta,
@@ -225,12 +239,12 @@ impl Execution {
             Op::Throw(tag) => return self.throw(inner, instance, *tag, next - 1),
             Op::ThrowRef => return self.throw_ref(),
             op @ Op::BrOnCast { .. } => {
-                if let Some(ip) = self.br_on_cast(inner, code, instance, op, false) {
+                if let Some(ip) = self.br_on_cast(inner, code, instance, op, false)? {
                     return Ok(StepOutcome::Advance(ip));
                 }
             }
             op @ Op::BrOnCastFail { .. } => {
-                if let Some(ip) = self.br_on_cast(inner, code, instance, op, true) {
+                if let Some(ip) = self.br_on_cast(inner, code, instance, op, true)? {
                     return Ok(StepOutcome::Advance(ip));
                 }
             }
@@ -249,7 +263,7 @@ impl Execution {
             | Op::ArrayNewData { .. }
             | Op::ArrayNewElem { .. }) => {
                 if let Some(charge) = self.gc_alloc_charge(inner, instance, alloc)? {
-                    if let Some(out) = self.gc_reserve(inner, charge, next - 1) {
+                    if let Some(out) = self.gc_reserve(inner, charge, next - 1)? {
                         return Ok(out);
                     }
                 }

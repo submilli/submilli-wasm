@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::panic::AssertUnwindSafe;
+
 use submilli_wasm::{Engine, Instance, Module, Store, Trap, Val};
 
 fn module(engine: &Engine, wat: &str) -> Module {
@@ -44,6 +46,37 @@ fn call_ref_dispatches_to_funcref() {
     let mut store = Store::new(&engine, ());
     let inst = Instance::new(&mut store, &m, &[]).unwrap();
     assert_eq!(run_i32(&mut store, inst, "run", &[Val::I32(21)]), 42);
+}
+
+#[test]
+fn returned_funcref_is_bound_to_its_store() {
+    let engine = Engine::default();
+    let m = module(
+        &engine,
+        "(module
+            (type $t (func (result i32)))
+            (func $target (type $t) i32.const 42)
+            (elem declare func $target)
+            (func (export \"get\") (result (ref $t)) ref.func $target))",
+    );
+    let mut first = Store::new(&engine, ());
+    let first_instance = Instance::new(&mut first, &m, &[]).unwrap();
+    let get = first_instance.get_func(&mut first, "get").unwrap();
+    let mut result = [Val::FuncRef(None)];
+    get.call(&mut first, &[], &mut result).unwrap();
+    let Val::FuncRef(Some(returned)) = result[0] else {
+        panic!("get did not return a funcref");
+    };
+    let mut value = [Val::I32(0)];
+    returned.call(&mut first, &[], &mut value).unwrap();
+    assert_eq!(value[0].unwrap_i32(), 42);
+
+    let mut second = Store::new(&engine, ());
+    Instance::new(&mut second, &m, &[]).unwrap();
+    let wrong_store = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        returned.call(&mut second, &[], &mut [Val::I32(0)])
+    }));
+    assert!(wrong_store.is_err(), "returned funcref lost store identity");
 }
 
 #[test]

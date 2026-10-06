@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use pollster::block_on;
@@ -18,7 +19,9 @@ use crate::instance::Instance;
 use crate::linker::Linker;
 use crate::module::Module;
 use crate::store::Store;
-use crate::value::{FuncType, Val, ValType};
+use crate::value::{
+    FieldType, FuncType, Mutability, StorageType, StructRef, StructRefPre, StructType, Val, ValType,
+};
 
 /// A future that returns `Pending` once before completing — forces the async driver to
 /// genuinely park and resume (rather than completing synchronously on first poll).
@@ -72,6 +75,43 @@ fn call_async_runs_wasm_export() {
     let mut out = [Val::I32(0)];
     block_on(add.call_async(&mut store, &[Val::I32(40), Val::I32(2)], &mut out)).unwrap();
     assert_eq!(out[0].unwrap_i32(), 42);
+}
+
+#[test]
+fn direct_async_host_call_transfers_only_returned_gc_roots() {
+    let engine = async_engine();
+    let mut store = Store::new(&engine, ());
+    let ty = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::I32),
+        )],
+    )
+    .unwrap();
+    let pre = Arc::new(StructRefPre::new(&mut store, ty));
+    let host = Func::new_async(
+        &mut store,
+        ft(&engine, &[], &[ValType::ANYREF]),
+        move |mut caller, _params, results| {
+            let pre = Arc::clone(&pre);
+            Box::new(async move {
+                let returned = StructRef::new(&mut caller, &pre, &[Val::I32(1)])?;
+                let _temporary = StructRef::new(&mut caller, &pre, &[Val::I32(2)])?;
+                results[0] = Val::AnyRef(Some(returned.to_anyref()));
+                Ok(())
+            })
+        },
+    );
+    let roots_before = store.inner.gc_roots_mark();
+    let mut results = [Val::AnyRef(None)];
+    block_on(host.call_async(&mut store, &[], &mut results)).unwrap();
+    assert_eq!(store.inner.gc_roots_mark(), roots_before + 1);
+    store.gc();
+    let Val::AnyRef(Some(returned)) = results[0] else {
+        panic!("host did not return an anyref");
+    };
+    assert!(returned.as_struct(&store).unwrap().is_some());
 }
 
 #[test]

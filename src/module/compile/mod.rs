@@ -23,6 +23,7 @@ mod visit_simd;
 use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, ValidatorResources};
 
 use crate::canon::{AggKind, IrVal, ModuleType};
+use crate::error::InternalError;
 use crate::module::code::{CodeArenas, Span};
 use crate::module::op::{BigMemArg, BranchTarget, CmpKind, CompiledFunc, MemArg, Op, BIG_MEMARG};
 use crate::{Error, Result};
@@ -108,6 +109,10 @@ pub(crate) fn translate_function(
     }
     reader.finish_expression(&vl).map_err(wp_err)?;
 
+    if let Some(error) = t.error {
+        return Err(error.into());
+    }
+
     // Return the (now-empty) `ctrl` buffer to the scratch so the next body reuses its capacity.
     scratch.ctrl = std::mem::take(&mut t.ctrl);
     let max_operands = t.max_operands;
@@ -159,6 +164,10 @@ struct Translator<'a> {
     /// [`Translator::emit`] per op; cleared at every control boundary where a branch label
     /// could land between the pair (see `control`).
     fusable_cmp: Option<CmpKind>,
+    /// First internal height-accounting failure. The validator should make this unreachable, but
+    /// latching it keeps the lowering helpers small and prevents a malformed internal stream from
+    /// being published as successfully compiled code.
+    error: Option<InternalError>,
 }
 
 impl<'a> Translator<'a> {
@@ -186,6 +195,7 @@ impl<'a> Translator<'a> {
             reachable: true,
             cur_offset: 0,
             fusable_cmp: None,
+            error: None,
         }
     }
 
@@ -244,12 +254,32 @@ impl<'a> Translator<'a> {
     }
 
     fn push(&mut self, n: u32) {
-        self.height += n;
+        let Some(height) = self.height.checked_add(n) else {
+            self.error
+                .get_or_insert(InternalError::Compiler("operand height overflow"));
+            return;
+        };
+        self.height = height;
         self.max_operands = self.max_operands.max(self.height);
     }
 
     fn pop(&mut self, n: u32) {
-        self.height = self.height.saturating_sub(n);
+        let Some(height) = self.height.checked_sub(n) else {
+            self.error
+                .get_or_insert(InternalError::Compiler("operand height underflow"));
+            return;
+        };
+        self.height = height;
+    }
+
+    fn height_below(&mut self, n: u32) -> u32 {
+        if let Some(height) = self.height.checked_sub(n) {
+            height
+        } else {
+            self.error
+                .get_or_insert(InternalError::Compiler("control operand height underflow"));
+            self.height
+        }
     }
 
     /// pop 2, push 1 (binary numeric / comparison).

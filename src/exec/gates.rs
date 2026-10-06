@@ -2,6 +2,7 @@
 //! `run` consults them only when the engine config enables at least one.
 
 use super::{Execution, Outcome};
+use crate::error::InternalError;
 use crate::store::{FuelStep, StoreInner};
 use crate::trap::Trap;
 use crate::Result;
@@ -26,7 +27,10 @@ impl Execution {
                 FuelStep::NeedYield => {
                     #[cfg(feature = "async")]
                     {
-                        self.frames.last_mut().expect("current frame").ip = ip;
+                        self.frames
+                            .last_mut()
+                            .ok_or(InternalError::FrameStack("missing frame at fuel yield"))?
+                            .ip = ip;
                         return Ok(Some(Outcome::FuelYield));
                     }
                     // Unreachable without async (an interval needs an async store); stays total.
@@ -36,7 +40,10 @@ impl Execution {
             }
         }
         if epoch && inner.epoch_deadline_reached() {
-            self.frames.last_mut().expect("current frame").ip = ip;
+            self.frames
+                .last_mut()
+                .ok_or(InternalError::FrameStack("missing frame at epoch deadline"))?
+                .ip = ip;
             return Ok(Some(Outcome::EpochDeadline));
         }
         Ok(None)
@@ -48,17 +55,19 @@ impl Execution {
     /// the async driver after every host-call await (the natural long-latency point — other
     /// tenants generate pressure while this guest is parked). Only large-footprint stores
     /// collect (no thundering herd); request, not force.
-    pub(super) fn service_gc_pressure(&mut self, inner: &mut StoreInner) {
+    pub(super) fn service_gc_pressure(&mut self, inner: &mut StoreInner) -> Result<()> {
         if inner.gc.footprint_over_floor() && inner.take_gc_request() {
-            self.gc_collect_now(inner);
+            self.gc_collect_now(inner)?;
         }
+        Ok(())
     }
 
     /// [`service_gc_pressure`](Self::service_gc_pressure) with the armed check included, for
     /// call sites outside the dispatch loop (which precomputes the armed flag).
-    pub(super) fn gc_pressure_safepoint(&mut self, inner: &mut StoreInner) {
+    pub(super) fn gc_pressure_safepoint(&mut self, inner: &mut StoreInner) -> Result<()> {
         if inner.gc.is_collecting() && inner.engine().gc_memory_threshold().is_some() {
-            self.service_gc_pressure(inner);
+            self.service_gc_pressure(inner)?;
         }
+        Ok(())
     }
 }

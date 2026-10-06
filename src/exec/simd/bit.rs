@@ -10,21 +10,21 @@ impl Execution {
         use SimdOp as S;
         match s {
             S::V128Not => {
-                let a = self.pop_v128();
+                let a = self.pop_v128()?;
                 self.push_v128(!a);
             }
-            S::V128And => self.bit_binop(|a, b| a & b),
-            S::V128Or => self.bit_binop(|a, b| a | b),
-            S::V128Xor => self.bit_binop(|a, b| a ^ b),
-            S::V128AndNot => self.bit_binop(|a, b| a & !b),
+            S::V128And => self.bit_binop(|a, b| a & b)?,
+            S::V128Or => self.bit_binop(|a, b| a | b)?,
+            S::V128Xor => self.bit_binop(|a, b| a ^ b)?,
+            S::V128AndNot => self.bit_binop(|a, b| a & !b)?,
             S::V128Bitselect => {
-                let c = self.pop_v128();
-                let v2 = self.pop_v128();
-                let v1 = self.pop_v128();
+                let c = self.pop_v128()?;
+                let v2 = self.pop_v128()?;
+                let v1 = self.pop_v128()?;
                 self.push_v128((v1 & c) | (v2 & !c));
             }
             S::V128AnyTrue => {
-                let v = self.pop_v128();
+                let v = self.pop_v128()?;
                 self.push(Val::I32(i32::from(v != 0)));
             }
             _ => return self.exec_simd_iarith(s),
@@ -32,9 +32,10 @@ impl Execution {
         Ok(())
     }
 
-    fn bit_binop(&mut self, f: impl Fn(u128, u128) -> u128) {
-        let b = self.pop_v128();
-        let a = self.pop_v128();
+    fn bit_binop(&mut self, f: impl Fn(u128, u128) -> u128) -> Result<()> {
+        let b = self.pop_v128()?;
+        let a = self.pop_v128()?;
         self.push_v128(f(a, b));
+        Ok(())
     }
 }

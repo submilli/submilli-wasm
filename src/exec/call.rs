@@ -52,7 +52,7 @@ impl Execution {
         // `table` is a wasmparser-validated table index for this instance (#33 carve-out).
         #[allow(clippy::indexing_slicing)]
         let handle = inner.instance(instance).tables[table as usize];
-        let idx = self.pop_index(inner.table(handle).ty.is_64());
+        let idx = self.pop_index(inner.table(handle).ty.is_64())?;
         let f = match inner.table(handle).get(idx) {
             Some(Ref::Func(Some(f))) => f,
             Some(Ref::Func(None)) => return Err(Trap::IndirectCallToNull.into()),
@@ -93,7 +93,7 @@ impl Execution {
         instance: Instance,
         kind: CallKind,
     ) -> Result<StepOutcome> {
-        let f = match self.pop_ref(RefKind::Func).to_ref() {
+        let f = match self.pop_ref(RefKind::Func)?.to_ref() {
             Ref::Func(Some(f)) => f,
             Ref::Func(None) => return Err(Trap::NullReference.into()),
             _ => return Err(Trap::BadSignature.into()),

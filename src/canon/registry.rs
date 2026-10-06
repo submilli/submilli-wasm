@@ -179,7 +179,11 @@ impl TypeRegistry {
             if id == sup {
                 return true;
             }
-            cur = self.types[id.index()].as_ref().and_then(|t| t.supertype);
+            cur = self
+                .types
+                .get(id.index())
+                .and_then(|ty| ty.as_ref())
+                .and_then(|ty| ty.supertype);
         }
         false
     }
@@ -278,10 +282,15 @@ impl TypeRegistry {
     }
 
     pub(crate) fn incref_group(&mut self, g: GroupId) {
-        self.groups[g.index()]
-            .as_mut()
-            .expect("live group")
-            .refcount += 1;
+        let record = self
+            .groups
+            .get_mut(g.index())
+            .and_then(Option::as_mut)
+            .expect("type owner must reference a live group");
+        record.refcount = record
+            .refcount
+            .checked_add(1)
+            .expect("type group reference count overflow");
     }
 
     /// Decrements a group's refcount; at zero, reclaims it — decref-ing its outgoing edges (which
@@ -289,10 +298,15 @@ impl TypeRegistry {
     pub(crate) fn decref_group(&mut self, g: GroupId) {
         let mut stack = vec![g];
         while let Some(g) = stack.pop() {
-            let Some(rec) = self.groups[g.index()].as_mut() else {
-                continue;
-            };
-            rec.refcount -= 1;
+            let rec = self
+                .groups
+                .get_mut(g.index())
+                .and_then(Option::as_mut)
+                .expect("type owner must release a live group");
+            rec.refcount = rec
+                .refcount
+                .checked_sub(1)
+                .expect("type group reference count underflow");
             if rec.refcount > 0 {
                 continue;
             }
@@ -314,16 +328,18 @@ impl TypeRegistry {
 
     /// Adds a registration to the group owning `id` (a handle was cloned / materialized).
     pub(crate) fn incref_type(&mut self, id: CanonicalTypeId) {
-        if let Some(g) = self.group_of(id) {
-            self.incref_group(g);
-        }
+        let g = self
+            .group_of(id)
+            .expect("type handle must reference a live canonical type");
+        self.incref_group(g);
     }
 
     /// Removes a registration from the group owning `id` (a handle was dropped).
     pub(crate) fn decref_type(&mut self, id: CanonicalTypeId) {
-        if let Some(g) = self.group_of(id) {
-            self.decref_group(g);
-        }
+        let g = self
+            .group_of(id)
+            .expect("type handle must reference a live canonical type");
+        self.decref_group(g);
     }
 
     /// The group owning `id`, or `None` if `id` is not a live type.

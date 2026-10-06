@@ -5,6 +5,7 @@
 
 use super::{cell, Execution};
 use crate::canon::{AggKind, CanonicalTypeId, IrHeap, RefKind};
+use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::code::Code;
 use crate::module::op::{Op, NULLABLE_BIT};
@@ -24,14 +25,14 @@ impl Execution {
     ) -> Result<()> {
         match op {
             Op::RefTest { ty, nullable } => {
-                let r = self.pop_ref(cell::refkind_of_irheap(ty));
-                let hit = matches_heaptype(inner, instance, &r, ty, *nullable);
+                let r = self.pop_ref(cell::refkind_of_irheap(ty))?;
+                let hit = matches_heaptype(inner, instance, &r, ty, *nullable)?;
                 self.push(Val::I32(i32::from(hit)));
                 Ok(())
             }
             Op::RefCast { ty, nullable } => {
-                let r = self.pop_ref(cell::refkind_of_irheap(ty));
-                if matches_heaptype(inner, instance, &r, ty, *nullable) {
+                let r = self.pop_ref(cell::refkind_of_irheap(ty))?;
+                if matches_heaptype(inner, instance, &r, ty, *nullable)? {
                     self.push(r);
                     Ok(())
                 } else {
@@ -39,19 +40,19 @@ impl Execution {
                 }
             }
             Op::RefEq => {
-                let b = self.pop_anyref();
-                let a = self.pop_anyref();
+                let b = self.pop_anyref()?;
+                let a = self.pop_anyref()?;
                 self.push(Val::I32(i32::from(ref_eq(&a, &b))));
                 Ok(())
             }
             Op::AnyConvertExtern => {
-                let e = self.pop_ref(RefKind::Extern);
+                let e = self.pop_ref(RefKind::Extern)?;
                 let a = inner.any_convert_extern(e)?;
                 self.push(a);
                 Ok(())
             }
             Op::ExternConvertAny => {
-                let a = self.pop_anyref();
+                let a = self.pop_anyref()?;
                 let e = inner.extern_convert_any(a)?;
                 self.push(e);
                 Ok(())
@@ -74,7 +75,7 @@ impl Execution {
         instance: Instance,
         op: &Op,
         on_fail: bool,
-    ) -> Option<u32> {
+    ) -> Result<Option<u32>> {
         let (ty, packed) = match op {
             Op::BrOnCast { ty, target } | Op::BrOnCastFail { ty, target } => (ty, *target),
             _ => unreachable!("not a br_on_cast op"),
@@ -84,14 +85,14 @@ impl Execution {
         let nullable = packed & NULLABLE_BIT != 0;
         #[allow(clippy::indexing_slicing)]
         let target = code.br_tables()[(packed & !NULLABLE_BIT) as usize];
-        let r = self.pop_ref(cell::refkind_of_irheap(ty));
-        let matched = matches_heaptype(inner, instance, &r, ty, nullable);
+        let r = self.pop_ref(cell::refkind_of_irheap(ty))?;
+        let matched = matches_heaptype(inner, instance, &r, ty, nullable)?;
         self.push(r);
         if matched ^ on_fail {
-            self.take_branch(target);
-            Some(target.ip)
+            self.take_branch(target)?;
+            Ok(Some(target.ip))
         } else {
-            None
+            Ok(None)
         }
     }
 }
@@ -105,29 +106,29 @@ pub(super) fn matches_heaptype(
     value: &Val,
     target: &IrHeap,
     nullable: bool,
-) -> bool {
+) -> Result<bool> {
     use IrHeap as H;
     if value.is_null_ref() {
-        return nullable;
+        return Ok(nullable);
     }
     match target {
-        H::Any => matches!(value, Val::AnyRef(Some(_))),
+        H::Any => Ok(matches!(value, Val::AnyRef(Some(_)))),
         H::Eq => is_eq(inner, value),
-        H::I31 => matches!(decode_any(value), Some(AnyRefHandle::I31(_))),
-        H::Struct => gc_kind(inner, value) == Some(AggKind::Struct),
-        H::Array => gc_kind(inner, value) == Some(AggKind::Array),
-        H::Func => matches!(value, Val::FuncRef(Some(_))),
-        H::Extern => matches!(value, Val::ExternRef(Some(_))),
-        H::Exn => matches!(value, Val::ExnRef(Some(_))),
+        H::I31 => Ok(matches!(decode_any(value), Some(AnyRefHandle::I31(_)))),
+        H::Struct => Ok(gc_kind(inner, value)? == Some(AggKind::Struct)),
+        H::Array => Ok(gc_kind(inner, value)? == Some(AggKind::Array)),
+        H::Func => Ok(matches!(value, Val::FuncRef(Some(_)))),
+        H::Extern => Ok(matches!(value, Val::ExternRef(Some(_)))),
+        H::Exn => Ok(matches!(value, Val::ExnRef(Some(_)))),
         // The bottom types are inhabited only by null, already handled above.
-        H::NoFunc | H::NoExtern | H::NoExn | H::None => false,
+        H::NoFunc | H::NoExtern | H::NoExn | H::None => Ok(false),
         H::Concrete(idx, kind) => concrete_matches(inner, instance, value, *idx, *kind),
     }
 }
 
 /// `eq` admits `i31`, `struct`, and `array` references (not, eventually, externalized `any`).
-fn is_eq(inner: &StoreInner, value: &Val) -> bool {
-    matches!(decode_any(value), Some(AnyRefHandle::I31(_))) || gc_kind(inner, value).is_some()
+fn is_eq(inner: &StoreInner, value: &Val) -> Result<bool> {
+    Ok(matches!(decode_any(value), Some(AnyRefHandle::I31(_))) || gc_kind(inner, value)?.is_some())
 }
 
 fn concrete_matches(
@@ -136,7 +137,7 @@ fn concrete_matches(
     value: &Val,
     idx: u32,
     kind: AggKind,
-) -> bool {
+) -> Result<bool> {
     let target_id = inner
         .instance(instance)
         .module
@@ -147,9 +148,9 @@ fn concrete_matches(
             Val::FuncRef(Some(f)) => Some(func_type_id(inner, *f)),
             _ => None,
         },
-        AggKind::Struct | AggKind::Array => gc_type_id(inner, value),
+        AggKind::Struct | AggKind::Array => gc_type_id(inner, value)?,
     };
-    actual.is_some_and(|a| inner.engine().is_subtype(a, target_id))
+    Ok(actual.is_some_and(|a| inner.engine().is_subtype(a, target_id)))
 }
 
 /// The decoded `anyref` handle of a non-null `anyref` value, if it is one.
@@ -161,29 +162,37 @@ fn decode_any(value: &Val) -> Option<AnyRefHandle> {
 }
 
 /// The aggregate kind of a non-null `anyref` heap object (`None` for `i31` or non-`anyref`).
-fn gc_kind(inner: &StoreInner, value: &Val) -> Option<AggKind> {
-    let slot = match decode_any(value)? {
-        AnyRefHandle::Slot(i) => i,
-        AnyRefHandle::I31(_) => return None,
+fn gc_kind(inner: &StoreInner, value: &Val) -> Result<Option<AggKind>> {
+    let Some(decoded) = decode_any(value) else {
+        return Ok(None);
     };
-    match inner.gc_object(slot).expect("live gc slot").header.kind {
+    let slot = match decoded {
+        AnyRefHandle::Slot(i) => i,
+        AnyRefHandle::I31(_) => return Ok(None),
+    };
+    let obj = inner.gc_object(slot).ok_or(InternalError::GcMetadata(
+        "cast operand refers to a missing GC object",
+    ))?;
+    Ok(match obj.header.kind {
         ObjKind::Struct => Some(AggKind::Struct),
         ObjKind::Array => Some(AggKind::Array),
         ObjKind::Extern => None, // an externalized host ref is `any` but not a typed aggregate
-    }
+    })
 }
 
 /// The canonical type id of a non-null `anyref` heap object (`None` for `i31`, `extern`
 /// wrappers, or non-`anyref`).
-fn gc_type_id(inner: &StoreInner, value: &Val) -> Option<CanonicalTypeId> {
-    let AnyRefHandle::Slot(i) = decode_any(value)? else {
-        return None;
+fn gc_type_id(inner: &StoreInner, value: &Val) -> Result<Option<CanonicalTypeId>> {
+    let Some(AnyRefHandle::Slot(i)) = decode_any(value) else {
+        return Ok(None);
     };
-    let obj = inner.gc_object(i).expect("live gc slot");
-    match obj.header.kind {
+    let obj = inner.gc_object(i).ok_or(InternalError::GcMetadata(
+        "cast operand refers to a missing GC object",
+    ))?;
+    Ok(match obj.header.kind {
         ObjKind::Struct | ObjKind::Array => Some(obj.header.type_id),
         ObjKind::Extern => None,
-    }
+    })
 }
 
 /// The canonical type id of a function reference's signature (wasm or host).

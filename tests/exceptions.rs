@@ -5,8 +5,8 @@
 #![allow(clippy::unwrap_used)]
 
 use submilli_wasm::{
-    AsContextMut, Engine, ExnRef, ExnRefPre, ExnType, Extern, Func, FuncType, Instance, Module,
-    Store, Tag, TagType, ThrownException, Trap, Val, ValType,
+    AsContextMut, Engine, ExnRef, ExnRefPre, ExnType, Extern, Func, FuncType, HeapType, Instance,
+    Module, RootScope, Store, Tag, TagType, ThrownException, Trap, Val, ValType,
 };
 
 fn run(wat: &str, export: &str, args: &[Val]) -> submilli_wasm::Result<()> {
@@ -220,6 +220,29 @@ fn host_builds_and_reads_exception() {
     let _ = exn.tag(&mut store).unwrap();
 }
 
+#[test]
+fn exn_matches_ty_validates_cross_store_and_stale_handles() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let tt = TagType::new(FuncType::new(&engine, [], []));
+    let tag = Tag::new(&mut store, &tt).unwrap();
+    let pre = ExnRefPre::new(&mut store, ExnType::from_tag_type(&tt).unwrap());
+
+    let live = ExnRef::new(&mut store, &pre, &tag, &[]).unwrap();
+    let other = Store::new(&engine, ());
+    let cross_store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        live.matches_ty(&other, &HeapType::Exn)
+    }));
+    assert!(cross_store.is_err(), "wrong-store misuse follows Wasmtime");
+
+    let stale = {
+        let mut scope = RootScope::new(&mut store);
+        ExnRef::new(&mut scope, &pre, &tag, &[]).unwrap()
+    };
+    store.gc();
+    assert!(stale.matches_ty(&store, &HeapType::Exn).is_err());
+}
+
 /// An uncaught guest exception surfaces as `ThrownException`, with the `exnref` on the store's
 /// pending slot (recoverable + inspectable).
 #[test]
@@ -239,6 +262,7 @@ fn uncaught_surfaces_as_thrown_exception() {
     let err = f.call(&mut store, &[], &mut []).unwrap_err();
     assert!(err.is::<ThrownException>(), "got: {err}");
     let exn = store.take_pending_exception().expect("pending exception");
+    store.gc();
     assert_eq!(exn.field(&mut store, 0).unwrap().unwrap_i32(), 9);
     assert!(
         store.take_pending_exception().is_none(),
@@ -375,10 +399,10 @@ fn stale_pending_is_not_phantom_caught() {
     assert!(err.to_string().contains("boom"));
 }
 
-/// A host that calls `Store::throw` but returns `Ok` (swallowing the error) must not leave a phantom
-/// pending exception after the — successful — call: the pending slot is scoped to the host call.
+/// Wasmtime leaves an exception pending when a host calls `Store::throw` and then swallows the
+/// returned error. The interpreter must not silently discard it at the guest/host boundary.
 #[test]
-fn host_throw_then_ok_leaves_no_pending() {
+fn host_throw_then_ok_preserves_pending() {
     let engine = Engine::default();
     let mut store = Store::new(&engine, ());
     let tt = TagType::new(FuncType::new(&engine, [], []));
@@ -403,7 +427,7 @@ fn host_throw_then_ok_leaves_no_pending() {
     let f = inst.get_func(&mut store, "f").unwrap();
     f.call(&mut store, &[], &mut []).unwrap(); // host swallowed its throw → the call succeeds
     assert!(
-        store.take_pending_exception().is_none(),
-        "a swallowed host throw left a phantom pending exception"
+        store.take_pending_exception().is_some(),
+        "a swallowed host throw was silently discarded"
     );
 }

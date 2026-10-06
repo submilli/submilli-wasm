@@ -7,6 +7,33 @@
 
 use core::fmt::{Debug, Display};
 
+/// A failure of an interpreter-owned invariant. This type is deliberately crate-private: callers
+/// receive the existing public [`Error`] while guest exception handling cannot recognize or catch
+/// the failure as a WebAssembly exception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InternalError {
+    OperandStack(&'static str),
+    FrameStack(&'static str),
+    ResultShape(&'static str),
+    GcMetadata(&'static str),
+    Compiler(&'static str),
+}
+
+impl Display for InternalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (area, detail) = match self {
+            InternalError::OperandStack(detail) => ("operand stack", detail),
+            InternalError::FrameStack(detail) => ("frame stack", detail),
+            InternalError::ResultShape(detail) => ("result shape", detail),
+            InternalError::GcMetadata(detail) => ("GC metadata", detail),
+            InternalError::Compiler(detail) => ("compiler", detail),
+        };
+        write!(f, "internal {area} invariant violated: {detail}")
+    }
+}
+
+impl std::error::Error for InternalError {}
+
 /// The error type, mirroring `wasmtime::Error`.
 pub struct Error(anyhow::Error);
 

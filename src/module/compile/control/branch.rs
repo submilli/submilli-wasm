@@ -5,6 +5,7 @@
 use wasmparser::BrTable;
 
 use super::{BlockKind, Patch, PatchSlot};
+use crate::error::InternalError;
 use crate::module::compile::{wp_err, Translator};
 use crate::module::op::{BrTableRange, BranchTarget, Op, NULLABLE_BIT};
 use crate::Result;
@@ -84,7 +85,11 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn ret(&mut self) -> Result<()> {
         let arity = self.ctrl[0].result_count;
-        let (keep, pop) = fixup(arity, self.height.saturating_sub(arity))?;
+        let pop = self
+            .height
+            .checked_sub(arity)
+            .ok_or(InternalError::Compiler("return operand height underflow"))?;
+        let (keep, pop) = fixup(arity, pop)?;
         let idx = self.next_ip();
         self.emit(Op::Br(BranchTarget { ip: 0, keep, pop }));
         self.ctrl[0].end_patches.push(Patch {
@@ -99,10 +104,26 @@ impl Translator<'_> {
     /// Computes a branch's `BranchTarget`; returns the control-frame index to
     /// patch later (forward targets), or `None` for an already-resolved loop.
     pub(super) fn branch_target(&self, depth: u32) -> Result<(BranchTarget, Option<usize>)> {
-        let i = self.ctrl.len() - 1 - depth as usize;
-        let frame = &self.ctrl[i];
+        let i = self
+            .ctrl
+            .len()
+            .checked_sub(1)
+            .and_then(|top| top.checked_sub(depth as usize))
+            .ok_or(InternalError::Compiler("branch control depth out of range"))?;
+        let frame = self
+            .ctrl
+            .get(i)
+            .ok_or(InternalError::Compiler("branch control frame missing"))?;
         let arity = frame.label_arity();
-        let (keep, pop) = fixup(arity, self.height.saturating_sub(frame.base_height + arity))?;
+        let target_height = frame
+            .base_height
+            .checked_add(arity)
+            .ok_or(InternalError::Compiler("branch target height overflow"))?;
+        let pop = self
+            .height
+            .checked_sub(target_height)
+            .ok_or(InternalError::Compiler("branch operand height underflow"))?;
+        let (keep, pop) = fixup(arity, pop)?;
         Ok(if frame.kind == BlockKind::Loop {
             (
                 BranchTarget {

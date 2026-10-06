@@ -115,39 +115,39 @@ impl Execution {
                 self.push_i64(i64::from(u32::from_le_bytes(b)));
             }
             Op::I32Store(m) => {
-                let v = self.pop().unwrap_i32();
+                let v = self.pop_i32()?;
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store(m) => {
-                let v = self.pop().unwrap_i64();
+                let v = self.pop_i64()?;
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::F32Store(m) => {
-                let v = self.pop().unwrap_f32().to_bits();
+                let v = self.pop_f32()?.to_bits();
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::F64Store(m) => {
-                let v = self.pop().unwrap_f64().to_bits();
+                let v = self.pop_f64()?.to_bits();
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I32Store8(m) => {
-                let v = self.pop().unwrap_i32() as u8;
+                let v = self.pop_i32()? as u8;
                 self.store_n(inner, code, instance, m, [v])?;
             }
             Op::I32Store16(m) => {
-                let v = self.pop().unwrap_i32() as u16;
+                let v = self.pop_i32()? as u16;
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store8(m) => {
-                let v = self.pop().unwrap_i64() as u8;
+                let v = self.pop_i64()? as u8;
                 self.store_n(inner, code, instance, m, [v])?;
             }
             Op::I64Store16(m) => {
-                let v = self.pop().unwrap_i64() as u16;
+                let v = self.pop_i64()? as u16;
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::I64Store32(m) => {
-                let v = self.pop().unwrap_i64() as u32;
+                let v = self.pop_i64()? as u32;
                 self.store_n(inner, code, instance, m, v.to_le_bytes())?;
             }
             Op::MemorySize(i) => {
@@ -157,9 +157,9 @@ impl Execution {
             }
             Op::MemoryFill(i) => {
                 let is_64 = inner.memory(mem(inner, instance, *i)).ty.is_64();
-                let len = self.pop_index(is_64);
-                let val = self.pop().unwrap_i32() as u8;
-                let dst = self.pop_index(is_64);
+                let len = self.pop_index(is_64)?;
+                let val = self.pop_i32()? as u8;
+                let dst = self.pop_index(is_64)?;
                 let bytes = &mut inner.memory_mut(mem(inner, instance, *i)).bytes;
                 let end = checked_range(dst, len, bytes.len() as u64)?;
                 bytes[dst as usize..end as usize].fill(val);
@@ -186,9 +186,9 @@ impl Execution {
             inner.memory(src_mem).ty.is_64(),
         );
         // The length is typed as the narrower of the two memories (#42).
-        let len = self.pop_index(dst_64 && src_64);
-        let src = self.pop_index(src_64);
-        let dst = self.pop_index(dst_64);
+        let len = self.pop_index(dst_64 && src_64)?;
+        let src = self.pop_index(src_64)?;
+        let dst = self.pop_index(dst_64)?;
         checked_range(src, len, inner.memory(src_mem).bytes.len() as u64)?;
         checked_range(dst, len, inner.memory(dst_mem).bytes.len() as u64)?;
         let (src, dst, len) = (src as usize, dst as usize, len as usize);
@@ -213,9 +213,9 @@ impl Execution {
         mem_i: u32,
     ) -> Result<()> {
         let is_64 = inner.memory(mem(inner, instance, mem_i)).ty.is_64();
-        let len = u64::from(self.pop_i32() as u32);
-        let src = u64::from(self.pop_i32() as u32);
-        let dst = self.pop_index(is_64);
+        let len = u64::from(self.pop_i32()? as u32);
+        let src = u64::from(self.pop_i32()? as u32);
+        let dst = self.pop_index(is_64)?;
         let entity = inner.instance(instance);
         let module = entity.module.clone();
         let dropped = entity.dropped_data[seg as usize];
@@ -237,7 +237,7 @@ impl Execution {
         entity: &crate::store::MemoryEntity,
         offset: u64,
     ) -> Result<usize> {
-        let addr = self.pop_index(entity.ty.is_64());
+        let addr = self.pop_index(entity.ty.is_64())?;
         let ea = addr.checked_add(offset).ok_or_else(oob)?;
         let end = ea.checked_add(N as u64).ok_or_else(oob)?;
         if end > entity.bytes.len() as u64 {

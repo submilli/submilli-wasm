@@ -17,6 +17,7 @@
 use super::gc::anyref_slot;
 use super::Execution;
 use crate::canon::{ArrayLayout, CanonicalTypeId, Layout, Slot};
+use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::{
@@ -65,7 +66,7 @@ impl Execution {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
         let layout = module.inner().array_layout(ty)?;
-        let count = self.pop_i32() as u32 as usize;
+        let count = self.pop_i32()? as u32 as usize;
         // `byte_len` (count Ã stride) was already bounded by `gc_reserve` before this op ran
         // (limiter or abort cap), so a too-large array has already trapped â no abort-cap re-check
         // here, which would otherwise cap a limiter-approved large array.
@@ -74,7 +75,7 @@ impl Execution {
         let fill = if default {
             default_for_slot(layout.elem_at(0))
         } else {
-            self.pop_val_for(layout.elem_at(0))
+            self.pop_val_for(layout.elem_at(0))?
         };
         write_each(layout, &mut data, count, fill);
         self.alloc_array(inner, type_id, data)
@@ -93,7 +94,7 @@ impl Execution {
         let count = n as usize;
         let mut data = vec![0u8; layout.body_size(count)];
         for i in (0..count).rev() {
-            let v = self.pop_val_for(layout.elem_at(i));
+            let v = self.pop_val_for(layout.elem_at(i))?;
             write_slot(layout.elem_at(i), &mut data, v);
         }
         self.alloc_array(inner, type_id, data)
@@ -109,8 +110,8 @@ impl Execution {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
         let stride = module.inner().array_layout(ty)?.stride();
-        let count = self.pop_i32() as u32 as usize;
-        let offset = self.pop_i32() as u32 as usize;
+        let count = self.pop_i32()? as u32 as usize;
+        let offset = self.pop_i32()? as u32 as usize;
         let byte_len = elem_bytes(count, stride)?;
         let dropped = inner.instance(instance).dropped_data[data as usize];
         let seg = &module.inner().datas[data as usize].bytes;
@@ -132,8 +133,8 @@ impl Execution {
         let module = inner.instance(instance).module.clone();
         let type_id = module.inner().canonical_type_id(ty);
         let layout = module.inner().array_layout(ty)?;
-        let count = self.pop_i32() as u32 as usize;
-        let offset = self.pop_i32() as u32 as usize;
+        let count = self.pop_i32()? as u32 as usize;
+        let offset = self.pop_i32()? as u32 as usize;
         let refs = self.segment_refs(inner, instance, elem);
         range(offset, count, refs.len(), Trap::TableOutOfBounds)?;
         inner.gc_check_capacity(elem_bytes(count, layout.stride())?)?;
@@ -153,11 +154,11 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().array_layout(ty)?;
-        let idx = self.pop_i32() as u32 as usize;
-        let r = self.pop_anyref();
+        let idx = self.pop_i32()? as u32 as usize;
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         let slot = self.elem_slot(inner, obj, layout, idx)?;
-        let data = &inner.gc_object(obj).expect("live gc slot").data;
+        let data = &gc_object(inner, obj)?.data;
         self.push(match ext {
             None => read_slot(slot, data),
             Some(signed) => Val::I32(read_slot_packed(slot, data, signed)),
@@ -168,46 +169,42 @@ impl Execution {
     fn array_set(&mut self, inner: &mut StoreInner, instance: Instance, ty: u32) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().array_layout(ty)?;
-        let v = self.pop_val_for(layout.elem_at(0));
-        let idx = self.pop_i32() as u32 as usize;
-        let r = self.pop_anyref();
+        let v = self.pop_val_for(layout.elem_at(0))?;
+        let idx = self.pop_i32()? as u32 as usize;
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         let slot = self.elem_slot(inner, obj, layout, idx)?;
-        write_slot(
-            slot,
-            &mut inner.gc_object_mut(obj).expect("live gc slot").data,
-            v,
-        );
+        write_slot(slot, &mut gc_object_mut(inner, obj)?.data, v);
         Ok(())
     }
 
     fn array_len(&mut self, inner: &StoreInner) -> Result<()> {
-        let r = self.pop_anyref();
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // `array.len` carries no type immediate (it's polymorphic), so the element stride is
         // recovered from the object's canonical type via the engine registry. Typically called once
         // per array (a loop bound), so this lookup is amortized.
-        let type_id = inner.gc_object(obj).expect("live gc slot").header.type_id;
+        let type_id = gc_object(inner, obj)?.header.type_id;
         let stride = Layout::for_array(&inner.engine().array_field(type_id)?).stride();
-        self.push(Val::I32(arr_len(inner, obj, stride) as i32));
+        self.push(Val::I32(arr_len(inner, obj, stride)? as i32));
         Ok(())
     }
 
     fn array_fill(&mut self, inner: &mut StoreInner, instance: Instance, ty: u32) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().array_layout(ty)?;
-        let len = self.pop_i32() as u32 as usize;
-        let v = self.pop_val_for(layout.elem_at(0));
-        let idx = self.pop_i32() as u32 as usize;
-        let r = self.pop_anyref();
+        let len = self.pop_i32()? as u32 as usize;
+        let v = self.pop_val_for(layout.elem_at(0))?;
+        let idx = self.pop_i32()? as u32 as usize;
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         range(
             idx,
             len,
-            arr_len(inner, obj, layout.stride()),
+            arr_len(inner, obj, layout.stride())?,
             Trap::ArrayOutOfBounds,
         )?;
-        let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
+        let data = &mut gc_object_mut(inner, obj)?.data;
         for i in idx..idx + len {
             write_slot(layout.elem_at(i), data, v);
         }
@@ -222,32 +219,30 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let stride = module.inner().array_layout(dst_ty)?.stride();
-        let len = self.pop_i32() as u32 as usize;
-        let src_idx = self.pop_i32() as u32 as usize;
-        let src_r = self.pop_anyref();
-        let dst_idx = self.pop_i32() as u32 as usize;
-        let dst_r = self.pop_anyref();
+        let len = self.pop_i32()? as u32 as usize;
+        let src_idx = self.pop_i32()? as u32 as usize;
+        let src_r = self.pop_anyref()?;
+        let dst_idx = self.pop_i32()? as u32 as usize;
+        let dst_r = self.pop_anyref()?;
         let src = anyref_slot(&src_r, Trap::NullArrayReference)?;
         let dst = anyref_slot(&dst_r, Trap::NullArrayReference)?;
         range(
             src_idx,
             len,
-            arr_len(inner, src, stride),
+            arr_len(inner, src, stride)?,
             Trap::ArrayOutOfBounds,
         )?;
         range(
             dst_idx,
             len,
-            arr_len(inner, dst, stride),
+            arr_len(inner, dst, stride)?,
             Trap::ArrayOutOfBounds,
         )?;
         // Byte copy (handles match-width ref handles too); snapshot so src==dst overlap is safe.
         let from = src_idx * stride;
-        let snapshot =
-            inner.gc_object(src).expect("live gc slot").data[from..from + len * stride].to_vec();
+        let snapshot = gc_object(inner, src)?.data[from..from + len * stride].to_vec();
         let to = dst_idx * stride;
-        inner.gc_object_mut(dst).expect("live gc slot").data[to..to + len * stride]
-            .copy_from_slice(&snapshot);
+        gc_object_mut(inner, dst)?.data[to..to + len * stride].copy_from_slice(&snapshot);
         Ok(())
     }
 
@@ -260,17 +255,17 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let stride = module.inner().array_layout(ty)?.stride();
-        let len = self.pop_i32() as u32 as usize;
-        let src = self.pop_i32() as u32 as usize;
-        let dst = self.pop_i32() as u32 as usize;
-        let r = self.pop_anyref();
+        let len = self.pop_i32()? as u32 as usize;
+        let src = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_i32()? as u32 as usize;
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // Array (dst) range before the data (src) range â a `len` overrunning both reports
         // "out of bounds array access" (matches the spec ordering).
         range(
             dst,
             len,
-            arr_len(inner, obj, stride),
+            arr_len(inner, obj, stride)?,
             Trap::ArrayOutOfBounds,
         )?;
         let byte_len = elem_bytes(len, stride)?;
@@ -280,8 +275,7 @@ impl Execution {
         range(src, byte_len, seg_len, Trap::MemoryOutOfBounds)?;
         let bytes = seg[src..src + byte_len].to_vec();
         let to = dst * stride;
-        inner.gc_object_mut(obj).expect("live gc slot").data[to..to + byte_len]
-            .copy_from_slice(&bytes);
+        gc_object_mut(inner, obj)?.data[to..to + byte_len].copy_from_slice(&bytes);
         Ok(())
     }
 
@@ -294,21 +288,21 @@ impl Execution {
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
         let layout = module.inner().array_layout(ty)?;
-        let len = self.pop_i32() as u32 as usize;
-        let src = self.pop_i32() as u32 as usize;
-        let dst = self.pop_i32() as u32 as usize;
-        let r = self.pop_anyref();
+        let len = self.pop_i32()? as u32 as usize;
+        let src = self.pop_i32()? as u32 as usize;
+        let dst = self.pop_i32()? as u32 as usize;
+        let r = self.pop_anyref()?;
         let obj = anyref_slot(&r, Trap::NullArrayReference)?;
         // Array (dst) range before the elem-segment (src) range, as in `array.init_data`.
         range(
             dst,
             len,
-            arr_len(inner, obj, layout.stride()),
+            arr_len(inner, obj, layout.stride())?,
             Trap::ArrayOutOfBounds,
         )?;
         let refs = self.segment_refs(inner, instance, elem);
         range(src, len, refs.len(), Trap::TableOutOfBounds)?;
-        let data = &mut inner.gc_object_mut(obj).expect("live gc slot").data;
+        let data = &mut gc_object_mut(inner, obj)?.data;
         for (i, r) in refs[src..src + len].iter().enumerate() {
             write_slot(layout.elem_at(dst + i), data, Val::from_ref(r.clone()));
         }
@@ -336,7 +330,7 @@ impl Execution {
         layout: ArrayLayout,
         idx: usize,
     ) -> Result<Slot> {
-        if idx < arr_len(inner, obj, layout.stride()) {
+        if idx < arr_len(inner, obj, layout.stride())? {
             Ok(layout.elem_at(idx))
         } else {
             Err(Trap::ArrayOutOfBounds.into())
@@ -355,11 +349,20 @@ impl Execution {
     }
 }
 
-fn arr_len(inner: &StoreInner, obj: u32, stride: usize) -> usize {
+fn gc_object(inner: &StoreInner, obj: u32) -> Result<&GcObject> {
     inner
         .gc_object(obj)
-        .expect("live gc slot")
-        .array_len(stride) as usize
+        .ok_or_else(|| InternalError::GcMetadata("array operand refers to a missing object").into())
+}
+
+fn gc_object_mut(inner: &mut StoreInner, obj: u32) -> Result<&mut GcObject> {
+    inner
+        .gc_object_mut(obj)
+        .ok_or_else(|| InternalError::GcMetadata("array operand refers to a missing object").into())
+}
+
+fn arr_len(inner: &StoreInner, obj: u32, stride: usize) -> Result<usize> {
+    Ok(gc_object(inner, obj)?.array_len(stride) as usize)
 }
 
 /// `count * width`, trapping (allocation-too-large) on overflow.

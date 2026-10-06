@@ -3,7 +3,10 @@
 
 #![allow(clippy::unwrap_used)]
 
-use submilli_wasm::{Caller, Engine, Extern, Func, Instance, Module, Store, Val};
+use submilli_wasm::{
+    AsContextMut, Caller, Engine, ExnRef, ExnRefPre, ExnType, Extern, Func, FuncType, Instance,
+    Module, Store, Tag, TagType, ThrownException, Val,
+};
 
 fn call1(store: &mut Store<()>, inst: Instance, name: &str, arg: i32) -> i32 {
     let f = inst.get_func(&mut *store, name).unwrap();
@@ -78,4 +81,36 @@ fn tail_call_to_host() {
     .unwrap();
     let inst = Instance::new(&mut store, &module, &[Extern::Func(double)]).unwrap();
     assert_eq!(call1(&mut store, inst, "tail_double", 21), 42);
+}
+
+#[test]
+fn top_level_tail_host_throw_surfaces_without_panicking() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let tag_ty = TagType::new(FuncType::new(&engine, [], []));
+    let tag = Tag::new(&mut store, &tag_ty).unwrap();
+    let pre = ExnRefPre::new(&mut store, ExnType::from_tag_type(&tag_ty).unwrap());
+    let thrower = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        move |mut caller, _, _| {
+            let exn = ExnRef::new(&mut caller, &pre, &tag, &[])?;
+            caller.as_context_mut().throw(exn).map_err(Into::into)
+        },
+    );
+    let module = Module::new(
+        &engine,
+        wat::parse_str(
+            r#"(module
+                (import "" "throw" (func $throw))
+                (func (export "run") (return_call $throw)))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let instance = Instance::new(&mut store, &module, &[Extern::Func(thrower)]).unwrap();
+    let run = instance.get_func(&mut store, "run").unwrap();
+    let err = run.call(&mut store, &[], &mut []).unwrap_err();
+    assert!(err.is::<ThrownException>(), "got: {err}");
+    assert!(store.take_pending_exception().is_some());
 }

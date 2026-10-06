@@ -20,7 +20,7 @@ fn exn_arena_round_trip() {
         })
         .unwrap();
 
-    let exn = inner.exn(handle);
+    let exn = inner.exn(handle).unwrap();
     assert_eq!(exn.tag.index, tag.index);
     assert_eq!(exn.args.len(), 2);
     assert_eq!(exn.args[0].unwrap_i32(), 7);

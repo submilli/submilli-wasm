@@ -180,8 +180,8 @@ impl<T: 'static> Store<T> {
         {
             // The guest's operands live on the parked execution (this runs inside a host call);
             // seed the collection from there so they survive (#27g).
-            let roots = self.inner.exec_roots();
-            self.inner.gc_collect(&roots);
+            let roots = self.inner.exec_roots()?;
+            self.inner.gc_collect(&roots)?;
             if self.inner.gc.fits(charge) {
                 return Ok(());
             }
@@ -357,8 +357,8 @@ impl<T: 'static> Store<T> {
             .is_free_grant(self.inner.gc.desired_reservation(charge))
             && self.inner.gc.is_collecting()
         {
-            let roots = self.inner.exec_roots();
-            self.inner.gc_collect(&roots);
+            let roots = self.inner.exec_roots()?;
+            self.inner.gc_collect(&roots)?;
             if self.inner.gc.fits(charge) {
                 return Ok(());
             }

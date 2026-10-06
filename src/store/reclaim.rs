@@ -84,7 +84,8 @@ impl<E> ReclaimArena<E> {
             if !live.contains(&(i as u32)) {
                 freed_bytes += byte_of(entry);
                 *slot = None;
-                self.generations[i] = self.generations[i].wrapping_add(1);
+                let next = self.generations[i].wrapping_add(1);
+                self.generations[i] = if next == u32::MAX { 0 } else { next };
                 self.free.push(i as u32);
             }
         }

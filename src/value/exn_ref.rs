@@ -2,7 +2,7 @@
 //! (`StructRef`/`StructRefPre`). An exception instance is `ExnEntity { tag, args }` in the store's
 //! exn arena (#28b); `Rooted<ExnRef>` is a handle into it.
 
-use crate::extern_::{val_matches, Tag};
+use crate::extern_::{val_matches_in_store, Tag};
 use crate::store::{AsContext, AsContextMut, ExnEntity};
 use crate::value::gc_ref::{ExnRef, Rooted};
 use crate::value::{ExnType, HeapType, Val, ValType};
@@ -12,13 +12,21 @@ use crate::{Error, Result};
 /// alive) so repeated allocations amortize the type lookup — wasmtime's `*Pre` purpose.
 #[derive(Debug)]
 pub struct ExnRefPre {
+    store: u64,
     ty: ExnType,
 }
 
 impl ExnRefPre {
-    pub fn new(store: impl AsContextMut, ty: ExnType) -> Self {
-        let _ = store; // no rooting/registration needed under the null collector
-        ExnRefPre { ty }
+    pub fn new(mut store: impl AsContextMut, ty: ExnType) -> Self {
+        let ctx = store.as_context_mut();
+        assert!(
+            ty.engine().same(ctx.engine()),
+            "exception type used with a store from a different engine"
+        );
+        ExnRefPre {
+            store: ctx.inner().store_id(),
+            ty,
+        }
     }
 }
 
@@ -31,16 +39,21 @@ impl ExnRef {
         tag: &Tag,
         fields: &[Val],
     ) -> Result<Rooted<ExnRef>> {
+        let mut ctx = store.as_context_mut();
+        ctx.inner().check_handle(allocator.store);
+        let tag_ty = &ctx.inner().tag(*tag).ty;
+        if allocator.ty.func() != tag_ty.ty() {
+            return Err(Error::msg("exception allocator and tag types do not match"));
+        }
         let params: Vec<ValType> = allocator.ty.func().params().collect();
         if fields.len() != params.len() {
             return Err(Error::msg("wrong number of exception fields"));
         }
         for (v, ty) in fields.iter().zip(&params) {
-            if !val_matches(v, ty) {
+            if !val_matches_in_store(ctx.inner(), v, ty)? {
                 return Err(Error::msg("exception field value has the wrong type"));
             }
         }
-        let mut ctx = store.as_context_mut();
         // Reserve through the limiter + charge the GC budget (the exn arena is reclaimable now, #27g).
         let exn = ctx.store_mut().gc_alloc_exn(ExnEntity {
             tag: *tag,
@@ -54,6 +67,8 @@ impl ExnRef {
         Ok(Rooted::from_raw_gen(
             exn.raw(),
             inner.exn_generation(exn.raw()).unwrap_or(0),
+            inner.store_id(),
+            crate::canon::RefKind::Exn,
         ))
     }
 }
@@ -61,13 +76,15 @@ impl ExnRef {
 impl Rooted<ExnRef> {
     /// Reads argument `index`.
     pub fn field(&self, mut store: impl AsContextMut, index: usize) -> Result<Val> {
-        let ctx = store.as_context_mut();
-        ctx.inner()
+        let mut ctx = store.as_context_mut();
+        let value = ctx
+            .inner()
             .exn_checked(*self)?
             .args
             .get(index)
             .copied()
-            .ok_or_else(|| Error::msg("exception field index out of bounds"))
+            .ok_or_else(|| Error::msg("exception field index out of bounds"))?;
+        ctx.inner_mut().root_host_result(value)
     }
 
     /// The tag this exception was thrown with.
@@ -84,7 +101,8 @@ impl Rooted<ExnRef> {
 
     /// Whether this `exnref`'s heap type is a subtype of `ty`.
     pub fn matches_ty(&self, store: impl AsContext, ty: &HeapType) -> Result<bool> {
-        let _ = store.as_context();
+        let ctx = store.as_context();
+        let _ = ctx.inner().exn_checked(*self)?;
         Ok(HeapType::Exn.matches(ty))
     }
 }

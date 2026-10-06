@@ -288,17 +288,20 @@ impl TableEntity {
 #[derive(Debug)]
 pub(crate) struct HostSig {
     pub params: Box<[crate::value::ValType]>,
+    pub results: Box<[crate::value::ValType]>,
     pub result_defaults: Box<[crate::value::Val]>,
 }
 
 impl HostSig {
     pub(crate) fn new(ty: &FuncType) -> std::sync::Arc<HostSig> {
+        let results: Box<[_]> = ty.results().collect();
         std::sync::Arc::new(HostSig {
             params: ty.params().collect(),
-            result_defaults: ty
-                .results()
-                .map(|t| crate::value::Val::default_for_valtype(&t))
+            result_defaults: results
+                .iter()
+                .map(crate::value::Val::default_for_valtype)
                 .collect(),
+            results,
         })
     }
 }

@@ -7,6 +7,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use crate::canon::RefKind;
+use crate::error::InternalError;
 use crate::exception::ThrownException;
 use crate::extern_::Tag;
 use crate::instance::Instance;
@@ -18,7 +19,7 @@ use crate::value::{ExnRef, Rooted, Val, ValType};
 use crate::{Error, Result};
 
 use super::outcome::StepOutcome;
-use super::{cell, Execution};
+use super::Execution;
 
 /// An exception in flight: a handle to the store's exception instance, carried inside `crate::Error`
 /// as it unwinds. Internal — at the embedder boundary it becomes [`ThrownException`].
@@ -42,7 +43,10 @@ pub(super) fn surface_exception(inner: &mut StoreInner, err: Error) -> Error {
     match err.downcast_ref::<PendingException>() {
         Some(p) => {
             let exn = p.exn;
-            let backtrace = inner.exn(exn).backtrace.clone();
+            let backtrace = match inner.exn(exn) {
+                Ok(entity) => entity.backtrace.clone(),
+                Err(error) => return error,
+            };
             inner.set_pending_exception(exn);
             // Backtrace as source, `ThrownException` as context: `Display` stays the exception
             // message while `downcast_ref::<WasmBacktrace>()` recovers the throw-site trace.
@@ -70,16 +74,10 @@ impl Execution {
         // Reserve the exception's GC-budget footprint *before* popping, so its args stay on the
         // operand stack as roots if a collection runs (#27g). A reservation grow suspends and
         // re-executes this throw — idempotent, since nothing has been popped yet.
-        if let Some(out) = self.gc_reserve(inner, crate::store::exn_charge(params.len()), ip) {
+        if let Some(out) = self.gc_reserve(inner, crate::store::exn_charge(params.len()), ip)? {
             return Ok(out);
         }
-        // Pop top-first (so the last param first), decoding by its type, then restore order.
-        let mut args: Vec<Val> = params
-            .iter()
-            .rev()
-            .map(|ty| cell::decode(self.pop(), ty))
-            .collect();
-        args.reverse();
+        let args = self.pop_params(&params)?;
         let backtrace = inner
             .engine()
             .wasm_backtrace_enabled()
@@ -94,7 +92,7 @@ impl Execution {
 
     /// `throw_ref`: re-raise a caught `exnref` (null traps).
     pub(super) fn throw_ref(&mut self) -> Result<StepOutcome> {
-        match self.pop_ref(RefKind::Exn) {
+        match self.pop_ref(RefKind::Exn)? {
             Val::ExnRef(Some(exn)) => Err(PendingException { exn }.into()),
             Val::ExnRef(None) => Err(Trap::NullReference.into()),
             _ => unreachable!("throw_ref operand is an exnref (validated)"),
@@ -118,29 +116,24 @@ impl Execution {
             Some(p) => p.exn,
             None => return Err(err),
         };
-        let thrown = inner.exn(exn).tag;
+        let thrown = inner.exn(exn)?.tag;
         loop {
-            let frame = self.frames.last().expect("unwind: empty frame stack");
-            let (code, base, instance) = (frame.code.clone(), frame.locals_base, frame.instance);
-            if let Some(rec) = find_clause(&code, fault_ip, inner, instance, thrown) {
-                let floor = base + code.n_params() + code.local_types().len() as u32;
-                let restore = (floor + rec.restore_height) as usize;
-                self.values.truncate(restore);
-                self.shadow.truncate(restore);
-                if rec.payload_args {
-                    for a in inner.exn(exn).args.clone() {
-                        self.push(a);
-                    }
-                }
-                if rec.payload_ref {
-                    self.push(Val::ExnRef(Some(exn)));
-                }
-                self.frames.last_mut().expect("frame").ip = rec.landing_ip;
-                return Ok(());
+            if self.frames.len() <= stop_depth {
+                return Err(err);
             }
-            self.values.truncate(base as usize);
-            self.shadow.truncate(base as usize);
-            self.frames.pop();
+            let frame = self.frames.last().ok_or(InternalError::FrameStack(
+                "missing frame during exception unwind",
+            ))?;
+            let (code, base, floor, instance) = (
+                frame.code.clone(),
+                frame.locals_base,
+                frame.operand_base,
+                frame.instance,
+            );
+            if let Some(rec) = find_clause(&code, fault_ip, inner, instance, thrown)? {
+                return self.enter_exception_handler(inner, exn, rec, floor);
+            }
+            self.pop_unwound_frame(base)?;
             // Stop at this call's boundary: an exception uncaught within these frames does not cross
             // the delimiter into a parked outer call (it surfaces to that call's `Func::call`).
             if self.frames.len() == stop_depth {
@@ -149,10 +142,61 @@ impl Execution {
             fault_ip = self
                 .frames
                 .last()
-                .expect("frame above the delimiter")
+                .ok_or(InternalError::FrameStack(
+                    "missing caller frame during unwind",
+                ))?
                 .ip
-                .saturating_sub(1);
+                .checked_sub(1)
+                .ok_or(InternalError::FrameStack("caller return address underflow"))?;
         }
+    }
+
+    fn enter_exception_handler(
+        &mut self,
+        inner: &StoreInner,
+        exn: Rooted<ExnRef>,
+        rec: HandlerRec,
+        floor: u32,
+    ) -> Result<()> {
+        let restore = floor
+            .checked_add(rec.restore_height)
+            .ok_or(InternalError::OperandStack(
+                "exception restore height overflow",
+            ))? as usize;
+        if self.values.len() != self.shadow.len() || restore > self.values.len() {
+            return Err(InternalError::OperandStack(
+                "exception restore height exceeds operand stack",
+            )
+            .into());
+        }
+        self.values.truncate(restore);
+        self.shadow.truncate(restore);
+        if rec.payload_args {
+            for arg in inner.exn(exn)?.args.clone() {
+                self.push(arg);
+            }
+        }
+        if rec.payload_ref {
+            self.push(Val::ExnRef(Some(exn)));
+        }
+        self.frames
+            .last_mut()
+            .ok_or(InternalError::FrameStack("missing handler frame"))?
+            .ip = rec.landing_ip;
+        Ok(())
+    }
+
+    fn pop_unwound_frame(&mut self, base: u32) -> Result<()> {
+        if self.values.len() != self.shadow.len() || base as usize > self.values.len() {
+            return Err(InternalError::OperandStack(
+                "frame base exceeds operand stack during unwind",
+            )
+            .into());
+        }
+        self.values.truncate(base as usize);
+        self.shadow.truncate(base as usize);
+        self.frames.pop();
+        Ok(())
     }
 
     /// A host function threw `exn` (via `Store::throw`): re-enter the unwinder from the host call
@@ -164,17 +208,23 @@ impl Execution {
         exn: Rooted<ExnRef>,
         stop_depth: usize,
     ) -> Result<()> {
+        if self.frames.len() <= stop_depth {
+            return Err(PendingException { exn }.into());
+        }
         let fault_ip = self
             .frames
             .last()
-            .expect("host call frame")
+            .ok_or(InternalError::FrameStack("missing host call frame"))?
             .ip
-            .saturating_sub(1);
+            .checked_sub(1)
+            .ok_or(InternalError::FrameStack(
+                "host call return address underflow",
+            ))?;
         // A host-thrown exception has no backtrace yet; capture the wasm stack at the host-call
         // site so an uncaught host exception still reports a backtrace (#29d).
-        if inner.exn(exn).backtrace.is_none() && inner.engine().wasm_backtrace_enabled() {
+        if inner.exn(exn)?.backtrace.is_none() && inner.engine().wasm_backtrace_enabled() {
             let bt = self.capture_backtrace(inner, fault_ip);
-            inner.exn_mut(exn).backtrace = Some(bt);
+            inner.exn_mut(exn)?.backtrace = Some(bt);
         }
         self.unwind(inner, PendingException { exn }.into(), fault_ip, stop_depth)
     }
@@ -187,19 +237,27 @@ fn find_clause(
     inner: &StoreInner,
     instance: Instance,
     thrown: Tag,
-) -> Option<HandlerRec> {
+) -> Result<Option<HandlerRec>> {
     for span in code.handlers() {
         if ip >= span.start_ip && ip < span.end_ip {
             for rec in &span.clauses {
                 let matches = match rec.tag {
                     None => true,
-                    Some(idx) => inner.instance(instance).tags[idx as usize].index == thrown.index,
+                    Some(idx) => {
+                        inner
+                            .instance(instance)
+                            .tags
+                            .get(idx as usize)
+                            .ok_or(InternalError::Compiler("exception handler tag is missing"))?
+                            .index
+                            == thrown.index
+                    }
                 };
                 if matches {
-                    return Some(*rec);
+                    return Ok(Some(*rec));
                 }
             }
         }
     }
-    None
+    Ok(None)
 }

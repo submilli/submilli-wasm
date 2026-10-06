@@ -21,9 +21,9 @@ use crate::Result;
 impl Execution {
     /// Runs a mark-sweep collection seeded with this execution's live operand/local roots. A safe
     /// point: operands are recovered from the root shadow, so live references survive.
-    pub(super) fn gc_collect_now(&mut self, inner: &mut StoreInner) {
-        let roots: Vec<_> = self.operand_roots().collect();
-        inner.gc_collect(&roots);
+    pub(super) fn gc_collect_now(&mut self, inner: &mut StoreInner) -> Result<()> {
+        let roots = self.operand_roots()?;
+        inner.gc_collect(&roots)
     }
 
     /// Ensures the GC reservation covers a `charge`-byte allocation. Called with operands still on
@@ -42,16 +42,16 @@ impl Execution {
         inner: &mut StoreInner,
         charge: usize,
         ip: u32,
-    ) -> Option<StepOutcome> {
+    ) -> Result<Option<StepOutcome>> {
         if inner.gc.fits(charge) {
-            return None;
+            return Ok(None);
         }
         // Only collect when the growth we'd need exceeds the free budget (the limiter-gated path).
         if !inner.gc.is_free_grant(inner.gc.desired_reservation(charge)) && inner.gc.is_collecting()
         {
-            self.gc_collect_now(inner);
+            self.gc_collect_now(inner)?;
             if inner.gc.fits(charge) {
-                return None;
+                return Ok(None);
             }
         }
         // Recompute after a possible collection (which may have lowered `used`, hence the target).
@@ -59,13 +59,13 @@ impl Execution {
         if inner.gc.is_free_grant(reserved_target) {
             let granted = inner.gc.grant(reserved_target);
             inner.engine().add_gc_committed(granted);
-            return None;
+            return Ok(None);
         }
-        Some(StepOutcome::DoGcGrow {
+        Ok(Some(StepOutcome::DoGcGrow {
             reserved_target,
             bytes_needed: charge as u64,
             return_ip: ip,
-        })
+        }))
     }
 
     /// The GC-heap byte charge of an allocating op (`None` for a non-allocating op), computed
@@ -84,7 +84,7 @@ impl Execution {
             }
             Op::ArrayNew(ty) | Op::ArrayNewDefault(ty) => {
                 let stride = module.inner().array_layout(*ty)?.stride();
-                array_bytes(self.peek_count(), stride)?
+                array_bytes(self.peek_count()?, stride)?
             }
             Op::ArrayNewFixed { ty, n } => module.inner().array_layout(*ty)?.body_size(*n as usize),
             Op::ArrayNewData { ty, data } => {
@@ -95,14 +95,14 @@ impl Execution {
                 } else {
                     module.inner().datas[*data as usize].bytes.len()
                 };
-                seg_clamped_charge(self.peek_count(), stride, seg)
+                seg_clamped_charge(self.peek_count()?, stride, seg)
             }
             Op::ArrayNewElem { ty, elem } => {
                 let stride = module.inner().array_layout(*ty)?.stride();
                 let seg = inner.instance(instance).elems[*elem as usize]
                     .len()
                     .saturating_mul(stride);
-                seg_clamped_charge(self.peek_count(), stride, seg)
+                seg_clamped_charge(self.peek_count()?, stride, seg)
             }
             _ => return Ok(None),
         };
@@ -110,8 +110,8 @@ impl Execution {
     }
 
     /// The top operand read as an unsigned element count (the array length on `array.new*`).
-    fn peek_count(&self) -> usize {
-        self.top_i32() as u32 as usize
+    fn peek_count(&self) -> Result<usize> {
+        Ok(self.top_i32()? as u32 as usize)
     }
 }
 

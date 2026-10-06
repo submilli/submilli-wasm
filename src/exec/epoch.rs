@@ -44,21 +44,38 @@ fn take_epoch_action<T>(exec: &mut Execution, store: &mut Store<T>) -> Result<Up
         return Ok(UpdateDeadline::Interrupt);
     };
     let roots_mark = store.inner.gc_roots_mark();
+    let pending = store.inner.pending_exception();
+    let pending_generation = store.inner.pending_exception_generation();
+    if let Some(exception) = pending {
+        store
+            .inner
+            .push_gc_root(exception.raw(), crate::canon::RefKind::Exn);
+    }
     store.inner.swap_exec(exec); // park (see `invoke_host`)
     let action = match super::guard::catch_host(|| f(store.as_context_mut())) {
         Ok(action) => action,
         Err(payload) => {
-            super::guard::restore_after_panic(&mut store.inner, roots_mark);
+            super::guard::restore_after_panic(
+                &mut store.inner,
+                roots_mark,
+                pending,
+                pending_generation,
+            );
+            store.epoch_callback = cb;
             super::guard::reraise(payload);
         }
     };
+    #[cfg(feature = "async")]
+    store.inner.recover_cancelled_async_calls();
     store.inner.swap_exec(exec); // reclaim
     store.inner.gc_roots_truncate(roots_mark);
-    if action.is_ok() {
-        // See `invoke_host`: a callback that returned normally leaves no pending exception.
-        store.inner.take_pending_exception();
-    }
     store.epoch_callback = cb;
+    if let Some(error) = store.inner.take_internal_error() {
+        store
+            .inner
+            .restore_pending_exception(pending, pending_generation);
+        return Err(error);
+    }
     action
 }
 
@@ -96,7 +113,10 @@ pub(super) async fn apply_epoch_deadline_async<T>(
             Ok(())
         }
         UpdateDeadline::Yield(delta) => {
+            store.inner.swap_exec(exec);
             yield_now().await;
+            store.inner.recover_cancelled_async_calls();
+            store.inner.swap_exec(exec);
             extend_epoch_deadline(store, delta);
             Ok(())
         }

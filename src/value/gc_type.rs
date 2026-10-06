@@ -72,6 +72,16 @@ impl StructType {
         fields: impl IntoIterator<Item = FieldType>,
     ) -> Result<Self> {
         let fields: Vec<FieldType> = fields.into_iter().collect();
+        assert!(
+            supertype.is_none_or(|ty| ty.engine().same(engine)),
+            "struct supertype belongs to a different engine"
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|field| field_belongs_to_engine(field, engine)),
+            "struct field contains a concrete type from a different engine"
+        );
         let id =
             engine.intern_struct_type(finality, supertype.map(StructType::canonical_id), &fields);
         Ok(StructType {
@@ -105,7 +115,7 @@ impl StructType {
     pub fn fields(&self) -> impl ExactSizeIterator<Item = FieldType> {
         self.engine
             .struct_fields(self.id)
-            .unwrap_or_default()
+            .expect("live StructType registration must retain its fields")
             .into_iter()
     }
 }
@@ -129,6 +139,14 @@ impl ArrayType {
         supertype: Option<&Self>,
         field_type: FieldType,
     ) -> Result<Self> {
+        assert!(
+            supertype.is_none_or(|ty| ty.engine().same(engine)),
+            "array supertype belongs to a different engine"
+        );
+        assert!(
+            field_belongs_to_engine(&field_type, engine),
+            "array field contains a concrete type from a different engine"
+        );
         let id = engine.intern_array_type(
             finality,
             supertype.map(ArrayType::canonical_id),
@@ -161,11 +179,18 @@ impl ArrayType {
     pub fn field_type(&self) -> FieldType {
         self.engine
             .array_field(self.id)
-            .unwrap_or_else(|_| FieldType::new(Mutability::Const, StorageType::I8))
+            .expect("live ArrayType registration must retain its field")
     }
 
     pub fn element_type(&self) -> StorageType {
         self.field_type().element_type().clone()
+    }
+}
+
+fn field_belongs_to_engine(field: &FieldType, engine: &Engine) -> bool {
+    match field.element_type() {
+        StorageType::I8 | StorageType::I16 => true,
+        StorageType::ValType(ty) => crate::value::val_type_belongs_to_engine(ty, engine),
     }
 }
 

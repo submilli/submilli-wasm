@@ -30,7 +30,7 @@ impl Execution {
                 self.push_v128(u128::from_le_bytes(b));
             }
             S::V128Store(m) => {
-                let v = self.pop_v128();
+                let v = self.pop_v128()?;
                 self.store_n::<16>(inner, code, instance, m, v.to_le_bytes())?;
             }
             S::V128Load8x8S(m) => {
@@ -100,47 +100,47 @@ impl Execution {
                 self.push_v128(u128::from(u64::from_le_bytes(b)));
             }
             S::V128Load8Lane { mem, lane } => {
-                let v = self.pop_v128();
+                let v = self.pop_v128()?;
                 let b = self.load_n::<1>(inner, code, instance, mem)?;
                 let mut a = u8x16(v);
                 a[*lane as usize] = b[0];
                 self.push_v128(from_u8x16(a));
             }
             S::V128Load16Lane { mem, lane } => {
-                let v = self.pop_v128();
+                let v = self.pop_v128()?;
                 let b = self.load_n::<2>(inner, code, instance, mem)?;
                 let mut a = u16x8(v);
                 a[*lane as usize] = u16::from_le_bytes(b);
                 self.push_v128(from_u16x8(a));
             }
             S::V128Load32Lane { mem, lane } => {
-                let v = self.pop_v128();
+                let v = self.pop_v128()?;
                 let b = self.load_n::<4>(inner, code, instance, mem)?;
                 let mut a = u32x4(v);
                 a[*lane as usize] = u32::from_le_bytes(b);
                 self.push_v128(from_u32x4(a));
             }
             S::V128Load64Lane { mem, lane } => {
-                let v = self.pop_v128();
+                let v = self.pop_v128()?;
                 let b = self.load_n::<8>(inner, code, instance, mem)?;
                 let mut a = u64x2(v);
                 a[*lane as usize] = u64::from_le_bytes(b);
                 self.push_v128(from_u64x2(a));
             }
             S::V128Store8Lane { mem, lane } => {
-                let a = u8x16(self.pop_v128());
+                let a = u8x16(self.pop_v128()?);
                 self.store_n::<1>(inner, code, instance, mem, [a[*lane as usize]])?;
             }
             S::V128Store16Lane { mem, lane } => {
-                let a = u16x8(self.pop_v128());
+                let a = u16x8(self.pop_v128()?);
                 self.store_n::<2>(inner, code, instance, mem, a[*lane as usize].to_le_bytes())?;
             }
             S::V128Store32Lane { mem, lane } => {
-                let a = u32x4(self.pop_v128());
+                let a = u32x4(self.pop_v128()?);
                 self.store_n::<4>(inner, code, instance, mem, a[*lane as usize].to_le_bytes())?;
             }
             S::V128Store64Lane { mem, lane } => {
-                let a = u64x2(self.pop_v128());
+                let a = u64x2(self.pop_v128()?);
                 self.store_n::<8>(inner, code, instance, mem, a[*lane as usize].to_le_bytes())?;
             }
             _ => return Ok(false),

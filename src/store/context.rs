@@ -98,16 +98,19 @@ impl<'a, T: 'static> StoreContextMut<'a, T> {
     }
 
     pub(crate) fn inner_mut(&mut self) -> &mut StoreInner {
+        self.0.recover_async_cancellation();
         &mut self.0.inner
     }
 
     /// The underlying `Store<T>` (for host-function storage + the generic driver).
     pub(crate) fn store_mut(&mut self) -> &mut Store<T> {
+        self.0.recover_async_cancellation();
         self.0
     }
 
     /// Consumes the context to yield the full-`'a` mutable borrow (for `Memory::data_mut`).
     pub(crate) fn into_inner_mut(self) -> &'a mut StoreInner {
+        self.0.recover_async_cancellation();
         &mut self.0.inner
     }
 }
@@ -122,6 +125,7 @@ impl<T: 'static> AsContext for Store<T> {
 
 impl<T: 'static> AsContextMut for Store<T> {
     fn as_context_mut(&mut self) -> StoreContextMut<'_, T> {
+        self.recover_async_cancellation();
         StoreContextMut(self)
     }
 }
@@ -144,6 +148,7 @@ impl<T: 'static> AsContext for StoreContextMut<'_, T> {
 
 impl<T: 'static> AsContextMut for StoreContextMut<'_, T> {
     fn as_context_mut(&mut self) -> StoreContextMut<'_, T> {
+        self.0.recover_async_cancellation();
         StoreContextMut(&mut *self.0)
     }
 }

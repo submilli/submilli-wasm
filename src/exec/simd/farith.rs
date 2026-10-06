@@ -18,46 +18,54 @@ impl Execution {
         use SimdOp as S;
         match s {
             // f32x4 arithmetic (canonicalize the result NaN unless an input was NaN)
-            S::F32x4Add => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a + b, nan2(a, b))),
-            S::F32x4Sub => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a - b, nan2(a, b))),
-            S::F32x4Mul => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a * b, nan2(a, b))),
-            S::F32x4Div => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a / b, nan2(a, b))),
-            S::F32x4Min => self.v_binop(f32x4, from_f32x4, f32_min),
-            S::F32x4Max => self.v_binop(f32x4, from_f32x4, f32_max),
-            S::F32x4PMin => self.v_binop(f32x4, from_f32x4, |a, b| if b < a { b } else { a }),
-            S::F32x4PMax => self.v_binop(f32x4, from_f32x4, |a, b| if a < b { b } else { a }),
-            S::F32x4Sqrt => self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.sqrt(), x.is_nan())),
-            S::F32x4Ceil => self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.ceil(), x.is_nan())),
-            S::F32x4Floor => self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.floor(), x.is_nan())),
-            S::F32x4Trunc => self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.trunc(), x.is_nan())),
+            S::F32x4Add => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a + b, nan2(a, b)))?,
+            S::F32x4Sub => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a - b, nan2(a, b)))?,
+            S::F32x4Mul => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a * b, nan2(a, b)))?,
+            S::F32x4Div => self.v_binop(f32x4, from_f32x4, |a, b| canon_f32(a / b, nan2(a, b)))?,
+            S::F32x4Min => self.v_binop(f32x4, from_f32x4, f32_min)?,
+            S::F32x4Max => self.v_binop(f32x4, from_f32x4, f32_max)?,
+            S::F32x4PMin => self.v_binop(f32x4, from_f32x4, |a, b| if b < a { b } else { a })?,
+            S::F32x4PMax => self.v_binop(f32x4, from_f32x4, |a, b| if a < b { b } else { a })?,
+            S::F32x4Sqrt => self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.sqrt(), x.is_nan()))?,
+            S::F32x4Ceil => self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.ceil(), x.is_nan()))?,
+            S::F32x4Floor => {
+                self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.floor(), x.is_nan()))?;
+            }
+            S::F32x4Trunc => {
+                self.v_unop(f32x4, from_f32x4, |x| canon_f32(x.trunc(), x.is_nan()))?;
+            }
             S::F32x4Nearest => {
                 self.v_unop(f32x4, from_f32x4, |x| {
                     canon_f32(x.round_ties_even(), x.is_nan())
-                });
+                })?;
             }
-            S::F32x4Abs => self.v_unop(u32x4, from_u32x4, |x| x & !SIGN32),
-            S::F32x4Neg => self.v_unop(u32x4, from_u32x4, |x| x ^ SIGN32),
+            S::F32x4Abs => self.v_unop(u32x4, from_u32x4, |x| x & !SIGN32)?,
+            S::F32x4Neg => self.v_unop(u32x4, from_u32x4, |x| x ^ SIGN32)?,
 
             // f64x2 arithmetic
-            S::F64x2Add => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a + b, nan2d(a, b))),
-            S::F64x2Sub => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a - b, nan2d(a, b))),
-            S::F64x2Mul => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a * b, nan2d(a, b))),
-            S::F64x2Div => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a / b, nan2d(a, b))),
-            S::F64x2Min => self.v_binop(f64x2, from_f64x2, f64_min),
-            S::F64x2Max => self.v_binop(f64x2, from_f64x2, f64_max),
-            S::F64x2PMin => self.v_binop(f64x2, from_f64x2, |a, b| if b < a { b } else { a }),
-            S::F64x2PMax => self.v_binop(f64x2, from_f64x2, |a, b| if a < b { b } else { a }),
-            S::F64x2Sqrt => self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.sqrt(), x.is_nan())),
-            S::F64x2Ceil => self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.ceil(), x.is_nan())),
-            S::F64x2Floor => self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.floor(), x.is_nan())),
-            S::F64x2Trunc => self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.trunc(), x.is_nan())),
+            S::F64x2Add => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a + b, nan2d(a, b)))?,
+            S::F64x2Sub => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a - b, nan2d(a, b)))?,
+            S::F64x2Mul => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a * b, nan2d(a, b)))?,
+            S::F64x2Div => self.v_binop(f64x2, from_f64x2, |a, b| canon_f64(a / b, nan2d(a, b)))?,
+            S::F64x2Min => self.v_binop(f64x2, from_f64x2, f64_min)?,
+            S::F64x2Max => self.v_binop(f64x2, from_f64x2, f64_max)?,
+            S::F64x2PMin => self.v_binop(f64x2, from_f64x2, |a, b| if b < a { b } else { a })?,
+            S::F64x2PMax => self.v_binop(f64x2, from_f64x2, |a, b| if a < b { b } else { a })?,
+            S::F64x2Sqrt => self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.sqrt(), x.is_nan()))?,
+            S::F64x2Ceil => self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.ceil(), x.is_nan()))?,
+            S::F64x2Floor => {
+                self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.floor(), x.is_nan()))?;
+            }
+            S::F64x2Trunc => {
+                self.v_unop(f64x2, from_f64x2, |x| canon_f64(x.trunc(), x.is_nan()))?;
+            }
             S::F64x2Nearest => {
                 self.v_unop(f64x2, from_f64x2, |x| {
                     canon_f64(x.round_ties_even(), x.is_nan())
-                });
+                })?;
             }
-            S::F64x2Abs => self.v_unop(u64x2, from_u64x2, |x| x & !SIGN64),
-            S::F64x2Neg => self.v_unop(u64x2, from_u64x2, |x| x ^ SIGN64),
+            S::F64x2Abs => self.v_unop(u64x2, from_u64x2, |x| x & !SIGN64)?,
+            S::F64x2Neg => self.v_unop(u64x2, from_u64x2, |x| x ^ SIGN64)?,
 
             _ => return self.exec_simd_fcmp(s),
         }

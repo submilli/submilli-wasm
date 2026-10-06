@@ -7,13 +7,83 @@
 
 use std::sync::Arc;
 
+use super::direct_call::{
+    call_direct_host, finish_direct_host_call, preflight_direct_call, DirectCallBoundary,
+};
 use super::wasm_ty::valtypes_of;
-use super::{check_args, default_results, Callee, Caller, Func, TypedFunc};
+use super::{check_args, default_results, validate_results, Callee, Caller, Func, TypedFunc};
 use super::{WasmParams, WasmResults, WasmRet};
 use crate::func::into_async_func;
 use crate::store::{AsContextMut, FuncEntity};
 use crate::value::{FuncType, Val};
 use crate::Result;
+
+async fn call_direct_host_async<S: AsContextMut>(
+    store: &mut S,
+    host_index: u32,
+    params: &[Val],
+    ty: &crate::value::FuncType,
+) -> Result<Vec<Val>> {
+    preflight_direct_call(store.as_context_mut().inner_mut())?;
+    let cb = store.as_context_mut().store_mut().async_host_funcs[host_index as usize].clone();
+    let mut out = default_results(ty);
+    let boundary = DirectCallBoundary::capture(store.as_context().inner());
+    let token = store.as_context_mut().inner_mut().begin_async_call_cleanup(
+        Some(boundary.roots_mark),
+        boundary.pending,
+        boundary.pending_generation,
+        None,
+    );
+    let mut cancellation = crate::exec::guard::AsyncCancellation::new(token);
+    let guarded = async {
+        Box::into_pin(cb(
+            Caller::new(store.as_context_mut(), None),
+            params,
+            &mut out,
+        ))
+        .await
+    };
+    let outcome = crate::exec::guard::CatchUnwind(Box::pin(guarded)).await;
+    let cleanup = store
+        .as_context_mut()
+        .inner_mut()
+        .complete_async_call_cleanup(cancellation.token());
+    cancellation.disarm();
+    let result = match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            boundary.restore_after_panic(store.as_context_mut().inner_mut());
+            crate::exec::guard::reraise(payload);
+        }
+    };
+    finish_async_cleanup(store.as_context_mut().inner_mut(), boundary, cleanup)?;
+    let result_types: Vec<_> = ty.results().collect();
+    finish_direct_host_call(
+        store.as_context_mut().inner_mut(),
+        boundary,
+        out,
+        &result_types,
+        result,
+    )
+}
+
+fn finish_async_cleanup(
+    inner: &mut crate::store::StoreInner,
+    boundary: DirectCallBoundary,
+    cleanup: Result<()>,
+) -> Result<()> {
+    let Err(error) = cleanup else {
+        return Ok(());
+    };
+    inner.gc_roots_truncate(boundary.roots_mark);
+    inner.restore_pending_exception(boundary.pending, boundary.pending_generation);
+    if inner.has_parked_execution() {
+        if let Some(internal) = error.downcast_ref::<crate::error::InternalError>() {
+            inner.latch_internal_error(*internal);
+        }
+    }
+    Err(error)
+}
 
 impl Func {
     /// Creates an async host function with a dynamic signature. The closure returns a
@@ -31,6 +101,10 @@ impl Func {
             + 'static,
         T: Send + 'static,
     {
+        assert!(
+            ty.engine().same(store.as_context().engine()),
+            "function type belongs to a different engine"
+        );
         let mut ctx = store.as_context_mut();
         let host_index = ctx.store_mut().push_async_host_func(Arc::new(func));
         ctx.inner_mut().alloc_func(FuncEntity::HostAsync {
@@ -68,7 +142,6 @@ impl Func {
 
     /// Async sibling of [`call`](Func::call): drives the call as a `Future`. Requires an
     /// async store; awaits async host callees.
-    #[allow(clippy::too_many_lines)] // three-arm callee dispatch; arms are short
     pub async fn call_async(
         &self,
         mut store: impl AsContextMut,
@@ -81,7 +154,7 @@ impl Func {
             ));
         }
         let ty = self.ty(&store);
-        check_args(params, &ty)?;
+        check_args(store.as_context().inner(), params, &ty)?;
         if results.len() != ty.results().len() {
             return Err(crate::Error::msg("wrong number of results"));
         }
@@ -115,37 +188,13 @@ impl Func {
                 )
                 .await?
             }
-            Callee::Host(host_index) => {
-                let cb = store.as_context_mut().store_mut().host_funcs[host_index as usize].clone();
-                let mut out = default_results(&ty);
-                // Contain a host-fn panic (#33): clear any pending exception, then re-raise.
-                match crate::exec::guard::catch_host(|| {
-                    cb(Caller::new(store.as_context_mut(), None), params, &mut out)
-                }) {
-                    Ok(result) => result?,
-                    Err(payload) => {
-                        store.as_context_mut().store_mut().take_pending_exception();
-                        crate::exec::guard::reraise(payload);
-                    }
-                }
-                out
-            }
+            Callee::Host(host_index) => call_direct_host(&mut store, host_index, params, &ty)?,
             Callee::HostAsync(host_index) => {
-                let cb = store.as_context_mut().store_mut().async_host_funcs[host_index as usize]
-                    .clone();
-                let mut out = default_results(&ty);
-                // Contain an async host-fn panic across the await (#33): poll inside `catch_unwind`.
-                let fut = cb(Caller::new(store.as_context_mut(), None), params, &mut out);
-                match crate::exec::guard::CatchUnwind(std::boxed::Box::into_pin(fut)).await {
-                    Ok(result) => result?,
-                    Err(payload) => {
-                        store.as_context_mut().store_mut().take_pending_exception();
-                        crate::exec::guard::reraise(payload);
-                    }
-                }
-                out
+                call_direct_host_async(&mut store, host_index, params, &ty).await?
             }
         };
+        let result_tys: Vec<_> = ty.results().collect();
+        validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
         results.clone_from_slice(&out);
         Ok(())
     }

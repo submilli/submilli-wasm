@@ -282,6 +282,10 @@ fn host_reads_guest_produced_struct() {
     let mut out = [Val::I32(0)];
     make.call(&mut store, &[], &mut out).unwrap();
 
+    // Returning the reference transfers it from operand-stack rooting to a host root. A collection
+    // immediately after the call must therefore retain the object.
+    store.gc();
+
     // The guest returned a structref (anyref-encoded); the host reads its fields.
     let Val::AnyRef(Some(any)) = out[0] else {
         panic!("expected a non-null anyref result");

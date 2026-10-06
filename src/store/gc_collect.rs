@@ -15,7 +15,9 @@
 use std::collections::HashSet;
 
 use crate::canon::{Layout, RefKind, Slot};
+use crate::error::InternalError;
 use crate::value::{Ref, Val};
+use crate::Result;
 
 use super::entity::{ExnEntity, ExternEntry};
 use super::gc::{decode_anyref_handle, AnyRefHandle};
@@ -36,9 +38,9 @@ impl StoreInner {
     /// Runs one mark-sweep collection. `stack_roots` are the live operand/local references the run
     /// loop recovered from its root shadow; all other roots are read from `self`. A no-op under
     /// `Collector::Null` (which never reclaims).
-    pub(crate) fn collect(&mut self, stack_roots: &[(u32, RefKind)]) {
+    pub(crate) fn collect(&mut self, stack_roots: &[(u32, RefKind)]) -> Result<()> {
         if !self.gc.is_collecting() {
-            return;
+            return Ok(());
         }
         let mut work: Vec<Reached> = Vec::new();
         for &(handle, kind) in stack_roots {
@@ -46,29 +48,13 @@ impl StoreInner {
         }
         self.seed_entity_roots(&mut work);
 
-        // `Gc` reachability is the object's mark bit; the extern/exn arenas use visited sets that
-        // double as their mark sets — the sweep frees every entry NOT visited here.
-        let mut extern_seen: HashSet<u32> = HashSet::new();
-        let mut exn_seen: HashSet<u32> = HashSet::new();
-        while let Some(r) = work.pop() {
-            match r {
-                Reached::Gc(i) => {
-                    if self.gc.mark(i) {
-                        self.trace_gc(i, &mut work);
-                    }
-                }
-                Reached::Extern(i) => {
-                    if extern_seen.insert(i) {
-                        self.trace_extern(i, &mut work);
-                    }
-                }
-                Reached::Exn(i) => {
-                    if exn_seen.insert(i) {
-                        self.trace_exn(i, &mut work);
-                    }
-                }
+        let (extern_seen, exn_seen) = match self.trace_reachable(work) {
+            Ok(live) => live,
+            Err(error) => {
+                self.gc.clear_marks();
+                return Err(error);
             }
-        }
+        };
 
         // Free the unreachable entries of each arena, crediting their bytes back to the shared GC
         // budget; the visited sets are the live sets (#27g).
@@ -77,6 +63,37 @@ impl StoreInner {
         let freed = self.exns.sweep(&exn_seen, ExnEntity::byte_size);
         self.gc.credit(freed);
         self.gc.sweep();
+        Ok(())
+    }
+
+    /// Walks the unified worklist. GC-object liveness is recorded in mark bits; the returned sets
+    /// are the live entries in the separately reclaimed externref and exception arenas.
+    fn trace_reachable(&mut self, mut work: Vec<Reached>) -> Result<(HashSet<u32>, HashSet<u32>)> {
+        let mut extern_seen = HashSet::new();
+        let mut exn_seen = HashSet::new();
+        while let Some(r) = work.pop() {
+            match r {
+                Reached::Gc(i) => {
+                    if self.gc.get(i).is_none() {
+                        return Err(InternalError::GcMetadata("dangling GC root").into());
+                    }
+                    if self.gc.mark(i) {
+                        self.trace_gc(i, &mut work)?;
+                    }
+                }
+                Reached::Extern(i) => {
+                    if extern_seen.insert(i) {
+                        self.trace_extern(i, &mut work)?;
+                    }
+                }
+                Reached::Exn(i) => {
+                    if exn_seen.insert(i) {
+                        self.trace_exn(i, &mut work)?;
+                    }
+                }
+            }
+        }
+        Ok((extern_seen, exn_seen))
     }
 
     /// Seeds the worklist from the non-stack roots: globals, table elements, element-segment
@@ -100,57 +117,80 @@ impl StoreInner {
         if let Some(e) = self.pending_exception {
             work.push(Reached::Exn(e.raw()));
         }
-        for &(handle, kind) in &self.gc_roots {
+        let roots = self
+            .gc_roots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &(handle, kind) in roots.iter() {
             seed_handle(work, handle, kind);
         }
     }
 
     /// Traces a freshly-marked GC object's reference fields/elements (via its `Layout`).
-    fn trace_gc(&self, index: u32, work: &mut Vec<Reached>) {
-        let Some(obj) = self.gc.get(index) else {
-            return;
-        };
+    fn trace_gc(&self, index: u32, work: &mut Vec<Reached>) -> Result<()> {
+        let obj = self
+            .gc
+            .get(index)
+            .ok_or(InternalError::GcMetadata("marked GC object is missing"))?;
         match obj.header.kind {
             ObjKind::Struct => {
-                let Ok(fields) = self.engine().struct_fields(obj.header.type_id) else {
-                    return;
-                };
+                let fields = self
+                    .engine()
+                    .struct_fields(obj.header.type_id)
+                    .map_err(|_| InternalError::GcMetadata("struct type metadata is missing"))?;
                 for &slot in Layout::for_struct(&fields).fields() {
-                    seed_slot(work, slot, &obj.data);
+                    seed_slot(work, slot, &obj.data)?;
                 }
             }
             ObjKind::Array => {
-                let Ok(field) = self.engine().array_field(obj.header.type_id) else {
-                    return;
-                };
+                let field = self
+                    .engine()
+                    .array_field(obj.header.type_id)
+                    .map_err(|_| InternalError::GcMetadata("array type metadata is missing"))?;
                 let layout = Layout::for_array(&field);
+                if layout.stride() == 0 || obj.data.len() % layout.stride() != 0 {
+                    return Err(InternalError::GcMetadata(
+                        "array body does not match its element layout",
+                    )
+                    .into());
+                }
                 for i in 0..obj.array_len(layout.stride()) as usize {
-                    seed_slot(work, layout.elem_at(i), &obj.data);
+                    seed_slot(work, layout.elem_at(i), &obj.data)?;
                 }
             }
             ObjKind::Extern => {
-                if let Some(idx) = obj.extern_index() {
-                    work.push(Reached::Extern(idx));
-                }
+                let idx = obj.extern_index().ok_or(InternalError::GcMetadata(
+                    "extern wrapper body is truncated",
+                ))?;
+                work.push(Reached::Extern(idx));
             }
         }
+        Ok(())
     }
 
     /// Traces an `externref` entry: an internalized `anyref` chains back into the GC heap; a host
     /// payload has no GC children.
-    fn trace_extern(&self, index: u32, work: &mut Vec<Reached>) {
-        if let Some(ExternEntry::Internal(handle)) = self.externrefs.get(index) {
+    fn trace_extern(&self, index: u32, work: &mut Vec<Reached>) -> Result<()> {
+        let entry = self
+            .externrefs
+            .get(index)
+            .ok_or(InternalError::GcMetadata("dangling externref root"))?;
+        if let ExternEntry::Internal(handle) = entry {
             seed_handle(work, *handle, RefKind::Any);
         }
+        Ok(())
     }
 
     /// Traces an exception instance: its argument values are roots.
-    fn trace_exn(&self, index: u32, work: &mut Vec<Reached>) {
-        if let Some(exn) = self.exns.get(index) {
-            for v in &exn.args {
-                seed_val(work, v);
-            }
+    fn trace_exn(&self, index: u32, work: &mut Vec<Reached>) -> Result<()> {
+        let exn = self
+            .exns
+            .get(index)
+            .ok_or(InternalError::GcMetadata("dangling exception root"))?;
+        for v in &exn.args {
+            seed_val(work, v);
         }
+        Ok(())
     }
 }
 
@@ -193,10 +233,15 @@ fn seed_ref(work: &mut Vec<Reached>, r: &Ref) {
 }
 
 /// Seeds from one packed slot of an object body (only reference slots carry a handle to trace).
-fn seed_slot(work: &mut Vec<Reached>, slot: Slot, data: &[u8]) {
+fn seed_slot(work: &mut Vec<Reached>, slot: Slot, data: &[u8]) -> Result<()> {
     if let Slot::Ref { offset, kind } = slot {
-        if let Some(bytes) = data.get(offset..offset + 4) {
-            seed_handle(work, le_u32(bytes), kind);
-        }
+        let end = offset
+            .checked_add(4)
+            .ok_or(InternalError::GcMetadata("reference slot offset overflow"))?;
+        let bytes = data.get(offset..end).ok_or(InternalError::GcMetadata(
+            "reference slot exceeds object body",
+        ))?;
+        seed_handle(work, le_u32(bytes), kind);
     }
+    Ok(())
 }

@@ -29,12 +29,12 @@ impl Execution {
                 Ok(())
             }
             Op::RefIsNull => {
-                let r = self.pop();
+                let (r, _) = self.pop_tagged_ref()?;
                 self.push(Val::I32(i32::from(r.is_null())));
                 Ok(())
             }
             Op::RefAsNonNull => {
-                let (r, tag) = self.pop_tagged();
+                let (r, tag) = self.pop_tagged_ref()?;
                 if r.is_null() {
                     return Err(Trap::NullReference.into());
                 }

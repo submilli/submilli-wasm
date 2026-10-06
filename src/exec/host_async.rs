@@ -6,14 +6,13 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::epoch::{apply_epoch_deadline_async, yield_now};
-use super::host::{enter, finish};
+use super::host::{enter, finish, HostCallState};
 use super::{Execution, Outcome};
-use crate::extern_::{Memory, Table};
 use crate::func::{Caller, Func};
 use crate::instance::Instance;
 use crate::module::code::Code;
 use crate::store::{FuncEntity, Store};
-use crate::value::{Ref, Val, ValType};
+use crate::value::{Val, ValType};
 use crate::Result;
 
 /// Async sibling of [`execute`]: drives the same resumable core to completion as a
@@ -27,8 +26,40 @@ pub(crate) async fn execute_async<T>(
     args: Vec<Val>,
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
-    let (mut exec, b) = enter(store, instance, func_index, code, args);
+    let (mut exec, b) = enter(store, instance, func_index, code, args)?;
+    let roots_mark = store.inner.gc_roots_mark();
+    let pending = store.inner.pending_exception();
+    let pending_generation = store.inner.pending_exception_generation();
+    if let Some(exception) = pending {
+        store
+            .inner
+            .push_gc_root(exception.raw(), crate::canon::RefKind::Exn);
+    }
+    let token = store.inner.begin_async_call_cleanup(
+        Some(roots_mark),
+        pending,
+        pending_generation,
+        Some(crate::store::AsyncCallBoundary {
+            value_base: b.value_base,
+            stop_depth: b.stop_depth,
+        }),
+    );
+    let mut cancellation = super::guard::AsyncCancellation::new(token);
     let outcome = drive_async(&mut exec, store, b.run_stop).await;
+    let cleanup = store
+        .inner
+        .complete_async_call_cleanup(cancellation.token());
+    cancellation.disarm();
+    store.inner.gc_roots_truncate(roots_mark);
+    let outcome = match cleanup {
+        Ok(()) => outcome,
+        Err(error) => {
+            store
+                .inner
+                .restore_pending_exception(pending, pending_generation);
+            Err(error)
+        }
+    };
     finish(store, exec, &b, result_tys, outcome)
 }
 
@@ -43,10 +74,13 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
                 // The await is the natural long-latency safepoint: other tenants generate
                 // engine-wide GC pressure while this guest is parked, so honor the mailbox
                 // on resume (sync host calls skip this — their path is tens of ns).
-                exec.gc_pressure_safepoint(&mut store.inner);
+                exec.gc_pressure_safepoint(&mut store.inner)?;
             }
             Outcome::FuelYield => {
+                store.inner.swap_exec(exec);
                 yield_now().await;
+                store.inner.recover_cancelled_async_calls();
+                store.inner.swap_exec(exec);
                 store.inner.refuel_from_reserve();
             }
             Outcome::EpochDeadline => {
@@ -54,27 +88,35 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
                     return Err(exec.attach_suspension_backtrace(&store.inner, e));
                 }
             }
-            Outcome::Grow { memory, delta } => exec.do_grow_async(store, memory, delta).await?,
+            Outcome::Grow { memory, delta } => {
+                let is_64 = store.inner.memory(memory).ty.is_64();
+                store.inner.swap_exec(exec);
+                let old = store.grow_memory_async(memory, delta).await;
+                store.inner.recover_cancelled_async_calls();
+                store.inner.swap_exec(exec);
+                exec.push_index(is_64, old?.unwrap_or(u64::MAX));
+            }
             Outcome::TableGrow { table, delta, init } => {
-                exec.do_grow_table_async(store, table, delta, init).await?;
+                let is_64 = store.inner.table(table).ty.is_64();
+                store.inner.swap_exec(exec);
+                let old = store.grow_table_async(table, delta, init).await;
+                store.inner.recover_cancelled_async_calls();
+                store.inner.swap_exec(exec);
+                exec.push_index(is_64, old?.unwrap_or(u64::MAX));
             }
             // GC reservation growth uses the sync limiter path (errors if an async limiter is
             // installed — combining an async limiter with the GC heap is unsupported for now).
             Outcome::GcGrow {
                 reserved_target,
                 bytes_needed,
-            } => store.grow_gc_reservation(reserved_target, bytes_needed)?,
+            } => exec.do_grow_gc(store, reserved_target, bytes_needed)?,
         }
     }
 }
 
 impl Execution {
-    /// Async sibling of [`invoke_host`](Self::invoke_host): runs the suspended async host
-    /// closure and awaits its future before pushing results. Args/results are owned locals,
-    /// so no store borrow is held across the `.await`.
-    /// Async sibling of [`invoke_host`](Self::invoke_host), split into sync halves around the
-    /// single await. (Fully inlining the await into `drive_async` was tried and measured
-    /// perf-neutral — the nested state machine is not where the async boundary's cost is.)
+    /// Runs a suspended async host closure, split into sync halves around the single await so no
+    /// store borrow is held while parked.
     async fn invoke_host_async<T>(
         &mut self,
         store: &mut Store<T>,
@@ -82,98 +124,50 @@ impl Execution {
         instance: Instance,
         stop_depth: usize,
     ) -> Result<()> {
-        let (mut scratch, roots_mark, host_index) = self.prep_host_async(store, func);
-        let cb = store.async_host_funcs[host_index as usize].clone();
+        let mut state = self.prep_host_async(store, func)?;
+        let cb = store.async_host_funcs[state.host_index as usize].clone();
         // Park the shared execution across the await; contain a host panic across the poll (#33).
         store.inner.swap_exec(self);
-        let outcome = {
+        let guarded = async {
             let caller = Caller::new(store.as_context_mut(), Some(instance));
-            let fut = cb(caller, &scratch.0, &mut scratch.1);
-            super::guard::CatchUnwind(std::boxed::Box::into_pin(fut)).await
+            Box::into_pin(cb(caller, &state.params, &mut state.results)).await
         };
-        store.inner.swap_exec(self);
+        let outcome = super::guard::CatchUnwind(Box::pin(guarded)).await;
         let outcome = match outcome {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                store.inner.recover_cancelled_async_calls();
+                store.inner.swap_exec(self);
+                outcome
+            }
             Err(payload) => {
-                super::guard::restore_after_panic(&mut store.inner, roots_mark);
+                super::guard::restore_after_panic(
+                    &mut store.inner,
+                    state.roots_mark,
+                    state.pending,
+                    state.pending_generation,
+                );
                 super::guard::reraise(payload);
             }
         };
-        self.finish_host_async(store, outcome, scratch, roots_mark, stop_depth)
+        if let Some(error) = store.inner.take_internal_error() {
+            store
+                .inner
+                .restore_pending_exception(state.pending, state.pending_generation);
+            Self::discard_host_call(store, state);
+            return Err(error);
+        }
+        self.finish_host_call(store, state, outcome, stop_depth)
     }
 
     /// Sync front half of an async host call: decodes args into the reused buffers and returns
     /// everything the await needs. Same shape as `invoke_host`.
-    fn prep_host_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        func: Func,
-    ) -> ((Vec<Val>, Vec<Val>), usize, u32) {
-        let (mut params, mut results) = store.inner.take_host_scratch();
-        let host_index = match store.inner.func(func) {
+    fn prep_host_async<T>(&mut self, store: &mut Store<T>, func: Func) -> Result<HostCallState> {
+        let (host_index, sig) = match store.inner.func(func) {
             FuncEntity::HostAsync {
                 sig, host_index, ..
-            } => {
-                results.clear();
-                results.extend_from_slice(&sig.result_defaults);
-                params.clear();
-                self.pop_params_into(&sig.params, &mut params);
-                *host_index
-            }
+            } => (*host_index, sig.clone()),
             _ => unreachable!("HostAsync only suspends on async host funcs"),
         };
-        // Scope the host-created GC roots for the call's duration (see `invoke_host`).
-        let roots_mark = store.inner.gc_roots_mark();
-        super::host::root_ref_params(&mut store.inner, &params);
-        ((params, results), roots_mark, host_index)
-    }
-
-    /// Sync back half of an async host call: results, scratch return, roots scope, errors.
-    fn finish_host_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        outcome: Result<()>,
-        scratch: (Vec<Val>, Vec<Val>),
-        roots_mark: usize,
-        stop_depth: usize,
-    ) -> Result<()> {
-        let (params, results) = scratch;
-        if let Err(e) = outcome {
-            store.inner.gc_roots_truncate(roots_mark);
-            return self.host_call_error(&mut store.inner, e, stop_depth);
-        }
-        // See `invoke_host`: a host that returned normally leaves no pending exception.
-        store.inner.take_pending_exception();
-        self.push_results_slice(&results);
-        store.inner.put_host_scratch(params, results);
-        store.inner.gc_roots_truncate(roots_mark);
-        Ok(())
-    }
-
-    /// Async sibling of [`do_grow`](Self::do_grow): awaits an async resource limiter.
-    async fn do_grow_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        memory: Memory,
-        delta: u64,
-    ) -> Result<()> {
-        let is_64 = store.inner.memory(memory).ty.is_64();
-        let old = store.grow_memory_async(memory, delta).await?;
-        self.push_index(is_64, old.unwrap_or(u64::MAX));
-        Ok(())
-    }
-
-    /// Async sibling of [`do_grow_table`](Self::do_grow_table).
-    async fn do_grow_table_async<T>(
-        &mut self,
-        store: &mut Store<T>,
-        table: Table,
-        delta: u64,
-        init: Ref,
-    ) -> Result<()> {
-        let is_64 = store.inner.table(table).ty.is_64();
-        let old = store.grow_table_async(table, delta, init).await?;
-        self.push_index(is_64, old.unwrap_or(u64::MAX));
-        Ok(())
+        self.prepare_host_call(store, host_index, sig)
     }
 }

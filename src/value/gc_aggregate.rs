@@ -9,7 +9,7 @@ use crate::store::{
     anyref_handle_slot, read_slot, slot_accepts, write_slot, AsContext, AsContextMut, GcObject,
     StoreInner,
 };
-use crate::value::gc_type::{ArrayType, StorageType, StructType};
+use crate::value::gc_type::{ArrayType, FieldType, StorageType, StructType};
 use crate::value::{Mutability, Val};
 use crate::{Error, Result};
 
@@ -22,7 +22,7 @@ fn root_new_gc<T>(inner: &mut StoreInner, idx: u32) -> Rooted<T> {
     let handle = anyref_handle_slot(idx);
     inner.push_gc_root(handle, RefKind::Any);
     let generation = inner.gc.generation(idx).unwrap_or(0);
-    Rooted::from_raw_gen(handle, generation)
+    Rooted::from_raw_gen(handle, generation, inner.store_id(), RefKind::Any)
 }
 
 /// A GC struct instance (`structref`).
@@ -36,15 +36,21 @@ pub struct StructRef {
 /// wasmtime's `*Pre` purpose).
 #[derive(Debug)]
 pub struct StructRefPre {
+    store: u64,
     ty: StructType,
     layout: StructLayout,
 }
 
 impl StructRefPre {
-    pub fn new(store: impl AsContextMut, ty: StructType) -> Self {
-        let _ = store; // no rooting/registration needed under the null collector
+    pub fn new(mut store: impl AsContextMut, ty: StructType) -> Self {
+        let ctx = store.as_context_mut();
+        assert!(
+            ty.engine().same(ctx.engine()),
+            "GC type used with a store from a different engine"
+        );
         let fields: Vec<_> = ty.fields().collect();
         StructRefPre {
+            store: ctx.inner().store_id(),
             ty,
             layout: Layout::for_struct(&fields),
         }
@@ -64,24 +70,26 @@ impl StructRef {
         if fields.len() != slots.len() {
             return Err(Error::msg("wrong number of struct fields"));
         }
-        for (slot, v) in slots.iter().zip(fields) {
-            if !slot_accepts(*slot, v) {
+        let mut ctx = store.as_context_mut();
+        ctx.inner().check_handle(allocator.store);
+        let field_types: Vec<_> = allocator.ty.fields().collect();
+        for ((slot, field_ty), v) in slots.iter().zip(&field_types).zip(fields) {
+            if !slot_accepts(*slot, v) || !field_value_matches(ctx.inner(), field_ty, v)? {
                 return Err(Error::msg("struct field value has the wrong type"));
             }
         }
         let type_id = allocator.ty.canonical_id();
-        let mut ctx = store.as_context_mut();
         // Reserve through the limiter (collect-then-grow) before building the body — the field
         // values are host-held `Val`s (rooted if they are GC refs), so a collection here is safe.
         let charge = ctx.inner().gc_object_charge(size);
         ctx.0.gc_reserve_host(charge)?;
         let inner = ctx.inner_mut();
-        inner.pin_gc_type(type_id); // keep the type alive for the object's (store) lifetime
         let mut data = vec![0u8; size];
         for (slot, v) in slots.iter().zip(fields) {
             write_slot(*slot, &mut data, *v);
         }
-        let idx = inner.alloc_gc(GcObject::new_struct(type_id, data.into_boxed_slice()))?;
+        let object = GcObject::new_struct(type_id, data.into_boxed_slice());
+        let idx = inner.alloc_host_gc(type_id, object)?;
         Ok(root_new_gc(inner, idx))
     }
 }
@@ -97,7 +105,7 @@ impl Rooted<StructRef> {
         let field = layout
             .field(index)
             .ok_or_else(|| Error::msg("struct field index out of bounds"))?;
-        Ok(read_slot(field, &obj.data))
+        inner.root_host_result(read_slot(field, &obj.data))
     }
 
     /// This struct's type.
@@ -113,6 +121,10 @@ impl Rooted<StructRef> {
     pub fn matches_ty(&self, store: impl AsContext, ty: &StructType) -> Result<bool> {
         let ctx = store.as_context();
         let inner = ctx.inner();
+        assert!(
+            ty.engine().same(inner.engine()),
+            "struct type belongs to a different engine"
+        );
         let slot = self.gc_slot_checked(inner)?;
         let type_id = gc_object(inner, slot)?.header.type_id;
         Ok(inner.engine().is_subtype(type_id, ty.canonical_id()))
@@ -135,7 +147,7 @@ impl Rooted<StructRef> {
         let field = Layout::for_struct(&fields)
             .field(index)
             .ok_or_else(|| Error::msg("struct field index out of bounds"))?;
-        if !slot_accepts(field, &value) {
+        if !slot_accepts(field, &value) || !field_value_matches(inner, field_ty, &value)? {
             return Err(Error::msg("struct field value has the wrong type"));
         }
         let obj = inner
@@ -147,13 +159,13 @@ impl Rooted<StructRef> {
 
     /// Upcasts this `structref` to an `anyref`.
     pub fn to_anyref(self) -> Rooted<AnyRef> {
-        Rooted::from_raw(self.raw())
+        self.cast()
     }
 }
 
 impl From<Rooted<StructRef>> for Rooted<AnyRef> {
     fn from(r: Rooted<StructRef>) -> Self {
-        Rooted::from_raw(r.raw())
+        r.cast()
     }
 }
 
@@ -167,15 +179,24 @@ pub struct ArrayRef {
 /// element layout (like [`StructRefPre`]).
 #[derive(Debug)]
 pub struct ArrayRefPre {
+    store: u64,
     ty: ArrayType,
     layout: ArrayLayout,
 }
 
 impl ArrayRefPre {
-    pub fn new(store: impl AsContextMut, ty: ArrayType) -> Self {
-        let _ = store;
+    pub fn new(mut store: impl AsContextMut, ty: ArrayType) -> Self {
+        let ctx = store.as_context_mut();
+        assert!(
+            ty.engine().same(ctx.engine()),
+            "GC type used with a store from a different engine"
+        );
         let layout = Layout::for_array(&ty.field_type());
-        ArrayRefPre { ty, layout }
+        ArrayRefPre {
+            store: ctx.inner().store_id(),
+            ty,
+            layout,
+        }
     }
 }
 
@@ -290,6 +311,7 @@ impl ArrayRef {
         expected: StorageType,
         count: usize,
     ) -> Result<usize> {
+        inner.check_handle(allocator.store);
         if allocator.ty.element_type() != expected {
             return Err(Error::msg(format!(
                 "element type mismatch: cannot initialize a non-{expected:?} array from a slice"
@@ -307,9 +329,10 @@ impl ArrayRef {
         allocator: &ArrayRefPre,
         body: Vec<u8>,
     ) -> Result<Rooted<ArrayRef>> {
+        inner.check_handle(allocator.store);
         let type_id = allocator.ty.canonical_id();
-        inner.pin_gc_type(type_id);
-        let idx = inner.alloc_gc(GcObject::new_array(type_id, body.into_boxed_slice()))?;
+        let object = GcObject::new_array(type_id, body.into_boxed_slice());
+        let idx = inner.alloc_host_gc(type_id, object)?;
         Ok(root_new_gc(inner, idx))
     }
 
@@ -324,26 +347,30 @@ impl ArrayRef {
         let byte_len = count
             .checked_mul(stride)
             .ok_or_else(|| Error::msg("array too large"))?;
+        let mut ctx = store.as_context_mut();
+        ctx.inner().check_handle(allocator.store);
+        let field_ty = allocator.ty.field_type();
         for i in 0..count {
-            if !slot_accepts(allocator.layout.elem_at(0), elem_at(i)) {
+            if !slot_accepts(allocator.layout.elem_at(0), elem_at(i))
+                || !field_value_matches(ctx.inner(), &field_ty, elem_at(i))?
+            {
                 return Err(Error::msg("array element value has the wrong type"));
             }
         }
         let type_id = allocator.ty.canonical_id();
-        let mut ctx = store.as_context_mut();
         // Reserve through the limiter (collect-then-grow) before building the (possibly large) body,
         // so a hostile element count traps here instead of allocating the `Vec` first. The element
         // values are host-held `Val`s (rooted if GC refs), so a collection here is safe.
         let charge = ctx.inner().gc_object_charge(byte_len);
         ctx.0.gc_reserve_host(charge)?;
         let inner = ctx.inner_mut();
-        inner.pin_gc_type(type_id);
         let mut data = vec![0u8; byte_len];
         for i in 0..count {
             write_slot(allocator.layout.elem_at(i), &mut data, *elem_at(i));
         }
         // The element count is implicit in the body length, not stored.
-        let idx = inner.alloc_gc(GcObject::new_array(type_id, data.into_boxed_slice()))?;
+        let object = GcObject::new_array(type_id, data.into_boxed_slice());
+        let idx = inner.alloc_host_gc(type_id, object)?;
         Ok(root_new_gc(inner, idx))
     }
 }
@@ -369,7 +396,7 @@ impl Rooted<ArrayRef> {
         if index >= obj.array_len(layout.stride()) {
             return Err(Error::msg("array index out of bounds"));
         }
-        Ok(read_slot(layout.elem_at(index as usize), &obj.data))
+        inner.root_host_result(read_slot(layout.elem_at(index as usize), &obj.data))
     }
 
     /// Copies this `i8` array's raw element bytes into `dst`.
@@ -556,7 +583,7 @@ impl Rooted<ArrayRef> {
             return Err(Error::msg("array element is not mutable"));
         }
         let elem = Layout::for_array(&field_ty).elem_at(index as usize);
-        if !slot_accepts(elem, &value) {
+        if !slot_accepts(elem, &value) || !field_value_matches(inner, &field_ty, &value)? {
             return Err(Error::msg("array element value has the wrong type"));
         }
         let obj = inner
@@ -568,13 +595,20 @@ impl Rooted<ArrayRef> {
 
     /// Upcasts this `arrayref` to an `anyref`.
     pub fn to_anyref(self) -> Rooted<AnyRef> {
-        Rooted::from_raw(self.raw())
+        self.cast()
+    }
+}
+
+fn field_value_matches(inner: &StoreInner, ty: &FieldType, value: &Val) -> Result<bool> {
+    match ty.element_type() {
+        StorageType::I8 | StorageType::I16 => Ok(matches!(value, Val::I32(_))),
+        StorageType::ValType(ty) => crate::extern_::val_matches_in_store(inner, value, ty),
     }
 }
 
 impl From<Rooted<ArrayRef>> for Rooted<AnyRef> {
     fn from(r: Rooted<ArrayRef>) -> Self {
-        Rooted::from_raw(r.raw())
+        r.cast()
     }
 }
 

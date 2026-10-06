@@ -115,9 +115,9 @@ fn read_ref(kind: RefKind, handle: u32) -> Val {
     }
     match kind {
         RefKind::Func => Val::FuncRef(Some(Func::from_raw(handle))),
-        RefKind::Extern => Val::ExternRef(Some(Rooted::<ExternRef>::from_raw(handle))),
-        RefKind::Any => Val::AnyRef(Some(Rooted::<AnyRef>::from_raw(handle))),
-        RefKind::Exn => Val::ExnRef(Some(Rooted::<ExnRef>::from_raw(handle))),
+        RefKind::Extern => Val::ExternRef(Some(Rooted::<ExternRef>::from_raw(handle, kind))),
+        RefKind::Any => Val::AnyRef(Some(Rooted::<AnyRef>::from_raw(handle, kind))),
+        RefKind::Exn => Val::ExnRef(Some(Rooted::<ExnRef>::from_raw(handle, kind))),
     }
 }
 
