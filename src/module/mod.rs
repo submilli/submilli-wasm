@@ -77,25 +77,34 @@ fn simd_features() -> WasmFeatures {
 /// [`Module::new_with_limits`].
 pub(crate) const DEFAULT_MAX_MODULE_BYTES: usize = 256 << 20;
 
+/// Default aggregate expanded-locals ceiling. Real modules declare ~7 locals per KiB of binary
+/// (measured on SpiderMonkey, sharp, astro), so a 256 MiB module lands under 2M; this leaves ~4×
+/// headroom while capping the arena a hostile module can demand at tens of MiB.
+pub(crate) const DEFAULT_MAX_EXPANDED_LOCALS: usize = 1 << 23;
+
 /// Per-module validation-time complexity limits (#32). Bounds compiler memory so a hostile
 /// *module* can't OOM the compiler before it ever executes — layered on top of `wasmparser`'s
 /// hard per-dimension limits (function body size, locals, segment/type/function counts), which
-/// it does not expose for tuning. Currently a single aggregate cap; kept a struct (rather than a
-/// bare argument) so future per-dimension knobs are additive.
+/// it does not expose for tuning. Each knob is additive: a module must pass every cap.
 ///
 /// **Additive deviation from wasmtime** — no analog in `wasmtime`. [`Default`] yields the
-/// untrusted-tier ceiling ([`crate::Config::max_module_bytes`]); trusted/curated packages pass a
-/// higher — but still finite — `max_module_bytes` via [`Module::new_with_limits`].
+/// untrusted-tier ceilings ([`crate::Config::max_module_bytes`] /
+/// [`crate::Config::max_expanded_locals`]); trusted/curated packages pass higher — but still
+/// finite — limits via [`Module::new_with_limits`].
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleLimits {
     /// Maximum accepted module binary size, in bytes. Always finite (no unbounded option).
     pub max_module_bytes: usize,
+    /// Maximum number of locals across *all* functions after run-length expansion. `wasmparser`
+    /// bounds locals per function only; this bounds the module-wide arena they expand into.
+    pub max_expanded_locals: usize,
 }
 
 impl Default for ModuleLimits {
     fn default() -> Self {
         ModuleLimits {
             max_module_bytes: DEFAULT_MAX_MODULE_BYTES,
+            max_expanded_locals: DEFAULT_MAX_EXPANDED_LOCALS,
         }
     }
 }
@@ -119,7 +128,7 @@ impl Module {
     /// Validation is fused into the decode/compile pass (see [`parse::parse_module`]), so the
     /// binary is walked once — not validated by a separate full pass and then re-parsed.
     pub fn from_binary(engine: &Engine, binary: &[u8]) -> Result<Module> {
-        let inner = parse::parse_module(engine, binary, engine.max_module_bytes())?;
+        let inner = parse::parse_module(engine, binary, &engine.module_limits())?;
         Ok(Module(Arc::new(inner)))
     }
 
@@ -133,7 +142,7 @@ impl Module {
         bytes: impl AsRef<[u8]>,
         limits: &ModuleLimits,
     ) -> Result<Module> {
-        let inner = parse::parse_module(engine, bytes.as_ref(), limits.max_module_bytes)?;
+        let inner = parse::parse_module(engine, bytes.as_ref(), limits)?;
         Ok(Module(Arc::new(inner)))
     }
 
@@ -187,11 +196,11 @@ impl Module {
     /// Validates a module without compiling it. Applies the engine's untrusted-tier
     /// module-size ceiling (`Config::max_module_bytes`, #32) before parsing.
     pub fn validate(engine: &Engine, binary: &[u8]) -> Result<()> {
-        if binary.len() > engine.max_module_bytes() {
+        let max_module_bytes = engine.module_limits().max_module_bytes;
+        if binary.len() > max_module_bytes {
             return Err(Error::msg(format!(
-                "module size {} exceeds configured limit {}",
+                "module size {} exceeds configured limit {max_module_bytes}",
                 binary.len(),
-                engine.max_module_bytes()
             )));
         }
         Validator::new_with_features(enabled_features())

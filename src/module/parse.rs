@@ -23,6 +23,7 @@ use crate::module::inner::{
     ImportKind, ModuleInner, TableDef, TagDef,
 };
 use crate::module::op::CompiledFunc;
+use crate::module::ModuleLimits;
 use crate::{Error, Result};
 
 pub(crate) fn wp_err(e: BinaryReaderError) -> Error {
@@ -37,18 +38,18 @@ pub(crate) fn wp_err(e: BinaryReaderError) -> Error {
 pub(crate) fn parse_module(
     engine: &Engine,
     bytes: &[u8],
-    max_module_bytes: usize,
+    limits: &ModuleLimits,
 ) -> Result<ModuleInner> {
     // Validation-time complexity bound (#32): reject an oversize module before allocating any of
     // the decode/compile state (the streaming decode + the data-segment byte copies below are
     // O(input)). `wasmparser` enforces the per-dimension ceilings (function body size, locals,
     // segment/type/function counts); this caps their aggregate so a hostile module can't OOM the
     // compiler. The trusted-artifact `Module::deserialize` path is exempt.
-    if bytes.len() > max_module_bytes {
+    if bytes.len() > limits.max_module_bytes {
         return Err(Error::msg(format!(
             "module size {} exceeds configured limit {}",
             bytes.len(),
-            max_module_bytes
+            limits.max_module_bytes
         )));
     }
     let keep_offsets = engine.wasm_backtrace_enabled();
@@ -70,7 +71,7 @@ pub(crate) fn parse_module(
         }
     }
 
-    (m.functions, m.code) = compile_bodies(&m, funcs, &bodies, keep_offsets)?;
+    (m.functions, m.code) = compile_bodies(&m, funcs, &bodies, keep_offsets, limits)?;
     // Register the module's rec groups in the engine, baking canonical type ids.
     m.intern(engine);
     Ok(m)
@@ -346,6 +347,7 @@ fn compile_bodies(
     funcs: Vec<FuncToValidate<ValidatorResources>>,
     bodies: &[FunctionBody<'_>],
     retain_offsets: bool,
+    limits: &ModuleLimits,
 ) -> Result<(Vec<CompiledFunc>, CodeArenas)> {
     let kinds: Vec<AggKind> = m.types.iter().map(ModuleType::kind).collect();
     let tag_types = tag_type_indices(m);
@@ -354,6 +356,7 @@ fn compile_bodies(
         kinds: &kinds,
         func_types: &m.func_types,
         tag_types: &tag_types,
+        max_expanded_locals: limits.max_expanded_locals,
     };
     // One set of module-wide arenas, pre-reserved once at half the total body bytes — real
     // code averages ~0.5 ops per encoded byte, so this almost never regrows (worst case: one
