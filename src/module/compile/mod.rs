@@ -42,6 +42,8 @@ pub(crate) struct CompileCtx<'a> {
     pub func_types: &'a [u32],
     /// Tag-index → type-index (imported then defined), for `try_table` catch-payload arity.
     pub tag_types: &'a [u32],
+    /// Module-wide cap on run-length-expanded locals (`ModuleLimits::max_expanded_locals`).
+    pub max_expanded_locals: usize,
 }
 
 fn wp_err(e: BinaryReaderError) -> Error {
@@ -79,14 +81,7 @@ pub(crate) fn translate_function(
     // is negligible (the operator body, which dominates, is still walked exactly once below).
     fv.read_locals(&mut body.get_binary_reader())
         .map_err(wp_err)?;
-    let locals_start = code.local_types.len() as u32;
-    for entry in body.get_locals_reader().map_err(wp_err)? {
-        let (count, ty) = entry.map_err(wp_err)?;
-        let vt = conv_valtype(ctx.kinds, ty)?;
-        for _ in 0..count {
-            code.local_types.push(vt.clone());
-        }
-    }
+    let locals_start = expand_locals(ctx, code, body)?;
 
     // The function's streams append to the module-wide arenas (pre-reserved once in
     // `compile_bodies` — each `Op` is written exactly once, no regrowth, no per-function
@@ -133,6 +128,41 @@ pub(crate) fn translate_function(
         big_memargs: span(base.big_memargs, code.big_memargs.len()),
         offsets: span(base.offsets, code.offsets.len()),
     })
+}
+
+/// Expands the body's run-length local declarations into the module-wide `local_types` arena,
+/// returning the function's start index. `wasmparser` caps locals *per function* (50 000) but
+/// not per module, so a few megabytes of trivial functions could otherwise request gigabytes
+/// here; the aggregate is checked against the configured cap before each group is reserved, and
+/// the reservation itself is fallible so a genuine allocation failure errors instead of aborting.
+fn expand_locals(
+    ctx: &CompileCtx<'_>,
+    code: &mut CodeArenas,
+    body: &FunctionBody<'_>,
+) -> Result<u32> {
+    // `Span` indexes are `u32`, so the effective cap can never exceed what a span can address.
+    let cap = ctx.max_expanded_locals.min(u32::MAX as usize);
+    let start = code.local_types.len();
+    for entry in body.get_locals_reader().map_err(wp_err)? {
+        let (count, ty) = entry.map_err(wp_err)?;
+        let vt = conv_valtype(ctx.kinds, ty)?;
+        let count = count as usize;
+        let total = code
+            .local_types
+            .len()
+            .checked_add(count)
+            .filter(|&n| n <= cap)
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "module declares more than {cap} locals in total (configured limit)"
+                ))
+            })?;
+        code.local_types
+            .try_reserve(count)
+            .map_err(|_| Error::msg("out of memory expanding module locals"))?;
+        code.local_types.resize(total, vt);
+    }
+    Ok(start as u32)
 }
 
 /// The arena lengths at function entry — the function's span starts. Every in-function index

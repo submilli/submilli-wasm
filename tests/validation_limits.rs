@@ -60,11 +60,55 @@ fn trusted_per_module_override_raises_ceiling() {
 
     let limits = ModuleLimits {
         max_module_bytes: n,
+        ..ModuleLimits::default()
     };
     let module = Module::new_with_limits(&engine, &wasm, &limits).unwrap();
     let mut store = Store::new(&engine, ());
     let inst = Instance::new(&mut store, &module, &[]).unwrap();
     assert_eq!(run_add(&mut store, inst), 42);
+}
+
+/// `n_funcs` functions of `n_locals` i32 locals each — every one well under `wasmparser`'s
+/// per-function cap, so only the module-wide aggregate can reject it.
+fn many_locals(n_funcs: usize, n_locals: usize) -> Vec<u8> {
+    let func = format!("(func (local {}))", "i32 ".repeat(n_locals));
+    wat::parse_str(format!("(module {})", func.repeat(n_funcs))).unwrap()
+}
+
+/// The aggregate expanded-locals cap (`Config::max_expanded_locals`) rejects a module whose
+/// functions are individually valid but together exceed it; exactly at the cap is accepted, and
+/// the trusted-tier `ModuleLimits` override raises it per-module.
+#[test]
+fn aggregate_expanded_locals_are_bounded() {
+    let mut config = Config::new();
+    config.max_expanded_locals(30);
+    let engine = Engine::new(&config).unwrap();
+
+    let over = many_locals(4, 10);
+    let err = Module::new(&engine, &over).unwrap_err();
+    assert!(
+        err.to_string().contains("more than 30 locals in total"),
+        "{err}"
+    );
+
+    assert!(Module::new(&engine, many_locals(3, 10)).is_ok());
+    assert!(Module::new(&engine, wat::parse_str(ADD).unwrap()).is_ok());
+
+    let limits = ModuleLimits {
+        max_expanded_locals: 40,
+        ..ModuleLimits::default()
+    };
+    assert!(Module::new_with_limits(&engine, &over, &limits).is_ok());
+}
+
+/// A hostile module under the default caps: the maximum per-function locals `wasmparser`
+/// allows, repeated until the aggregate crosses the default — a few hundred KiB of input that
+/// would otherwise expand to hundreds of MiB — is rejected cleanly by `Module::new`.
+#[test]
+fn default_cap_rejects_locals_bomb() {
+    let wasm = many_locals(200, 50_000);
+    let err = Module::new(&Engine::default(), &wasm).unwrap_err();
+    assert!(err.to_string().contains("locals in total"), "{err}");
 }
 
 /// `wasmparser`'s per-dimension hard limits still reject a hostile module in our streaming path —

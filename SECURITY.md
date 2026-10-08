@@ -60,8 +60,8 @@ enabled for untrusted code. Both also bound the `start` function and active-segm
   instance/memory/table counts at instantiation, and GC-heap allocation.
 - `Config::max_wasm_stack` (bytes) bounds recursion → `Trap::StackOverflow`, including across the host↔wasm
   re-entry boundary, so host/guest ping-pong traps rather than aborting the native stack (#30).
-- Validation-time `Config::max_module_bytes` bounds the *compiler* against a hostile module before it runs
-  (#32), on top of `wasmparser`'s per-dimension limits.
+- Validation-time `Config::max_module_bytes` and `Config::max_expanded_locals` bound the *compiler*
+  against a hostile module before it runs (#32), on top of `wasmparser`'s per-dimension limits.
 - **With no limiter installed, the defaults are finite ceilings, never "unbounded"** — a deliberate
   deviation from wasmtime (see §5).
 
@@ -119,7 +119,7 @@ For untrusted, multi-tenant operation the embedder **must**:
    **arm them before `Instance::new`** — guest code runs at instantiation (`start` + active segments), not
    only on the first export call.
 4. **Set `Config::max_wasm_stack`** to bound recursion depth.
-5. **Set `Config::max_module_bytes`** to the untrusted-tier ceiling for guest modules. Compile only
+5. **Set `Config::max_module_bytes` / `max_expanded_locals`** to the untrusted-tier ceilings for guest modules. Compile only
    curated/vetted packages with the higher limit via `Module::new_with_limits`.
 6. **Capability-scope imports.** Expose only the host functions a tenant is authorized to call. Host-fn
    panics are contained, but a panic still aborts that tenant's call — keep host functions robust.
@@ -134,8 +134,9 @@ and documented:
 - **Finite no-limiter ceilings.** With no `ResourceLimiter` installed, memory/table growth and initial size
   are bounded by finite default ceilings (notably `memory64`/`table64`, which wasmtime leaves effectively
   unbounded). The no-limiter default is never "unbounded". (#31)
-- **`Config::max_module_bytes`.** An additive validation-time cap with no wasmtime analog, bounding compiler
-  memory against a hostile module. (#32)
+- **`Config::max_module_bytes` / `max_expanded_locals`.** Additive validation-time caps with no wasmtime
+  analog, bounding compiler memory against a hostile module: the encoded size, and the module-wide
+  locals arena (which `wasmparser` bounds only per function). (#32)
 - **Collector selection.** `Collector::Auto`/`MarkSweep` run the non-moving mark-sweep collector;
   `Collector::Null` is allocate-only; `DeferredReferenceCounting`/`Copying` are **rejected** at
   `Engine::new`. (#27g)

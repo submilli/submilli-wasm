@@ -52,6 +52,7 @@ fn compile_wat(
         kinds: &kinds,
         func_types: &[0],
         tag_types: &[],
+        max_expanded_locals: usize::MAX,
     };
     let mut arenas = crate::module::code::CodeArenas::default();
     let mut func = None;

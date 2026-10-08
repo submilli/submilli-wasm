@@ -1,5 +1,7 @@
 //! `Config` — engine/runtime configuration (wasmtime-compatible builder).
 
+use crate::module::ModuleLimits;
+
 /// Global configuration for an [`crate::Engine`]. Builder methods return `&mut Self`.
 #[allow(clippy::struct_excessive_bools)] // independent on/off knobs, mirroring `wasmtime::Config`
 #[derive(Clone, Debug)]
@@ -11,6 +13,7 @@ pub struct Config {
     gc_memory_threshold: Option<usize>,
     gc_heap_reservation: u64,
     max_module_bytes: usize,
+    max_expanded_locals: usize,
     async_support: bool,
     wasm_backtrace: bool,
     wasm_backtrace_details: WasmBacktraceDetails,
@@ -31,6 +34,7 @@ impl Default for Config {
             gc_heap_reservation: 256 * 1024,
             // The untrusted-tier module-size ceiling (#32); a finite default, never unbounded.
             max_module_bytes: crate::module::DEFAULT_MAX_MODULE_BYTES,
+            max_expanded_locals: crate::module::DEFAULT_MAX_EXPANDED_LOCALS,
             // Enabled by default (unlike wasmtime, where it's opt-in): this interpreter is
             // fiber-less, so an async-enabled store runs sync calls just as well, and defaulting
             // on lets embedders use `call_async`/`fuel_async_yield_interval` without an explicit
@@ -98,9 +102,28 @@ impl Config {
         self
     }
 
-    /// The configured default module-size ceiling in bytes (`Config::max_module_bytes`).
-    pub(crate) fn max_module_bytes_value(&self) -> usize {
-        self.max_module_bytes
+    /// Sets the default maximum number of locals, summed over every function after run-length
+    /// expansion, that [`Module::new`] will compile on this engine. `wasmparser` caps locals per
+    /// function (50 000) but not per module, so without this a small module of many such
+    /// functions could demand gigabytes from the compiler. Raised per-module for trusted packages
+    /// via [`Module::new_with_limits`].
+    ///
+    /// **Additive deviation from wasmtime** — there is no analog in `wasmtime::Config`. The
+    /// default is finite (8M locals; ~4× what a 256 MiB real-world module declares).
+    ///
+    /// [`Module::new`]: crate::Module::new
+    /// [`Module::new_with_limits`]: crate::Module::new_with_limits
+    pub fn max_expanded_locals(&mut self, locals: usize) -> &mut Self {
+        self.max_expanded_locals = locals;
+        self
+    }
+
+    /// The configured untrusted-tier module limits, as a [`ModuleLimits`].
+    pub(crate) fn module_limits(&self) -> ModuleLimits {
+        ModuleLimits {
+            max_module_bytes: self.max_module_bytes,
+            max_expanded_locals: self.max_expanded_locals,
+        }
     }
 
     pub fn wasm_multi_value(&mut self, enable: bool) -> &mut Self {

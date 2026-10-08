@@ -63,6 +63,7 @@ fn compile_func(
         kinds: &kinds,
         func_types,
         tag_types: &[],
+        max_expanded_locals: usize::MAX,
     };
     let mut validator = Validator::new_with_features(crate::module::enabled_features());
     for payload in Parser::new(0).parse_all(&bytes) {

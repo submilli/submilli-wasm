@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGua
 
 use crate::canon::{AggKind, CanonicalTypeId, GroupId, ModuleType, TypeRegistry};
 use crate::config::{CollectorKind, Config};
+use crate::module::ModuleLimits;
 use crate::value::{FieldType, Finality, ValType};
 use crate::{Error, Result};
 
@@ -36,9 +37,10 @@ struct EngineInner {
     /// Per-store pre-authorized GC budget (bytes): reservation growth within it skips the limiter,
     /// and it caps a single growth step (`Config::gc_heap_reservation`).
     gc_heap_reservation: usize,
-    /// Default validation-time module-size ceiling (bytes) for `Module::new` — the untrusted
-    /// tier (`Config::max_module_bytes`, #32). Trusted modules override it per-compile.
-    max_module_bytes: usize,
+    /// Default validation-time complexity ceilings for `Module::new` — the untrusted tier
+    /// (`Config::max_module_bytes` / `max_expanded_locals`, #32). Trusted modules override them
+    /// per-compile via `Module::new_with_limits`.
+    module_limits: ModuleLimits,
     /// Total GC bytes committed (reserved) across all of the engine's stores — updated at
     /// reservation-batch granularity (never per object), so it has no hot-path cost. Drives the
     /// engine-wide GC-pressure axis (§14).
@@ -76,7 +78,7 @@ impl Engine {
                 collector: config.collector_kind().resolve()?,
                 gc_memory_threshold: config.gc_memory_threshold_bytes(),
                 gc_heap_reservation: config.gc_heap_reservation_bytes(),
-                max_module_bytes: config.max_module_bytes_value(),
+                module_limits: config.module_limits(),
                 gc_committed: AtomicUsize::new(0),
                 gc_requests: Mutex::new(Vec::new()),
                 wasm_backtrace: config.wasm_backtrace_enabled(),
@@ -278,9 +280,9 @@ impl Engine {
         self.inner.gc_heap_reservation
     }
 
-    /// The default validation-time module-size ceiling for `Module::new` (`Config::max_module_bytes`).
-    pub(crate) fn max_module_bytes(&self) -> usize {
-        self.inner.max_module_bytes
+    /// The default validation-time ceilings for `Module::new` (the untrusted tier).
+    pub(crate) fn module_limits(&self) -> ModuleLimits {
+        self.inner.module_limits
     }
 
     /// Registers a new store's GC-request mailbox, returning the flag the store owns (the engine
