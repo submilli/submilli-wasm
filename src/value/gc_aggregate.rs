@@ -202,14 +202,26 @@ impl ArrayRefPre {
 
 impl ArrayRef {
     /// Allocates an array of `len` copies of `elem`.
+    ///
+    /// `elem` is type-checked and encoded once, then replicated across the body — a zero fill
+    /// (the common "allocate, then write in place" pattern) costs a single zeroed allocation.
     pub fn new(
-        store: impl AsContextMut,
+        mut store: impl AsContextMut,
         allocator: &ArrayRefPre,
         elem: &Val,
         len: u32,
     ) -> Result<Rooted<ArrayRef>> {
-        let count = len as usize;
-        Self::alloc(store, allocator, count, |_| elem)
+        let mut ctx = store.as_context_mut();
+        ctx.inner().check_handle(allocator.store);
+        Self::check_elem(ctx.inner(), allocator, elem)?;
+        let byte_len = Self::body_len(allocator, len as usize)?;
+        // Reserve before building the body; `elem` is host-held (rooted if a GC ref), so a
+        // collection here is safe. Encode it only afterwards, as `alloc` does.
+        let charge = ctx.inner().gc_object_charge(byte_len);
+        ctx.0.gc_reserve_host(charge)?;
+        let mut pattern = vec![0u8; allocator.layout.stride()];
+        write_slot(allocator.layout.elem_at(0), &mut pattern, *elem);
+        Self::finish_packed(ctx.inner_mut(), allocator, filled_body(&pattern, byte_len)?)
     }
 
     /// Allocates a fixed array from the given elements.
@@ -218,7 +230,7 @@ impl ArrayRef {
         allocator: &ArrayRefPre,
         elems: &[Val],
     ) -> Result<Rooted<ArrayRef>> {
-        Self::alloc(store, allocator, elems.len(), |i| &elems[i])
+        Self::alloc(store, allocator, elems)
     }
 
     /// Allocates an `i8` array initialized from the given byte slice.
@@ -233,7 +245,7 @@ impl ArrayRef {
         let mut ctx = store.as_context_mut();
         let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I8, elems.len())?;
         ctx.0.gc_reserve_host(charge)?;
-        Self::finish_packed(ctx.inner_mut(), allocator, elems.to_vec())
+        Self::finish_packed(ctx.inner_mut(), allocator, copied_body(elems)?)
     }
 
     /// Allocates a zero-filled `i8` array directly under the GC limiter.
@@ -258,7 +270,11 @@ impl ArrayRef {
         let storage = StorageType::ValType(crate::ValType::I64);
         let charge = Self::packed_charge(ctx.inner(), allocator, storage, elems.len())?;
         ctx.0.gc_reserve_host(charge)?;
-        Self::finish_packed(ctx.inner_mut(), allocator, i64_body(elems)?)
+        Self::finish_packed(
+            ctx.inner_mut(),
+            allocator,
+            le_body(elems, u64::to_le_bytes)?,
+        )
     }
 
     /// Async sibling of [`ArrayRef::new_from_i8_slice`].
@@ -271,7 +287,7 @@ impl ArrayRef {
         let mut ctx = store.as_context_mut();
         let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I8, elems.len())?;
         ctx.store_mut().gc_reserve_host_async(charge).await?;
-        Self::finish_packed(ctx.inner_mut(), allocator, elems.to_vec())
+        Self::finish_packed(ctx.inner_mut(), allocator, copied_body(elems)?)
     }
 
     /// Allocates an `i16` array initialized from the given 16-bit units.
@@ -286,7 +302,11 @@ impl ArrayRef {
         let mut ctx = store.as_context_mut();
         let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I16, elems.len())?;
         ctx.0.gc_reserve_host(charge)?;
-        Self::finish_packed(ctx.inner_mut(), allocator, i16_body(elems))
+        Self::finish_packed(
+            ctx.inner_mut(),
+            allocator,
+            le_body(elems, u16::to_le_bytes)?,
+        )
     }
 
     /// Async sibling of [`ArrayRef::new_from_i16_slice`].
@@ -299,7 +319,11 @@ impl ArrayRef {
         let mut ctx = store.as_context_mut();
         let charge = Self::packed_charge(ctx.inner(), allocator, StorageType::I16, elems.len())?;
         ctx.store_mut().gc_reserve_host_async(charge).await?;
-        Self::finish_packed(ctx.inner_mut(), allocator, i16_body(elems))
+        Self::finish_packed(
+            ctx.inner_mut(),
+            allocator,
+            le_body(elems, u16::to_le_bytes)?,
+        )
     }
 
     /// The limiter charge for a packed array of `count` elements, after checking the allocator's
@@ -317,11 +341,25 @@ impl ArrayRef {
                 "element type mismatch: cannot initialize a non-{expected:?} array from a slice"
             )));
         }
+        Ok(inner.gc_object_charge(Self::body_len(allocator, count)?))
+    }
+
+    /// The body byte length of a `count`-element array, if `count` fits an array length.
+    fn body_len(allocator: &ArrayRefPre, count: usize) -> Result<usize> {
         u32::try_from(count).map_err(|_| Error::msg("array too large"))?;
-        let byte_len = count
+        count
             .checked_mul(allocator.layout.stride())
-            .ok_or_else(|| Error::msg("array too large"))?;
-        Ok(inner.gc_object_charge(byte_len))
+            .ok_or_else(|| Error::msg("array too large"))
+    }
+
+    fn check_elem(inner: &StoreInner, allocator: &ArrayRefPre, elem: &Val) -> Result<()> {
+        let field_ty = allocator.ty.field_type();
+        if !slot_accepts(allocator.layout.elem_at(0), elem)
+            || !field_value_matches(inner, &field_ty, elem)?
+        {
+            return Err(Error::msg("array element value has the wrong type"));
+        }
+        Ok(())
     }
 
     fn finish_packed(
@@ -336,26 +374,17 @@ impl ArrayRef {
         Ok(root_new_gc(inner, idx))
     }
 
-    /// Shared array constructor: validates each element, packs the body, allocates.
-    fn alloc<'a>(
+    /// `new_fixed` constructor: validates each element, packs the body, allocates.
+    fn alloc(
         mut store: impl AsContextMut,
         allocator: &ArrayRefPre,
-        count: usize,
-        elem_at: impl Fn(usize) -> &'a Val,
+        elems: &[Val],
     ) -> Result<Rooted<ArrayRef>> {
-        let stride = allocator.layout.stride();
-        let byte_len = count
-            .checked_mul(stride)
-            .ok_or_else(|| Error::msg("array too large"))?;
+        let byte_len = Self::body_len(allocator, elems.len())?;
         let mut ctx = store.as_context_mut();
         ctx.inner().check_handle(allocator.store);
-        let field_ty = allocator.ty.field_type();
-        for i in 0..count {
-            if !slot_accepts(allocator.layout.elem_at(0), elem_at(i))
-                || !field_value_matches(ctx.inner(), &field_ty, elem_at(i))?
-            {
-                return Err(Error::msg("array element value has the wrong type"));
-            }
+        for elem in elems {
+            Self::check_elem(ctx.inner(), allocator, elem)?;
         }
         let type_id = allocator.ty.canonical_id();
         // Reserve through the limiter (collect-then-grow) before building the (possibly large) body,
@@ -364,9 +393,9 @@ impl ArrayRef {
         let charge = ctx.inner().gc_object_charge(byte_len);
         ctx.0.gc_reserve_host(charge)?;
         let inner = ctx.inner_mut();
-        let mut data = vec![0u8; byte_len];
-        for i in 0..count {
-            write_slot(allocator.layout.elem_at(i), &mut data, *elem_at(i));
+        let mut data = zeroed_body(byte_len)?;
+        for (i, elem) in elems.iter().enumerate() {
+            write_slot(allocator.layout.elem_at(i), &mut data, *elem);
         }
         // The element count is implicit in the body length, not stored.
         let object = GcObject::new_array(type_id, data.into_boxed_slice());
@@ -612,11 +641,8 @@ impl From<Rooted<ArrayRef>> for Rooted<AnyRef> {
     }
 }
 
-/// Lays out 16-bit units as a packed `i16` array body (little-endian, matching `write_slot`).
-fn i16_body(elems: &[u16]) -> Vec<u8> {
-    elems.iter().flat_map(|unit| unit.to_le_bytes()).collect()
-}
-
+/// Body builders allocate fallibly: the limiter has already admitted the bytes, so an allocator
+/// failure must surface as an error rather than abort the process.
 fn zeroed_body(len: usize) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     body.try_reserve_exact(len).map_err(Error::new)?;
@@ -624,14 +650,33 @@ fn zeroed_body(len: usize) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn i64_body(elems: &[u64]) -> Result<Vec<u8>> {
+fn copied_body(elems: &[u8]) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.try_reserve_exact(elems.len()).map_err(Error::new)?;
+    body.extend_from_slice(elems);
+    Ok(body)
+}
+
+/// A `len`-byte body repeating the encoded element `pattern` (whose length divides `len`).
+fn filled_body(pattern: &[u8], len: usize) -> Result<Vec<u8>> {
+    let mut body = zeroed_body(len)?;
+    if pattern.iter().any(|&b| b != 0) {
+        for chunk in body.chunks_exact_mut(pattern.len()) {
+            chunk.copy_from_slice(pattern);
+        }
+    }
+    Ok(body)
+}
+
+/// Lays out units as a packed array body (little-endian, matching `write_slot`).
+fn le_body<T: Copy, const N: usize>(elems: &[T], to_le: fn(T) -> [u8; N]) -> Result<Vec<u8>> {
     let byte_len = elems
         .len()
-        .checked_mul(8)
+        .checked_mul(N)
         .ok_or_else(|| Error::msg("array too large"))?;
     let mut body = zeroed_body(byte_len)?;
-    for (bytes, unit) in body.as_chunks_mut::<8>().0.iter_mut().zip(elems) {
-        *bytes = unit.to_le_bytes();
+    for (bytes, &unit) in body.as_chunks_mut::<N>().0.iter_mut().zip(elems) {
+        *bytes = to_le(unit);
     }
     Ok(body)
 }

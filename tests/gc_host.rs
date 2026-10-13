@@ -629,5 +629,71 @@ fn bulk_allocations_refuse_before_building_the_body() {
         ),
     );
     assert!(ArrayRef::new_from_i64_slice(&mut store, &limbs, &[0; 256]).is_err());
+    assert!(ArrayRef::new(&mut store, &bytes, &Val::I32(0), 2048).is_err());
+    assert!(ArrayRef::new(&mut store, &limbs, &Val::I64(-1), u32::MAX).is_err());
+    assert_eq!(store.gc_heap_capacity(), 0);
+}
+
+#[test]
+fn array_new_replicates_the_encoded_fill() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let units = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16)),
+    );
+    let array = ArrayRef::new(&mut store, &units, &Val::I32(0x5_1234), 3).unwrap();
+    let mut actual = [0; 3];
+    array.copy_to_i16_slice(&store, &mut actual).unwrap();
+    assert_eq!(actual, [0x1234; 3]);
+
+    let st = StructType::new(
+        &engine,
+        [FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::I32),
+        )],
+    )
+    .unwrap();
+    let spre = StructRefPre::new(&mut store, st);
+    let s = StructRef::new(&mut store, &spre, &[Val::I32(42)]).unwrap();
+    let refs = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(
+            &engine,
+            FieldType::new(Mutability::Var, StorageType::ValType(ValType::ANYREF)),
+        ),
+    );
+    let filled = ArrayRef::new(&mut store, &refs, &Val::AnyRef(Some(s.into())), 2).unwrap();
+    for i in 0..2 {
+        let Val::AnyRef(Some(elem)) = filled.get(&store, i).unwrap() else {
+            panic!("expected a non-null anyref");
+        };
+        let field = elem.unwrap_struct(&store).unwrap().field(&mut store, 0);
+        assert_eq!(field.unwrap().unwrap_i32(), 42);
+    }
+    // Null is a non-zero handle, so a null fill must not take the all-zero shortcut.
+    let nulls = ArrayRef::new(&mut store, &refs, &Val::AnyRef(None), 2).unwrap();
+    assert!(matches!(nulls.get(&store, 1).unwrap(), Val::AnyRef(None)));
+}
+
+/// Slices longer than an array length error before being copied. `vec![0; n]` maps zeroed pages
+/// lazily, so these multi-GiB inputs are never touched.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn oversized_slices_error_before_copying() {
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let too_long = u32::MAX as usize + 1;
+    let bytes = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8)),
+    );
+    assert!(ArrayRef::new_from_i8_slice(&mut store, &bytes, &vec![0; too_long]).is_err());
+    let units = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I16)),
+    );
+    assert!(ArrayRef::new_from_i16_slice(&mut store, &units, &vec![0; too_long]).is_err());
     assert_eq!(store.gc_heap_capacity(), 0);
 }
