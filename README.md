@@ -4,12 +4,12 @@ A WebAssembly interpreter that would rather start *now* than run fast later.
 
 ## Why we built this
 
-We built this for **submilli-runtime**, our runtime for LLM-generated code, which now
-runs on this interpreter. A model writes a program, we compile it to wasm, run it
-once, and throw it away — for tenants who don't trust each other and whom we don't
-trust either. The code itself is thin orchestration: call a host function, shuffle
-some data, call another one. Almost all of its real work happens on our side of the
-boundary.
+We built this for **[submilli-runtime](https://github.com/submilli/submilli-runtime)**,
+our runtime for LLM-generated code, which now runs on this interpreter. A model
+writes a program, we compile it to wasm, run it once, and throw it away — for tenants
+who don't trust each other and whom we don't trust either. The code itself is thin
+orchestration: call a host function, shuffle some data, call another one. Almost all
+of its real work happens on our side of the boundary.
 
 It's an unusual workload for a wasm engine. Most engines — reasonably — optimize for
 *compile once, run many times*: pay a compiler up front, win it back over many
