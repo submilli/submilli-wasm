@@ -4,21 +4,21 @@ A WebAssembly interpreter that would rather start *now* than run fast later.
 
 ## Why we built this
 
-We're building a product that runs LLM-generated code. A model writes a program, we
-compile it to wasm, run it once, and throw it away — for tenants who don't trust each
-other and whom we don't trust either. The code itself is thin orchestration: call a
-host function, shuffle some data, call another one. Almost all of its real work
-happens on our side of the boundary.
+We built this for **submilli-runtime**, our runtime for LLM-generated code, which now
+runs on this interpreter. A model writes a program, we compile it to wasm, run it
+once, and throw it away — for tenants who don't trust each other and whom we don't
+trust either. The code itself is thin orchestration: call a host function, shuffle
+some data, call another one. Almost all of its real work happens on our side of the
+boundary.
 
 It's an unusual workload for a wasm engine. Most engines — reasonably — optimize for
 *compile once, run many times*: pay a compiler up front, win it back over many
 iterations. Our modules don't have many iterations. They have one.
 
-We started — and our product still runs — on **wasmtime**. It's the gold standard,
-and we love its API. But as the workload took shape, Cranelift's compile time became
-the bill we couldn't pay: ~190 ms for a 4 MiB module, *with optimization turned off*.
-For code that runs once, that's not overhead — that's the whole show. So we looked
-around:
+We started on **wasmtime**. It's the gold standard, and we love its API. But as the
+workload took shape, Cranelift's compile time became the bill we couldn't pay:
+~190 ms for a 4 MiB module, *with optimization turned off*. For code that runs once,
+that's not overhead — that's the whole show. So we looked around:
 
 - **Winch**, wasmtime's baseline compiler, has a lot of potential — much faster
   compilation, real momentum. But no GC and no exception handling, and code generated
@@ -30,7 +30,7 @@ around:
   their lives waiting on IO, and density means parking thousands of them on awaits
   over a small thread pool, not holding a thread per guest.
 
-We needed the combination: the wasmtime API our product is already written against
+We needed the combination: the wasmtime API our product was already written against
 (async host functions included), wasmi-class startup, and full Wasm 3.0 — GC and
 `try_table` included, because that's what compilers emit now. We couldn't find it on
 the shelf, so we started building it.
@@ -57,9 +57,9 @@ resource limits, fuel, and epochs. The details live in [`SECURITY.md`](SECURITY.
 
 An interpreter — deliberately no JIT — with a `wasmtime`-shaped API: `Engine`,
 `Store<T>`, `Module`, `Linker`, `func_wrap`, async host functions, limiters, fuel,
-epochs, `Trap` and `WasmBacktrace` via `downcast_ref`. Our own embedding code moved
-over with little more than a dependency swap — though as said above, the surface is
-what our product needed, and it grows one missing method at a time.
+epochs, `Trap` and `WasmBacktrace` via `downcast_ref`. submilli-runtime moved over with
+little more than a dependency swap — though as said above, the surface is what our
+product needed, and it grows one missing method at a time.
 
 And the swap really is one line, thanks to Cargo's package rename:
 
