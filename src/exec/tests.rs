@@ -51,6 +51,7 @@ fn compile_wat(
         types: &types,
         kinds: &kinds,
         func_types: &[0],
+        num_imported_funcs: 0,
         tag_types: &[],
         max_expanded_locals: usize::MAX,
     };

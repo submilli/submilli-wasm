@@ -62,6 +62,7 @@ fn compile_func(
         types: &types,
         kinds: &kinds,
         func_types,
+        num_imported_funcs: 0,
         tag_types: &[],
         max_expanded_locals: usize::MAX,
     };
@@ -225,7 +226,7 @@ fn call_stack_effect() {
     .unwrap();
     assert!(matches!(
         ops.as_slice(),
-        [Op::Copy(3, 1), Op::Copy(2, 0), Op::Call(1, 2)]
+        [Op::Copy(3, 1), Op::Copy(2, 0), Op::CallInternal(1, 2)]
     ));
 }
 

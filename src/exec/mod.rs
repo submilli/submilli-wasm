@@ -51,6 +51,7 @@ pub(crate) mod trace;
 use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::code::Code;
+use crate::module::op::Op;
 use crate::store::Store;
 use crate::trap::Trap;
 use crate::value::{Val, ValType};
@@ -58,7 +59,7 @@ use crate::Result;
 
 use self::frame::{Delimiter, Frame};
 pub(crate) use outcome::Outcome;
-use outcome::{CallReq, ResolvedCall, StepOutcome, CONTROL};
+use outcome::{CallReq, ResolvedCall, StepOutcome, CALL_INTERNAL, CONTROL};
 
 /// Transient interpreter state for one top-level call. Self-contained: it owns its
 /// operand/frame stacks and holds no borrow into the `Store` across an [`Outcome`]
@@ -308,32 +309,19 @@ impl Execution {
     /// `Config::max_wasm_stack` at each frame push to bound runaway recursion (slots charged at
     /// [`SLOT_CHARGE`]).
     #[inline]
-    fn stack_bytes(&self) -> Result<usize> {
+    fn stack_bytes(&self) -> usize {
         self.stack_bytes_for(self.live_top(), self.frames.len())
     }
 
     /// [`stack_bytes`](Self::stack_bytes) for a prospective `slots`-slot buffer and `frames`
-    /// frames.
+    /// frames. Saturating: a footprint too large to count is over any limit (branch-free on the
+    /// call path).
     #[inline]
-    fn stack_bytes_for(&self, slots: usize, frames: usize) -> Result<usize> {
-        let values = slots
-            .checked_mul(SLOT_CHARGE)
-            .ok_or(InternalError::FrameStack(
-                "operand stack byte size overflow",
-            ))?;
-        let frames = frames
-            .checked_mul(std::mem::size_of::<Frame>())
-            .ok_or(InternalError::FrameStack("frame stack byte size overflow"))?;
-        let reentry = self
-            .host_reentry_depth
-            .checked_mul(HOST_REENTRY_RESERVE)
-            .ok_or(InternalError::FrameStack(
-                "host re-entry byte size overflow",
-            ))?;
-        values
-            .checked_add(frames)
-            .and_then(|n| n.checked_add(reentry))
-            .ok_or_else(|| InternalError::FrameStack("execution stack byte size overflow").into())
+    fn stack_bytes_for(&self, slots: usize, frames: usize) -> usize {
+        slots
+            .saturating_mul(SLOT_CHARGE)
+            .saturating_add(frames.saturating_mul(std::mem::size_of::<Frame>()))
+            .saturating_add(self.host_reentry_depth.saturating_mul(HOST_REENTRY_RESERVE))
     }
 
     /// Runs frames until the stack falls back to `stop_depth` (the boundary this `run` is
@@ -351,7 +339,7 @@ impl Execution {
         // (just a host call) would never be checked. With the host-crossing reserve folded into
         // `stack_bytes`, this entry check makes even pure host↔wasm ping-pong trap here rather
         // than abort the native stack (#30).
-        if self.stack_bytes()? >= self.stack_limit {
+        if self.stack_bytes() >= self.stack_limit {
             let ip = self.frames.last().map_or(0, |f| f.ip);
             return Err(self.attach_trap_backtrace(&store.inner, Trap::StackOverflow.into(), ip));
         }
@@ -431,9 +419,28 @@ impl Execution {
                         Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
                     },
                 };
-                if next != CONTROL {
+                if next < CALL_INTERNAL {
                     ip = next;
                     continue;
+                }
+                if next == CALL_INTERNAL {
+                    // The callee is read from the op itself: a stray marker (a corrupt branch
+                    // target) from any other op fails closed.
+                    let Op::CallInternal(index, s) = *op else {
+                        return Err(InternalError::FrameStack("call marker without a call").into());
+                    };
+                    match self.call_internal(code, instance, index, step::slot(base, s), ip + 1) {
+                        Ok((f, b)) => (func, ip, base) = (f, 0, b),
+                        Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
+                    }
+                    if gc_watch {
+                        gc_countdown -= 1;
+                        if gc_countdown == 0 {
+                            gc_countdown = GC_CHECK_INTERVAL;
+                            self.service_gc_pressure(&mut store.inner)?;
+                        }
+                    }
+                    continue 'frame;
                 }
                 // `CONTROL` without a pending outcome is an interpreter bug: fail closed.
                 let outcome = self.control.take().ok_or(InternalError::FrameStack(

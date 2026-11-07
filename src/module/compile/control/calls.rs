@@ -8,7 +8,10 @@ impl Translator<'_> {
         let s = self.slot_below(params);
         self.pop(params);
         self.push(results);
-        self.emit(Op::Call(func, s));
+        self.emit(match func.checked_sub(self.ctx.num_imported_funcs) {
+            Some(defined) => Op::CallInternal(defined, s),
+            None => Op::Call(func, s),
+        });
     }
 
     pub(in crate::module::compile) fn call_indirect(&mut self, type_index: u32, table: u32) {

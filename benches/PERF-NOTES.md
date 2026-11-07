@@ -981,3 +981,35 @@ the access itself (effective address, bounds check, byte copy), not the lookup.
 **Tried and reverted:** resolving memory 0 eagerly into a per-frame context (base/length kept
 next to the frame) regressed 5–10%. The extra live state in the dispatch loop cost more registers
 than the lookups it saved.
+
+## 21. Session 7 — the wasm→wasm call path
+
+The direct race had fib furthest from the target (5.5× wasmi 2.0 with SIMD). The cost was ~550
+instructions per fib call for 4–5 executed ops, almost all of it call and return.
+
+- **`CallInternal`.** A direct call to a function the module defines always runs in the caller's
+  instance from the caller's module, so it needs no store lookups (`instances[i].funcs[f]` → func
+  entity → instance → module `defined`). The op carries the defined index, and the run loop
+  re-points its `Code` handle (bounds-checked: a corrupt artifact fails closed). `step` returns a
+  sentinel `next`, not the `StepOutcome` enum, and the loop reads the callee from the op it just
+  ran, so a stray sentinel (a corrupt branch target) fails closed. A side-channel field with the
+  request, cleared after use, cost fib 8%. Imported, indirect and tail calls keep the general path.
+- **Frame push.** `push_call` called out to `live_top` and `grow_for_frame`, and the stack charge
+  did three checked multiplies with error paths. Now the charge saturates (an uncountable footprint
+  is over any limit: same `StackOverflow` trap), buffer growth is a cold `extend_slots`, and
+  `live_top` is inline.
+- **Return.** `top_into` is inline again. The old "8–15% slower loops" note no longer reproduces.
+- **SIMD build.** `Op::Copy` copies the whole 17-byte record (`copy_slot`); LLVM had outlined the
+  value/tag accessor pair.
+
+**Measured** (cycles, M4 Pro) vs §20. Default build: fib 1.50×, CoreMark 1.05×, memory_tree
+1.03×, tiny 1.02×, others flat. SIMD build: fib 1.86×, CoreMark 1.06×, memory_tree 1.05×, tiny
+1.04×, linked_list 0.97×. That last one is a code-layout effect of the loop's op read: it is
+neutral in the default build, and the SIMD build's slot layout changes with the next stage.
+
+**Race vs wasmi 2.0** (wasm.fyi config, SIMD on both): fib 3.0×, CoreMark 3.1×, memory/sum 3.1×,
+memory_tree 3.3×, linked_list 3.5×, tiny 4.0× (per host→wasm call).
+
+**Tried and dropped:** merging `do_return` + `top_into` into one out-of-line return was neutral.
+After this stage the SIMD build is still ~6% slower than the default on fib, from the 17-byte slot
+record (copies and frame pushes). v128 as two 8-byte slots would remove that.

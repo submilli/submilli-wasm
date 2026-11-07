@@ -45,9 +45,15 @@ pub(crate) enum Outcome {
 }
 
 /// [`step`](super::Execution::step)'s return value when the op left a [`StepOutcome`] in
-/// `Execution::control` instead of naming the next ip. Ops index a validated function body, far
-/// below `u32::MAX`.
+/// `Execution::control` instead of naming the next ip. This and [`CALL_INTERNAL`] are the two
+/// reserved values: ops index a validated function body, far below `u32::MAX - 1`.
 pub(super) const CONTROL: u32 = u32::MAX;
+
+/// [`step`](super::Execution::step)'s return value for an [`Op::CallInternal`]: the run loop reads
+/// the callee from the op it just ran — no [`StepOutcome`], since this is the hot call.
+///
+/// [`Op::CallInternal`]: crate::module::op::Op::CallInternal
+pub(super) const CALL_INTERNAL: u32 = u32::MAX - 1;
 
 /// A call/grow the run loop must service after a [`step`](super::Execution::step), turning it
 /// into a frame switch or an [`Outcome`]. Passed out of line (see [`CONTROL`]): returning this

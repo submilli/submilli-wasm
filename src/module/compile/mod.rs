@@ -44,6 +44,8 @@ pub(crate) struct CompileCtx<'a> {
     pub types: &'a [ModuleType],
     pub kinds: &'a [AggKind],
     pub func_types: &'a [u32],
+    /// Leading imports in `func_types`: a call above them targets a function this module defines.
+    pub num_imported_funcs: u32,
     /// Tag-index → type-index (imported then defined), for `try_table` catch-payload arity.
     pub tag_types: &'a [u32],
     /// Module-wide cap on run-length-expanded locals (`ModuleLimits::max_expanded_locals`).

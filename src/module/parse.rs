@@ -356,6 +356,7 @@ fn compile_bodies(
         types: &m.types,
         kinds: &kinds,
         func_types: &m.func_types,
+        num_imported_funcs: m.num_imported_funcs,
         tag_types: &tag_types,
         max_expanded_locals: limits.max_expanded_locals,
     };

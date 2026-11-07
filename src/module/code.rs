@@ -105,6 +105,19 @@ impl Code {
         *self.f()
     }
 
+    /// Re-points this handle at its module's defined function `index` (an `Op::CallInternal`
+    /// target) and returns that function's module-space index; `None` (handle unchanged) if the
+    /// module has no such function — a corrupt artifact, so the caller fails closed.
+    #[inline]
+    pub(crate) fn enter_defined(&mut self, index: u32) -> Option<u32> {
+        if index as usize >= self.module.functions.len() {
+            return None;
+        }
+        let func_index = index.checked_add(self.module.num_imported_funcs)?;
+        self.index = index;
+        Some(func_index)
+    }
+
     /// The op stream at a frame-cached span (the run loop's fast path).
     #[inline]
     pub(crate) fn ops_in(&self, span: Span) -> &[Op] {

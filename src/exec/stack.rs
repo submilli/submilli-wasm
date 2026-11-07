@@ -402,6 +402,16 @@ impl Execution {
         Ok((slot.cell, slot.tag))
     }
 
+    /// Copies slot `src` (value and shadow tag) to slot `dst` — `Copy`, the hottest generic op.
+    /// Forced inline: with the 17-byte `simd` record LLVM otherwise outlines the access pair.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub(super) fn copy_slot(&mut self, src: usize, dst: usize) -> Result<()> {
+        let entry = *self.slots.get(src).ok_or_else(slot_error)?;
+        *self.slots.get_mut(dst).ok_or_else(slot_error)? = entry;
+        Ok(())
+    }
+
     /// Writes a cell + shadow tag at operand index `i` (a `local.set`/`local.tee` target).
     #[inline]
     pub(super) fn set_cell(&mut self, i: usize, cell: Cell, tag: RefTag) -> Result<()> {

@@ -50,6 +50,12 @@ pub(crate) enum Op {
     // land there). Indirect/ref calls carry their table-index / funcref operand's slot instead
     // (read before the callee is known); the arguments sit just below it.
     Call(FuncIdx, Slot),
+    /// `call` of a function this module defines, by defined-function index ([`Code::index`]): it
+    /// runs in the caller's instance from the caller's module, so nothing resolves through the
+    /// store.
+    ///
+    /// [`Code::index`]: crate::module::code::Code::index
+    CallInternal(u32, Slot),
     CallIndirect {
         type_idx: TypeIdx,
         table: TableIdx,

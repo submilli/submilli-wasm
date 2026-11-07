@@ -12,6 +12,10 @@ use crate::store::StoreInner;
 use super::outcome::Callee;
 use crate::trap::Trap;
 
+/// What the run loop keeps in registers for the running frame: its function, `ip`, locals base and
+/// instance.
+pub(super) type Resume = (FrameFunc, u32, u32, Instance);
+
 /// The part of a function's [`CompiledFunc`] the run loop reads on every frame switch, cached so
 /// it never re-resolves `functions[index]`. Not the whole 64-byte record: copying that into each
 /// frame and back out on every call/return was measurable in call-heavy code.
@@ -158,19 +162,52 @@ impl super::Execution {
         Ok((frame_func, geometry.base))
     }
 
+    /// An `Op::CallInternal` of defined function `index` with its arguments at `args_at`: the
+    /// callee is `code`'s module's, in the caller's `instance`. Saves the caller's resume point,
+    /// then pushes the callee's frame like any wasm call.
+    #[inline]
+    pub(super) fn call_internal(
+        &mut self,
+        code: &mut Code,
+        instance: Instance,
+        index: u32,
+        args_at: usize,
+        return_ip: u32,
+    ) -> crate::Result<(FrameFunc, u32)> {
+        let caller = self
+            .frames
+            .last_mut()
+            .ok_or(InternalError::FrameStack("missing caller frame"))?;
+        caller.ip = return_ip;
+        // The arguments become the callee's locals; the caller's live temporaries end below them.
+        caller.live_end = to_u32(args_at)?;
+        let func_index = code.enter_defined(index).ok_or(InternalError::FrameStack(
+            "call target is not a defined function",
+        ))?;
+        self.push_call(instance, func_index, code, args_at)
+    }
+
     /// Charges a new frame ending at `end` (the live stack top) against `max_wasm_stack` *before*
     /// allocating — a frame's operand area is sized statically, so one call can claim a large
     /// extent — then grows the buffer zeroed if it doesn't reach that far yet (it usually does:
     /// returns leave earlier frames' slots behind). An allocation failure traps, not aborts.
+    #[inline]
     fn grow_for_frame(&mut self, end: usize) -> crate::Result<()> {
         let frames = self.frames.len().saturating_add(1);
-        if self.stack_bytes_for(end, frames)? >= self.stack_limit {
+        if self.stack_bytes_for(end, frames) >= self.stack_limit {
             return Err(Trap::StackOverflow.into());
         }
-        let extra = end.saturating_sub(self.slots.len());
-        if extra == 0 {
-            return Ok(());
+        if end > self.slots.len() {
+            return self.extend_slots(end);
         }
+        Ok(())
+    }
+
+    /// Grows the operand buffer to `end` with zeroed slots (an allocation failure traps).
+    #[cold]
+    #[inline(never)]
+    fn extend_slots(&mut self, end: usize) -> crate::Result<()> {
+        let extra = end.saturating_sub(self.slots.len());
         if self.slots.try_reserve(extra).is_err() {
             return Err(Trap::StackOverflow.into());
         }
@@ -179,6 +216,7 @@ impl super::Execution {
     }
 
     /// The live stack top: the top frame's end (the buffer may extend past it, see `Frame::end`).
+    #[inline]
     pub(super) fn live_top(&self) -> usize {
         self.frames.last().map_or(0, |frame| frame.end as usize)
     }
@@ -256,10 +294,7 @@ impl super::Execution {
         }
         match n {
             0 => {}
-            1 => {
-                let (cell, tag) = self.cell_at(src)?;
-                self.set_cell(dst, cell, tag)?;
-            }
+            1 => self.copy_slot(src, dst)?,
             _ => {
                 self.slots.copy_within(src..src + n, dst);
             }
@@ -269,14 +304,10 @@ impl super::Execution {
 
     /// [`top`](Self::top) for the run loop's frame switches: retargets the loop's `code` handle
     /// in place, bumping the module `Arc` only when the new frame runs in a different module.
-    /// Kept out of line: inlined into the dispatch loop it perturbed the hot ops' code layout
-    /// (same instruction count, 8–15% more cycles on loop-heavy code).
-    #[inline(never)]
-    pub(super) fn top_into(
-        &self,
-        inner: &StoreInner,
-        code: &mut Code,
-    ) -> crate::Result<(FrameFunc, u32, u32, Instance)> {
+    /// Inlined: it is the return path's resume (fib 1.13×). It was once kept out of line for
+    /// code-layout reasons that no longer measure.
+    #[inline]
+    pub(super) fn top_into(&self, inner: &StoreInner, code: &mut Code) -> crate::Result<Resume> {
         let f = self.top_frame()?;
         if f.module == code.key() {
             code.index = f.index;

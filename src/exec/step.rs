@@ -6,6 +6,7 @@
 
 use super::call::{self, CallKind};
 use super::cell::Cell;
+use super::outcome::CALL_INTERNAL;
 use super::stack::{Bin, Un};
 use super::{arith, cell, convert, memory, Execution, StepOutcome, CONTROL};
 use crate::instance::Instance;
@@ -49,10 +50,7 @@ impl Execution {
                 self.set_scalar(slot(base, *s), Cell::of_bytes(v.to_le_bytes()))?;
             }
             Op::Select(s) => self.select_at(slot(base, *s))?,
-            Op::Copy(dst, src) => {
-                let (cell, tag) = self.cell_at(slot(base, *src))?;
-                self.set_cell(slot(base, *dst), cell, tag)?;
-            }
+            Op::Copy(dst, src) => self.copy_slot(slot(base, *src), slot(base, *dst))?,
             Op::GlobalGet(s, g) => {
                 let v = inner.global(index_space::global(inner, instance, *g)).value;
                 self.set_val(slot(base, *s), v)?;
@@ -123,6 +121,8 @@ impl Execution {
                 self.take_branch(*t, at)?;
                 return Ok(t.ip);
             }
+            // The run loop makes the call (it re-reads the op): see `CALL_INTERNAL`.
+            Op::CallInternal(..) => return Ok(CALL_INTERNAL),
             call_op @ (Op::Call(f, s) | Op::ReturnCall(f, s)) => {
                 let callee = index_space::func(inner, instance, *f);
                 let kind = call_kind(matches!(call_op, Op::ReturnCall(..)), next);
