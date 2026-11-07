@@ -90,6 +90,10 @@ pub(crate) struct Execution {
     /// The engine's `max_wasm_stack` (bytes), cached at entry so every frame push is charged
     /// against it; `0` (fail closed) until an entry sets it.
     stack_limit: usize,
+    /// Set when execution resumes after a serviced epoch deadline: the op at the resume point
+    /// already passed its gates (fuel charged, deadline handled), so it runs before the next gate
+    /// check — otherwise a callback returning `Continue(0)` would refire at the same op forever.
+    gates_passed: bool,
 }
 
 /// Guest calls between amortized GC-pressure mailbox checks (see `run`): pressure is
@@ -134,6 +138,7 @@ impl Default for Execution {
             control: None,
             sp: 0,
             stack_limit: 0,
+            gates_passed: false,
         }
     }
 }

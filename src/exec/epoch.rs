@@ -94,6 +94,7 @@ pub(super) fn apply_epoch_deadline<T>(exec: &mut Execution, store: &mut Store<T>
         UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
         UpdateDeadline::Continue(delta) => {
             extend_epoch_deadline(store, delta);
+            exec.resume_past_gates();
             Ok(())
         }
         #[cfg(feature = "async")]
@@ -112,6 +113,7 @@ pub(super) async fn apply_epoch_deadline_async<T>(
         UpdateDeadline::Interrupt => Err(Trap::Interrupt.into()),
         UpdateDeadline::Continue(delta) => {
             extend_epoch_deadline(store, delta);
+            exec.resume_past_gates();
             Ok(())
         }
         UpdateDeadline::Yield(delta) => {
@@ -120,6 +122,7 @@ pub(super) async fn apply_epoch_deadline_async<T>(
             store.inner.recover_cancelled_async_calls();
             store.inner.swap_exec(exec);
             extend_epoch_deadline(store, delta);
+            exec.resume_past_gates();
             Ok(())
         }
     }

@@ -284,6 +284,62 @@ fn epoch_callback_continue_resumes() {
     assert_eq!(out[0].unwrap_i32(), 7);
 }
 
+/// Counts to 100 in a loop (~500 executed ops).
+const COUNT_TO_100: &str = "(module (func (export \"f\") (result i32) (local i32)
+    (loop $l
+        (local.set 0 (i32.add (local.get 0) (i32.const 1)))
+        (br_if $l (i32.lt_u (local.get 0) (i32.const 100))))
+    (local.get 0)))";
+
+/// `Continue(0)` re-arms the deadline at once, so the callback fires again at the next check —
+/// but the guest still advances between callbacks (as with wasmtime's checkpoints). The
+/// callback interrupts after a generous budget so a regression fails instead of hanging.
+#[test]
+fn epoch_callback_continue_zero_makes_progress() {
+    let engine = epoch_engine();
+    let m = module(&engine, COUNT_TO_100);
+    let mut store = Store::new(&engine, 0u32);
+    store.epoch_deadline_callback(|mut ctx| {
+        *ctx.data_mut() += 1;
+        Ok(if *ctx.data() > 100_000 {
+            UpdateDeadline::Interrupt
+        } else {
+            UpdateDeadline::Continue(0)
+        })
+    });
+    store.set_epoch_deadline(0);
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let f = inst.get_func(&mut store, "f").unwrap();
+    let mut out = [Val::I32(0)];
+    f.call(&mut store, &[], &mut out).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 100);
+    assert!(*store.data() > 100, "the callback refires at every op");
+}
+
+/// An epoch suspension doesn't charge the interrupted op's fuel twice: exactly the fuel the
+/// function needs still suffices with a deadline firing before every op.
+#[test]
+fn epoch_suspension_charges_fuel_once() {
+    let mut config = Config::new();
+    config.consume_fuel(true).epoch_interruption(true);
+    let engine = Engine::new(&config).unwrap();
+    let m = module(&engine, COUNT_TO_100);
+    let mut store = Store::new(&engine, ());
+    store.set_epoch_deadline(u64::MAX);
+    store.set_fuel(1_000_000).unwrap();
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    let f = inst.get_func(&mut store, "f").unwrap();
+    let mut out = [Val::I32(0)];
+    f.call(&mut store, &[], &mut out).unwrap();
+    let needed = 1_000_000 - store.get_fuel().unwrap();
+
+    store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Continue(0)));
+    store.set_epoch_deadline(0);
+    store.set_fuel(needed).unwrap();
+    f.call(&mut store, &[], &mut out).unwrap();
+    assert_eq!(out[0].unwrap_i32(), 100);
+}
+
 // --- limits ---------------------------------------------------------------
 
 struct HostState {

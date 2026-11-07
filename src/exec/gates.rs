@@ -18,6 +18,10 @@ impl Execution {
         (fuel, epoch): (bool, bool),
         ip: u32,
     ) -> Result<Option<Outcome>> {
+        if self.gates_passed {
+            self.gates_passed = false;
+            return Ok(None);
+        }
         if fuel {
             match inner.consume_fuel_step() {
                 FuelStep::Ran => {}
@@ -60,6 +64,13 @@ impl Execution {
             self.gc_collect_now(inner)?;
         }
         Ok(())
+    }
+
+    /// Resumes past a serviced epoch deadline: the suspended op runs before the gates are checked
+    /// again (see `Execution::gates_passed`), guaranteeing progress like wasmtime's checks at
+    /// function entries and loop headers do.
+    pub(super) fn resume_past_gates(&mut self) {
+        self.gates_passed = true;
     }
 
     /// [`service_gc_pressure`](Self::service_gc_pressure) with the armed check included, for
