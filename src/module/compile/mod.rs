@@ -62,6 +62,8 @@ fn wp_err(e: BinaryReaderError) -> Error {
 #[derive(Default)]
 pub(crate) struct Scratch {
     ctrl: Vec<CtrlFrame>,
+    patch_pool: Vec<Vec<control::Patch>>,
+    table_patches: Vec<(usize, control::PatchSlot)>,
     stack: Vec<Slot>,
     local_heights: Vec<u32>,
     local_types: Vec<IrVal>,
@@ -205,6 +207,10 @@ struct Translator<'a> {
     local_heights: Vec<u32>,
     max_operands: u32,
     ctrl: Vec<CtrlFrame>,
+    /// Finished frames' emptied patch lists, reused by new frames (see `patch_list`).
+    patch_pool: Vec<Vec<control::Patch>>,
+    /// `br_table`'s forward-target scratch, reused across tables.
+    table_patches: Vec<(usize, control::PatchSlot)>,
     reachable: bool,
     /// Byte offset of the operator currently being translated; recorded per emitted `Op` into
     /// the offsets arena (when retained) so a frame's `ip` maps back to source via DWARF (#29a).
@@ -252,6 +258,8 @@ impl<'a> Translator<'a> {
             local_heights: std::mem::take(&mut scratch.local_heights),
             max_operands: 0,
             ctrl: std::mem::take(&mut scratch.ctrl),
+            patch_pool: std::mem::take(&mut scratch.patch_pool),
+            table_patches: std::mem::take(&mut scratch.table_patches),
             reachable: true,
             cur_offset: 0,
             fusable_cmp: None,
@@ -266,6 +274,8 @@ impl<'a> Translator<'a> {
         self.stack.clear();
         self.local_heights.clear();
         scratch.ctrl = std::mem::take(&mut self.ctrl);
+        scratch.patch_pool = std::mem::take(&mut self.patch_pool);
+        scratch.table_patches = std::mem::take(&mut self.table_patches);
         scratch.stack = std::mem::take(&mut self.stack);
         scratch.local_heights = std::mem::take(&mut self.local_heights);
     }

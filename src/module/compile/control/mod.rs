@@ -31,13 +31,13 @@ struct HandlerClause {
 }
 
 #[derive(Copy, Clone)]
-enum PatchSlot {
+pub(super) enum PatchSlot {
     Single,
     TableCase(u32),
     TableDefault,
 }
 
-struct Patch {
+pub(super) struct Patch {
     op: u32,
     slot: PatchSlot,
 }
@@ -75,14 +75,26 @@ impl Translator<'_> {
         self.ctrl.last().map(|f| f.kind)
     }
 
+    /// An empty patch list for a new frame, reusing a finished frame's: a block's first incoming
+    /// branch would otherwise allocate one, and its `end` free it (most compile-time allocations).
+    pub(super) fn patch_list(&mut self) -> Vec<Patch> {
+        self.patch_pool.pop().unwrap_or_default()
+    }
+
+    pub(super) fn recycle_patches(&mut self, mut patches: Vec<Patch>) {
+        patches.clear();
+        self.patch_pool.push(patches);
+    }
+
     pub(super) fn push_func_frame(&mut self, n_results: u32) {
+        let end_patches = self.patch_list();
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::Block,
             base_height: 0,
             param_count: 0,
             result_count: n_results,
             start_ip: 0,
-            end_patches: Vec::new(),
+            end_patches,
             else_patch: None,
             reachable_on_entry: true,
             end_targeted: false,
@@ -110,13 +122,14 @@ impl Translator<'_> {
         self.clear_fusion();
         let (param_count, result_count) = self.block_arity(bt);
         let base_height = self.block_base(param_count);
+        let end_patches = self.patch_list();
         self.ctrl.push(CtrlFrame {
             kind,
             base_height,
             param_count,
             result_count,
             start_ip: self.next_ip(),
-            end_patches: Vec::new(),
+            end_patches,
             else_patch: None,
             reachable_on_entry: self.reachable,
             end_targeted: false,
@@ -149,13 +162,14 @@ impl Translator<'_> {
         }
         self.clear_fusion();
         let base_height = self.block_base(param_count);
+        let end_patches = self.patch_list();
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::If,
             base_height,
             param_count,
             result_count,
             start_ip: self.next_ip(),
-            end_patches: Vec::new(),
+            end_patches,
             else_patch,
             reachable_on_entry: self.reachable,
             end_targeted: false,
@@ -230,6 +244,7 @@ impl Translator<'_> {
             self.reachable || frame.end_targeted || frame.else_patch.is_some()
         };
         self.reset_after_label(frame.base_height, frame.result_count);
+        self.recycle_patches(frame.end_patches);
         Ok(())
     }
 

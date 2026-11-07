@@ -37,13 +37,14 @@ impl Translator<'_> {
         self.clear_fusion();
         let (param_count, result_count) = self.block_arity(tt.ty);
         let base_height = self.block_base(param_count);
+        let end_patches = self.patch_list();
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::TryTable,
             base_height,
             param_count,
             result_count,
             start_ip: self.next_ip(),
-            end_patches: Vec::new(),
+            end_patches,
             else_patch: None,
             reachable_on_entry: self.reachable,
             end_targeted: false,
@@ -105,6 +106,7 @@ impl Translator<'_> {
         });
         self.reachable = self.reachable || frame.end_targeted;
         self.reset_after_label(base_height, frame.result_count);
+        self.recycle_patches(frame.end_patches);
         Ok(())
     }
 

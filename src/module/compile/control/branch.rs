@@ -74,18 +74,20 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn br_table(&mut self, table: &BrTable<'_>) -> Result<()> {
         let index = self.operand(0);
         self.pop(1);
-        let cases: Vec<u32> = table.targets().collect::<Result<_, _>>().map_err(wp_err)?;
         // Append this table's targets (cases then default) contiguously to the side-table; the
-        // `Op` carries only the `{base, len}` range into it.
+        // `Op` carries only the `{base, len}` range into it. The forward ones are patched at their
+        // frames' ends, collected meanwhile in a buffer reused across tables.
         let base = self.code.br_tables.len() as u32 - self.base.br_tables;
-        let len = cases.len() as u32;
-        let mut patches: Vec<(usize, PatchSlot)> = Vec::new();
-        for (k, &depth) in cases.iter().enumerate() {
-            let (bt, frame) = self.branch_target(depth)?;
+        let mut patches = std::mem::take(&mut self.table_patches);
+        patches.clear();
+        let mut len = 0u32;
+        for (k, depth) in table.targets().enumerate() {
+            let (bt, frame) = self.branch_target(depth.map_err(wp_err)?)?;
             self.push_edge(bt);
             if let Some(i) = frame {
                 patches.push((i, PatchSlot::TableCase(k as u32)));
             }
+            len += 1;
         }
         let (default, default_frame) = self.branch_target(table.default())?;
         self.push_edge(default);
@@ -96,11 +98,12 @@ impl Translator<'_> {
         let s = self.branch_operand(index, default.keep);
         let idx = self.next_ip();
         self.emit(Op::BrTable(BrTableRange { base, len }, s));
-        for (i, slot) in patches {
+        for &(i, slot) in &patches {
             let frame = &mut self.ctrl[i];
             frame.end_patches.push(Patch { op: idx, slot });
             frame.end_targeted = true;
         }
+        self.table_patches = patches;
         self.reachable = false;
         Ok(())
     }
