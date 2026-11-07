@@ -40,12 +40,64 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn br(&mut self, depth: u32) -> Result<()> {
         let (target, patch_frame) = self.branch_target(depth)?;
         self.materialize(u32::from(target.keep));
+        if patch_frame.is_none() && target.keep == 0 {
+            if let Some(rotated) = self.rotated_header(target.ip) {
+                self.emit(rotated);
+            }
+        }
         let top = self.height_slot(0);
         let idx = self.next_ip();
         self.emit(Op::Br(target, top));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.reachable = false;
         Ok(())
+    }
+
+    /// Loop rotation: a back-edge to a loop whose first op is a conditional branch (the usual
+    /// `loop { br_if $exit cond; ...; br $loop }`) first runs that test inverted, staying in the
+    /// loop past it — one dispatch per iteration instead of a jump plus the test. It falls through
+    /// to the plain back-edge, so leaving the loop re-runs the test at its head. Sound because the
+    /// test is the loop's first op and the loop takes no values: its operands are locals or
+    /// immediates (anything pushed inside the loop would need an op before it), which hold the same
+    /// values at the back-edge as on arrival at the head.
+    fn rotated_header(&self, header: u32) -> Option<Op> {
+        let body = header.checked_add(1)?;
+        let stay = BranchTarget {
+            ip: body,
+            keep: 0,
+            pop: 0,
+        };
+        Some(match *self.op_get(header)? {
+            Op::BrIfCmp {
+                kind,
+                negate,
+                lhs,
+                rhs,
+                ..
+            } => Op::BrIfCmp {
+                kind,
+                negate: !negate,
+                ip: body,
+                lhs,
+                rhs,
+            },
+            Op::BrIfCmpImm {
+                kind,
+                negate,
+                lhs,
+                imm,
+                ..
+            } => Op::BrIfCmpImm {
+                kind,
+                negate: !negate,
+                ip: body,
+                lhs,
+                imm,
+            },
+            Op::BrIf(t, s) if t.keep == 0 => Op::BrIfNot(stay, s),
+            Op::BrIfNot(t, s) if t.keep == 0 => Op::BrIf(stay, s),
+            _ => return None,
+        })
     }
 
     pub(in crate::module::compile) fn br_if(&mut self, depth: u32) -> Result<()> {

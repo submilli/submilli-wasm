@@ -143,18 +143,22 @@ impl Translator<'_> {
         if self.reachable {
             let s = self.operand(0); // the condition (the branch keeps nothing: any slot)
             self.pop(1);
-            self.materialize_locals();
             let target = BranchTarget {
                 ip: 0,
                 keep: 0,
                 pop: 0,
             };
-            // Fuse `relop; if` into one negated compare-and-branch (see `br_if`).
-            let fused = self.fusable_cmp.take();
-            if let Some((kind, lhs, rhs, _)) = fused.filter(|f| f.3 == s) {
-                let idx = self.next_ip() - 1;
-                *self.op_mut(idx) = fused_branch(kind, true, target, lhs, rhs);
-                else_patch = Some(idx);
+            // Fuse `relop; if` into one negated compare-and-branch (see `br_if`). The block entry's
+            // local copies must precede the branch, so the relop is lifted out and re-emitted fused
+            // after them: they write only the slots of entries below its operands and result.
+            let fused = self.fusable_cmp.take().filter(|f| f.3 == s);
+            let lifted = fused.and_then(|_| self.unemit_last());
+            self.materialize_locals();
+            if let (Some((kind, lhs, rhs, _)), Some(offset)) = (fused, lifted) {
+                else_patch = Some(self.next_ip());
+                let at = std::mem::replace(&mut self.cur_offset, offset);
+                self.emit(fused_branch(kind, true, target, lhs, rhs));
+                self.cur_offset = at;
             } else {
                 else_patch = Some(self.next_ip());
                 self.emit(Op::BrIfNot(target, s));

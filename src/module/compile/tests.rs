@@ -325,3 +325,59 @@ fn compare_against_constant_fuses_into_one_branch() {
         }]
     ));
 }
+
+#[test]
+fn loop_back_edge_runs_the_header_test_inverted() {
+    let (sigs, ft) = one((&[ValType::I32], &[]));
+    let ops = compile_one(
+        "(module (func (param i32)
+            (block (loop
+                (br_if 1 (i32.eqz (local.get 0)))
+                (local.set 0 (i32.sub (local.get 0) (i32.const 1)))
+                (br 0)))))",
+        &sigs,
+        &ft,
+        0,
+    )
+    .unwrap();
+    // head: exit if zero; body; back-edge: stay (to the body) if nonzero, else fall to the head.
+    assert!(matches!(
+        ops.as_slice(),
+        [
+            Op::BrIfNot(BranchTarget { ip: 4, .. }, 0),
+            Op::I32AddImm(0, 0, -1),
+            Op::BrIf(BranchTarget { ip: 1, .. }, 0),
+            Op::Br(BranchTarget { ip: 0, .. }, _),
+        ]
+    ));
+}
+
+#[test]
+fn relop_fuses_into_if_past_the_block_entry_copies() {
+    let (sigs, ft) = one((&[ValType::I32, ValType::I32], &[ValType::I32]));
+    let ops = compile_one(
+        "(module (func (param i32 i32) (result i32)
+            local.get 1
+            (if (result i32) (i32.eq (local.get 0) (local.get 1))
+                (then (i32.const 7)) (else (i32.const 9)))
+            i32.add))",
+        &sigs,
+        &ft,
+        0,
+    )
+    .unwrap();
+    // The pending `local.get 1` is copied to its own slot first; the compare still fuses.
+    assert!(matches!(
+        ops.as_slice(),
+        [
+            Op::Copy(2, 1),
+            Op::BrIfCmp {
+                kind: CmpKind::Eq,
+                negate: true,
+                lhs: 0,
+                ..
+            },
+            ..
+        ]
+    ));
+}

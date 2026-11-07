@@ -296,6 +296,11 @@ impl<'a> Translator<'a> {
         self.code.ops.get_mut(at as usize)
     }
 
+    /// [`op_ref`](Self::op_ref), checked (loop rotation's header lookup).
+    fn op_get(&self, idx: u32) -> Option<&Op> {
+        self.code.ops.get(self.base.ops.checked_add(idx)? as usize)
+    }
+
     fn op_ref(&self, idx: u32) -> &Op {
         &self.code.ops[(self.base.ops + idx) as usize]
     }
@@ -401,6 +406,20 @@ impl<'a> Translator<'a> {
         self.fusable_cmp = None;
         self.fusable_dst = None;
         self.pending_const = None;
+    }
+
+    /// Removes the last emitted op of this function, returning its source offset.
+    fn unemit_last(&mut self) -> Option<u32> {
+        if self.next_ip() == 0 {
+            return None;
+        }
+        self.code.ops.pop()?;
+        let offset = if self.retain_offsets {
+            self.code.offsets.pop()
+        } else {
+            None
+        };
+        Some(offset.unwrap_or(self.cur_offset))
     }
 
     /// Removes the last emitted op if it is `i32.const k` into `dst` (an immediate form takes its
