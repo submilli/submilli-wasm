@@ -1,9 +1,9 @@
 //! Operand-stack operations on [`Execution`]: typed pushes/pops over the untyped [`Cell`] slots,
-//! with the GC root shadow (`RefTag` per slot) maintained in lockstep. The `Cell`/`RefTag` types
+//! with the GC root shadow (a `RefTag` stored with each slot's cell). The `Cell`/`RefTag` types
 //! and the `Val` codec live in [`super::cell`].
 
-// Little-endian (un)packing is intentional narrowing; operand-stack / local indexing is
-// bounds-guaranteed by validation (stack height - #33).
+// Little-endian (un)packing is intentional narrowing; the few direct slot indexes follow an
+// explicit `ensure_operands` bound check.
 #![allow(
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
@@ -13,7 +13,7 @@
 
 use super::cell::{
     decode, encode, refkind_of_heap, refkind_of_irheap, stack_slot_for_field, Cell, RefTag,
-    SLOT_BYTES,
+    TaggedCell, SLOT_BYTES,
 };
 
 /// Direct cell → `Val` for the host boundary: one match on the type instead of the layered
@@ -42,11 +42,6 @@ fn encode_val(v: Val) -> Cell {
     }
 }
 #[cold]
-fn lockstep_error() -> crate::Error {
-    InternalError::OperandStack("value/shadow length mismatch").into()
-}
-
-#[cold]
 fn underflow_error() -> crate::Error {
     InternalError::OperandStack("operand stack underflow").into()
 }
@@ -62,9 +57,11 @@ fn scalar_tag_error() -> crate::Error {
 }
 
 /// Clears the root-shadow tags of the dead slots `range` (an empty range is a no-op).
-fn clear_tags(shadow: &mut [RefTag], range: std::ops::Range<usize>) {
-    if let Some(dead) = shadow.get_mut(range) {
-        dead.fill(RefTag::NONE);
+fn clear_tags(slots: &mut [TaggedCell], range: std::ops::Range<usize>) {
+    if let Some(dead) = slots.get_mut(range) {
+        for slot in dead {
+            slot.tag = RefTag::NONE;
+        }
     }
 }
 
@@ -89,9 +86,9 @@ impl Execution {
     }
 
     /// Index of the lowest of the top `needed` operands of the current stack window (`sp`; see
-    /// [`enter_window`](Self::enter_window)), refusing to pop below the current frame's
-    /// floor or to proceed with the value/shadow stacks out of lockstep (both impossible for
-    /// validated code; corrupt bytecode must still fail closed, not read the caller's operands).
+    /// [`enter_window`](Self::enter_window)), refusing to pop below the current frame's floor
+    /// (impossible for validated code; corrupt bytecode must still fail closed, not read the
+    /// caller's operands).
     /// Kept to two compares against cached state: walking the frame stack here on every op once
     /// cost ~30% of CoreMark.
     #[allow(clippy::inline_always)] // called by nearly every op; must not stay an out-of-line call
@@ -104,10 +101,7 @@ impl Execution {
                 .map_or(usize::MAX, |frame| frame.operand_base as usize),
             "stale cached frame floor (a frame push/pop skipped `sync_floor`)"
         );
-        let len = self.values.len();
-        if len != self.shadow.len() {
-            return Err(lockstep_error());
-        }
+        let len = self.slots.len();
         match self.sp.checked_sub(needed) {
             Some(base) if base >= self.floor && self.sp <= len => Ok(base),
             _ => Err(underflow_error()),
@@ -115,9 +109,8 @@ impl Execution {
     }
 
     /// [`ensure_operands`](Self::ensure_operands) for numeric ops, also refusing reference-tagged
-    /// operands: the in-place helpers (`binop_cells`/`unop_cell`) keep the first operand's shadow
-    /// tag, so a reference reaching a numeric op would leave a scalar result tagged as a GC root.
-    /// Impossible for validated code; corrupt bytecode must fail closed.
+    /// operands: a numeric op reading a reference would decode a handle as a number. Impossible
+    /// for validated code; corrupt bytecode must fail closed.
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn ensure_scalar_operands(&self, needed: usize) -> Result<usize> {
@@ -131,28 +124,20 @@ impl Execution {
         Ok(base)
     }
 
-    /// The shadow tag at `i`. Fallible: a broken value/shadow invariant must surface as an error,
-    /// never a panic.
+    /// The shadow tag at `i` (out of range is an error, never a panic).
     #[allow(clippy::inline_always)]
     #[inline(always)]
     fn tag_at(&self, i: usize) -> Result<RefTag> {
-        self.shadow
+        self.slots
             .get(i)
-            .copied()
-            .ok_or_else(|| InternalError::OperandStack("value/shadow length mismatch").into())
-    }
-
-    /// The shadow tags from `base` up (see [`tag_at`](Self::tag_at)).
-    fn tags_from(&self, base: usize) -> Result<&[RefTag]> {
-        self.shadow
-            .get(base..)
-            .ok_or_else(|| InternalError::OperandStack("value/shadow length mismatch").into())
+            .map(|slot| slot.tag)
+            .ok_or_else(slot_error)
     }
 
     #[inline]
     fn pop_scalar(&mut self) -> Result<Cell> {
         let base = self.ensure_scalar_operands(1)?;
-        let cell = self.values[base];
+        let cell = self.slots[base].cell;
         self.sp = base;
         Ok(cell)
     }
@@ -164,14 +149,13 @@ impl Execution {
     #[inline]
     fn push_slot(&mut self, cell: Cell, tag: RefTag) {
         let sp = self.sp;
-        if let (Some(slot), Some(slot_tag)) = (self.values.get_mut(sp), self.shadow.get_mut(sp)) {
-            *slot = cell;
-            *slot_tag = tag;
+        let entry = TaggedCell { cell, tag };
+        if let Some(slot) = self.slots.get_mut(sp) {
+            *slot = entry;
         } else {
-            self.values.push(cell);
-            self.shadow.push(tag);
+            self.slots.push(entry);
         }
-        self.sp = self.values.len().min(sp.saturating_add(1));
+        self.sp = self.slots.len().min(sp.saturating_add(1));
     }
 
     /// Writes a local's default value to slot `at` (locals init on every call): scalars and
@@ -192,10 +176,13 @@ impl Execution {
     #[allow(clippy::inline_always)]
     #[inline(always)]
     pub(super) fn scalar_at(&self, at: usize) -> Result<Cell> {
-        match (self.values.get(at), self.shadow.get(at)) {
-            (Some(&cell), Some(&RefTag::NONE)) => Ok(cell),
-            (Some(_), Some(_)) => Err(scalar_tag_error()),
-            _ => Err(slot_error()),
+        match self.slots.get(at) {
+            Some(&TaggedCell {
+                cell,
+                tag: RefTag::NONE,
+            }) => Ok(cell),
+            Some(_) => Err(scalar_tag_error()),
+            None => Err(slot_error()),
         }
     }
 
@@ -203,21 +190,19 @@ impl Execution {
     #[allow(clippy::inline_always)]
     #[inline(always)]
     pub(super) fn set_scalar(&mut self, at: usize, cell: Cell) -> Result<()> {
-        match (self.values.get_mut(at), self.shadow.get_mut(at)) {
-            (Some(slot), Some(tag)) => {
-                *slot = cell;
-                *tag = RefTag::NONE;
-                Ok(())
-            }
-            _ => Err(slot_error()),
-        }
+        let slot = self.slots.get_mut(at).ok_or_else(slot_error)?;
+        *slot = TaggedCell {
+            cell,
+            tag: RefTag::NONE,
+        };
+        Ok(())
     }
 
     /// Enters a stack-window op whose operands end at absolute index `top`: its handler then
     /// pops/pushes relative to `sp`. Also the frame's GC safepoint: everything up to `top` is live.
     #[inline]
     pub(super) fn enter_window(&mut self, top: usize) -> Result<()> {
-        if top > self.values.len() || top < self.floor {
+        if top > self.slots.len() || top < self.floor {
             return Err(slot_error());
         }
         self.sp = top;
@@ -390,7 +375,7 @@ impl Execution {
     #[inline]
     pub(super) fn pop(&mut self) -> Result<Cell> {
         let base = self.ensure_operands(1)?;
-        let cell = self.values[base];
+        let cell = self.slots[base].cell;
         self.sp = base;
         Ok(cell)
     }
@@ -410,32 +395,29 @@ impl Execution {
     /// The cell + shadow tag at operand index `i` (a `local.get` source).
     #[inline]
     pub(super) fn cell_at(&self, i: usize) -> Result<(Cell, RefTag)> {
-        let cell = self
-            .values
+        let slot = self
+            .slots
             .get(i)
-            .copied()
             .ok_or(InternalError::OperandStack("local index out of bounds"))?;
-        Ok((cell, self.tag_at(i)?))
+        Ok((slot.cell, slot.tag))
     }
 
     /// Writes a cell + shadow tag at operand index `i` (a `local.set`/`local.tee` target).
     #[inline]
     pub(super) fn set_cell(&mut self, i: usize, cell: Cell, tag: RefTag) -> Result<()> {
-        match (self.values.get_mut(i), self.shadow.get_mut(i)) {
-            (Some(slot), Some(slot_tag)) => {
-                *slot = cell;
-                *slot_tag = tag;
-                Ok(())
-            }
-            _ => Err(InternalError::OperandStack("local index out of bounds").into()),
-        }
+        let slot = self
+            .slots
+            .get_mut(i)
+            .ok_or(InternalError::OperandStack("local index out of bounds"))?;
+        *slot = TaggedCell { cell, tag };
+        Ok(())
     }
 
     /// The top operand as an `i32` without popping (an `array.new*` count peek).
     #[inline]
     pub(super) fn top_i32(&self) -> Result<i32> {
         let base = self.ensure_scalar_operands(1)?;
-        Ok(self.values[base].unwrap_i32())
+        Ok(self.slots[base].cell.unwrap_i32())
     }
 
     #[inline]
@@ -506,43 +488,39 @@ impl Execution {
     #[inline]
     pub(super) fn pop_params_into(&mut self, tys: &[ValType], out: &mut Vec<Val>) -> Result<()> {
         let base = self.ensure_operands(tys.len())?;
-        for (tag, ty) in self.tags_from(base)?.iter().zip(tys) {
-            if *tag != Self::expected_tag(ty) {
-                return Err(InternalError::OperandStack("host parameter tag mismatch").into());
-            }
+        let args = self.slots.get(base..).ok_or_else(slot_error)?;
+        if args
+            .iter()
+            .zip(tys)
+            .any(|(slot, ty)| slot.tag != Self::expected_tag(ty))
+        {
+            return Err(InternalError::OperandStack("host parameter tag mismatch").into());
         }
-        out.extend(
-            self.values[base..]
-                .iter()
-                .zip(tys)
-                .map(|(&c, t)| decode(c, t)),
-        );
+        out.extend(args.iter().zip(tys).map(|(slot, t)| decode(slot.cell, t)));
         self.sp = base;
         Ok(())
     }
 
-    /// Checks the completed call's exact result count and shadow tags before either stack is
+    /// Checks the completed call's exact result count and shadow tags before the buffer is
     /// mutated. The signature is the only type information available for the untyped cells.
     pub(super) fn validate_result_tags(&self, base: usize, tys: &[ValType]) -> Result<()> {
-        if self.values.len() != self.shadow.len() || base > self.values.len() {
+        let Some(results) = self.slots.get(base..) else {
             return Err(InternalError::OperandStack("invalid result stack boundary").into());
-        }
-        let tags = &self.shadow[base..];
-        if tags.len() != tys.len() {
+        };
+        if results.len() != tys.len() {
             return Err(InternalError::ResultShape("wrong number of execution results").into());
         }
-        if tags
+        if results
             .iter()
             .zip(tys)
-            .any(|(tag, ty)| *tag != Self::expected_tag(ty))
+            .any(|(slot, ty)| slot.tag != Self::expected_tag(ty))
         {
             return Err(InternalError::ResultShape("execution result tag mismatch").into());
         }
         Ok(())
     }
 
-    /// Borrowing [`push_results`](Self::push_results) (the reused scratch buffer survives).
-    /// Indexed loops for the same reason as [`pop_params_into`](Self::pop_params_into).
+    /// Pushes a host call's results from the reused scratch buffer (which survives).
     #[inline]
     pub(super) fn push_results_slice(&mut self, results: &[Val]) {
         for v in results {
@@ -556,12 +534,6 @@ impl Execution {
     /// collection may free its referent, and no later scan — notably a widened one
     /// (`widen_top_live_range`) — may trace a freed handle.
     pub(crate) fn operand_roots(&mut self) -> Result<Vec<(u32, RefKind)>> {
-        if self.values.len() != self.shadow.len() {
-            return Err(InternalError::OperandStack(
-                "value/shadow length mismatch during root scan",
-            )
-            .into());
-        }
         let mut roots = Vec::new();
         let (mut prev_base, mut dead_from) = (0, 0);
         for frame in &self.frames {
@@ -573,20 +545,18 @@ impl Execution {
                 );
             }
             prev_base = base;
-            let (Some(cells), Some(tags)) =
-                (self.values.get(base..end), self.shadow.get(base..end))
-            else {
+            let Some(live) = self.slots.get(base..end) else {
                 return Err(InternalError::OperandStack("frame live range out of bounds").into());
             };
-            roots.extend(cells.iter().zip(tags).filter_map(|(cell, tag)| {
-                let kind = tag.refkind()?;
-                (!cell.is_null()).then(|| (cell.handle(), kind))
+            roots.extend(live.iter().filter_map(|slot| {
+                let kind = slot.tag.refkind()?;
+                (!slot.cell.is_null()).then(|| (slot.cell.handle(), kind))
             }));
-            clear_tags(&mut self.shadow, dead_from..base);
+            clear_tags(&mut self.slots, dead_from..base);
             dead_from = dead_from.max(end);
         }
-        let len = self.shadow.len();
-        clear_tags(&mut self.shadow, dead_from..len);
+        let len = self.slots.len();
+        clear_tags(&mut self.slots, dead_from..len);
         Ok(roots)
     }
 }

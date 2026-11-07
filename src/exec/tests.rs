@@ -150,21 +150,27 @@ fn operand_underflow_bypasses_guest_catch_all() {
     assert!(!error.is::<super::exn::PendingException>());
 }
 
+/// A slot whose tag contradicts its use (a numeric read of a reference-tagged slot) fails closed,
+/// a failed pop leaves the stack untouched, and the store recovers for the next call.
 #[test]
-fn inconsistent_operand_shadow_fails_without_partial_pop() {
+fn corrupt_slot_tag_fails_closed() {
     let (engine, code) = compile_wat("(module (func (param i32)))", &[ValType::I32], &[]).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance { index: 0, store: 0 };
     let (mut exec, boundary) =
         host::enter(&mut store, instance, 0, code.clone(), &[Val::I32(7)]).unwrap();
-    exec.shadow.pop();
-    let values_before = exec.values.len();
+    let param = exec.top_frame().unwrap().locals_base as usize;
+    exec.slots.get_mut(param).unwrap().tag =
+        super::cell::RefTag::of_refkind(crate::canon::RefKind::Any);
 
-    let error = exec.pop().unwrap_err();
+    let error = exec.scalar_at(param).unwrap_err();
+    assert!(error.is::<crate::error::InternalError>());
+    let (sp, len) = (exec.sp, exec.slots.len());
+    let error = exec.pop_i32().unwrap_err();
     assert!(error.is::<crate::error::InternalError>());
     assert_eq!(
-        exec.values.len(),
-        values_before,
+        (exec.sp, exec.slots.len()),
+        (sp, len),
         "failed pop must be transactional"
     );
     let error = host::finish(&mut store, exec, &boundary, &[], Err(error)).unwrap_err();

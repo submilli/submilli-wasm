@@ -127,7 +127,7 @@ pub(super) fn enter<T>(
     exec.trim_to_live(); // a parked call's buffer may extend past its live top
     exec.stack_limit = store.inner.engine().max_wasm_stack();
     exec.gates_passed = false; // defensive: a recycled execution never carries it over
-    let value_base = exec.values.len();
+    let value_base = exec.slots.len();
     let stop_depth = exec.frames.len();
     let delim = if stop_depth == 0 {
         Delimiter::TopLevel
@@ -354,8 +354,7 @@ impl Execution {
         // then sits above its `end`; that's fine only because nothing can re-enter — and trim —
         // before `take_results`: only the async GC-pressure check runs in between.)
         if self.frames.len() == stop_depth {
-            self.values.truncate(self.sp);
-            self.shadow.truncate(self.sp);
+            self.slots.truncate(self.sp);
         }
         // A safepoint: the results are live (e.g. for the async driver's GC-pressure check).
         let live = self.set_live_end(self.sp);

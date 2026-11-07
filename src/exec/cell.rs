@@ -31,10 +31,31 @@ pub(super) const SLOT_BYTES: usize = 8;
 #[derive(Copy, Clone, Debug)]
 pub(super) struct Cell([u8; SLOT_BYTES]);
 
-/// The reference-hierarchy tag stored in the operand-stack root shadow (one per slot, `Copy` so it
-/// moves with the cell stack's `copy_within`). [`NONE`](RefTag::NONE) marks a non-reference slot;
+/// One operand slot as stored: its value and its root-shadow tag together, so an access is one
+/// bounds check on one vector. Both fields are byte-aligned, so the record packs to
+/// `SLOT_BYTES + 1` bytes — the same as separate value and tag vectors (a 16-byte padded record
+/// measured only 1–4% faster).
+#[derive(Copy, Clone, Debug)]
+pub(super) struct TaggedCell {
+    pub cell: Cell,
+    pub tag: RefTag,
+}
+
+impl TaggedCell {
+    /// A zeroed scalar slot (fresh operand-buffer growth).
+    pub(super) const ZERO: TaggedCell = TaggedCell {
+        cell: Cell([0u8; SLOT_BYTES]),
+        tag: RefTag::NONE,
+    };
+}
+
+const _: () = assert!(std::mem::size_of::<TaggedCell>() == SLOT_BYTES + 1);
+
+/// The reference-hierarchy tag stored with each operand slot's value (the root shadow, `Copy` so it
+/// moves with the slot in `copy_within`). [`NONE`](RefTag::NONE) marks a non-reference slot;
 /// the others say which arena a live handle points into, so the tracing collector decodes and
-/// traces it (#27g). A compact newtype, not the `RefKind` enum, so the shadow stays a byte vector.
+/// traces it (#27g). A compact one-byte newtype, not the `RefKind` enum, so a slot stays
+/// `SLOT_BYTES + 1` bytes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(super) struct RefTag(u8);
 

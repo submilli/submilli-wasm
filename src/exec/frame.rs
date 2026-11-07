@@ -2,7 +2,7 @@
 //! rather than holding the module (its instance does): the run loop keeps one [`Code`] handle for
 //! the running frame and re-points it on a frame switch, cloning only when the module changes.
 
-use super::cell::{Cell, RefTag, SLOT_BYTES};
+use super::cell::TaggedCell;
 use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::code::{Code, Span};
@@ -41,7 +41,7 @@ pub(crate) struct Frame {
     pub func: FrameFunc,
     /// Resume point in `code.ops` (saved when this frame makes a call).
     pub ip: u32,
-    /// Index into `Execution.values` where this frame's locals (slot 0) begin.
+    /// Index into `Execution.slots` where this frame's locals (slot 0) begin.
     pub locals_base: u32,
     /// First operand-stack slot above this frame's parameters and locals.
     pub operand_base: u32,
@@ -131,7 +131,7 @@ impl super::Execution {
         let local_types = code.local_types_of(&func);
         let geometry = frame_geometry(args_at, &func, local_types.len())?;
         let args_end = args_at.saturating_add(func.n_params as usize);
-        if args_at < self.floor || args_end > self.values.len() {
+        if args_at < self.floor || args_end > self.slots.len() {
             return Err(InternalError::OperandStack("call arguments out of place").into());
         }
         let end = geometry.end.max(self.live_top());
@@ -167,15 +167,14 @@ impl super::Execution {
         if self.stack_bytes_for(end, frames)? >= self.stack_limit {
             return Err(Trap::StackOverflow.into());
         }
-        let extra = end.saturating_sub(self.values.len());
+        let extra = end.saturating_sub(self.slots.len());
         if extra == 0 {
             return Ok(());
         }
-        if self.values.try_reserve(extra).is_err() || self.shadow.try_reserve(extra).is_err() {
+        if self.slots.try_reserve(extra).is_err() {
             return Err(Trap::StackOverflow.into());
         }
-        self.values.resize(end, Cell::of_bytes([0u8; SLOT_BYTES]));
-        self.shadow.resize(end, RefTag::NONE);
+        self.slots.resize(end, TaggedCell::ZERO);
         Ok(())
     }
 
@@ -188,8 +187,7 @@ impl super::Execution {
     /// arguments and boundary there.
     pub(super) fn trim_to_live(&mut self) {
         let top = self.live_top();
-        self.values.truncate(top);
-        self.shadow.truncate(top);
+        self.slots.truncate(top);
     }
 
     /// Pushes a [`Delimiter`] boundary marker (no slots, inert `code`/`instance` filler) at the
@@ -202,10 +200,7 @@ impl super::Execution {
         instance: Instance,
         code: &Code,
     ) -> crate::Result<()> {
-        if self.values.len() != self.shadow.len() {
-            return Err(InternalError::OperandStack("value/shadow length mismatch").into());
-        }
-        let base = to_u32(self.values.len())?;
+        let base = to_u32(self.slots.len())?;
         let func = FrameFunc::of(&code.func());
         self.frames.push(Frame {
             module: code.key(),
@@ -238,7 +233,7 @@ impl super::Execution {
         }
         let src = top
             .checked_sub(usize::from(t.keep))
-            .filter(|&src| src >= self.floor && top <= self.values.len())
+            .filter(|&src| src >= self.floor && top <= self.slots.len())
             .ok_or(InternalError::OperandStack("branch fixup out of range"))?;
         if t.pop == 0 {
             return Ok(());
@@ -255,8 +250,8 @@ impl super::Execution {
     /// Copies `n` slots (values and their root-shadow tags) from `src` down to `dst`.
     #[inline]
     fn move_slots(&mut self, src: usize, dst: usize, n: usize) -> crate::Result<()> {
-        let end = src.checked_add(n).filter(|&end| end <= self.values.len());
-        if end.is_none() || dst > src || self.shadow.len() != self.values.len() {
+        let end = src.checked_add(n).filter(|&end| end <= self.slots.len());
+        if end.is_none() || dst > src {
             return Err(InternalError::OperandStack("slot move out of range").into());
         }
         match n {
@@ -266,8 +261,7 @@ impl super::Execution {
                 self.set_cell(dst, cell, tag)?;
             }
             _ => {
-                self.values.copy_within(src..src + n, dst);
-                self.shadow.copy_within(src..src + n, dst);
+                self.slots.copy_within(src..src + n, dst);
             }
         }
         Ok(())
@@ -345,9 +339,7 @@ impl super::Execution {
         let finished = self.frames.len() == stop_depth;
         if finished {
             // Back at the call's boundary: its results must end the buffer.
-            let end = dst.saturating_add(n);
-            self.values.truncate(end);
-            self.shadow.truncate(end);
+            self.slots.truncate(dst.saturating_add(n));
         }
         Ok(finished)
     }

@@ -948,3 +948,20 @@ Cumulative vs `main`: CoreMark **3.28×** (simd 3.36×), loops 3.9–5.0× (simd
 (simd 1.72×), per call 5.5× (simd 5.2×). Estimated gap to wasmi 2.0 on wasm.fyi: CoreMark ~3.8×,
 loops ~3.5–4.3×, fib ~5.3×, per call ~3.8×. `Module::new`: **+19–22% vs `main`** (immediates
 +4.5%); the compile-profiling pass is owed.
+
+## 19. Session 7 — one slot vector (value + tag)
+
+The operand buffer was two parallel vectors (`Vec<Cell>` + `Vec<RefTag>`): every slot access
+bounds-checked both and reloaded both headers after each slot write. Now one `Vec<TaggedCell>`;
+the record packs to `SLOT_BYTES + 1` bytes (both fields byte-aligned), so memory is unchanged, and
+the value/shadow lockstep checks are gone (that state can no longer exist).
+
+**Measured** (cycles, M4 Pro) vs 2c: CoreMark 1.05×, per call 1.09×, others flat (instructions
+−2 to −7%; the unaligned 9-byte stride gives part back). A 16-byte padded record measured 1–4%
+faster still — not worth 1.8× the operand memory. Checking a three-address op's slots once
+(then plain indexing) gained nothing: LLVM was already folding most of it.
+
+**Where CoreMark's time goes now:** the dispatch loop ~46% (`match` + back-edge), scalar slot
+reads ~14%, and **memory access ~25%** — every load/store resolves its memory through the store
+twice (instance → memories[i] → memory entity, each an arena lookup with a store-id check). That
+is the next lever for the memory-heavy workloads.

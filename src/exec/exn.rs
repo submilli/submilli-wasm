@@ -162,7 +162,7 @@ impl Execution {
             .ok_or(InternalError::OperandStack(
                 "exception restore height overflow",
             ))? as usize;
-        if self.values.len() != self.shadow.len() || restore > self.values.len() {
+        if restore > self.slots.len() {
             return Err(InternalError::OperandStack(
                 "exception restore height exceeds operand stack",
             )

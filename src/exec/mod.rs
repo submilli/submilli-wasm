@@ -66,12 +66,11 @@ use outcome::{CallReq, ResolvedCall, StepOutcome, CONTROL};
 /// where the driver awaits with this state at rest. See ARCHITECTURE §2.4.
 #[derive(Debug)]
 pub(crate) struct Execution {
-    values: Vec<cell::Cell>,
-    /// Per-operand-slot reference tag ([`cell::RefTag`]), parallel to `values` (same length, moved
-    /// in lockstep). The cell stack is untyped, so this byte-shadow is how a tracing collector
-    /// recovers operand/local roots (ARCHITECTURE §7/§14, #27g). Maintained unconditionally; cheap
-    /// (1 B/slot) and far simpler to keep exhaustive than gating per-op.
-    shadow: Vec<cell::RefTag>,
+    /// The operand buffer: every frame's locals and operands, each slot its untyped cell plus its
+    /// reference tag ([`cell::RefTag`]). The cells are untyped, so the tag (the root shadow) is
+    /// how a tracing collector recovers operand/local roots (ARCHITECTURE §7/§14, #27g); keeping
+    /// them in one record makes every slot access a single bounds check.
+    slots: Vec<cell::TaggedCell>,
     frames: Vec<Frame>,
     /// Count of live [`Delimiter::HostReentry`] boundaries on `frames` — the host→wasm crossings
     /// nested on the *native* Rust stack. Each is charged [`HOST_REENTRY_RESERVE`] in `stack_bytes`
@@ -134,8 +133,7 @@ const _: fn() = || {
 impl Default for Execution {
     fn default() -> Self {
         Execution {
-            values: Vec::new(),
-            shadow: Vec::new(),
+            slots: Vec::new(),
             frames: Vec::new(),
             host_reentry_depth: 0,
             floor: usize::MAX,
@@ -150,7 +148,7 @@ impl Default for Execution {
 
 impl Execution {
     pub(crate) fn is_empty(&self) -> bool {
-        self.frames.is_empty() && self.values.is_empty() && self.shadow.is_empty()
+        self.frames.is_empty() && self.slots.is_empty()
     }
 
     /// Whether nothing at all survives from earlier calls — the condition for a store to reuse
@@ -164,17 +162,15 @@ impl Execution {
 
     /// Heap bytes held by the stacks' capacity (bounds what a store keeps between calls).
     pub(crate) fn retained_bytes(&self) -> usize {
-        let values = self
-            .values
+        let slots = self
+            .slots
             .capacity()
-            .saturating_mul(std::mem::size_of::<cell::Cell>());
+            .saturating_mul(std::mem::size_of::<cell::TaggedCell>());
         let frames = self
             .frames
             .capacity()
             .saturating_mul(std::mem::size_of::<Frame>());
-        values
-            .saturating_add(self.shadow.capacity())
-            .saturating_add(frames)
+        slots.saturating_add(frames)
     }
 
     /// Enters a (sub-)call on the shared stacks: a [`Delimiter`] boundary, the call's `args`, then
@@ -188,7 +184,7 @@ impl Execution {
         code: Code,
         args: &[Val],
     ) -> Result<()> {
-        let value_base = self.values.len();
+        let value_base = self.slots.len();
         let frame_base = self.frames.len();
         let old_reentry_depth = self.host_reentry_depth;
         if delim == Delimiter::HostReentry {
@@ -201,11 +197,12 @@ impl Execution {
             self.host_reentry_depth = old_reentry_depth;
             return Err(error);
         }
-        self.shadow.extend(args.iter().map(cell::RefTag::of_val));
-        self.values.extend(args.iter().map(|&v| cell::encode(v)));
+        self.slots.extend(args.iter().map(|&v| cell::TaggedCell {
+            cell: cell::encode(v),
+            tag: cell::RefTag::of_val(&v),
+        }));
         if let Err(error) = self.push_call(instance, func_index, &code, value_base) {
-            self.values.truncate(value_base);
-            self.shadow.truncate(value_base);
+            self.slots.truncate(value_base);
             self.frames.truncate(frame_base);
             self.sync_floor();
             self.host_reentry_depth = old_reentry_depth;
@@ -244,23 +241,19 @@ impl Execution {
         stop_depth: usize,
         result_tys: &[ValType],
     ) -> Result<Vec<Val>> {
-        if self.values.len() != self.shadow.len()
-            || value_base > self.values.len()
-            || stop_depth > self.frames.len()
-        {
+        if value_base > self.slots.len() || stop_depth > self.frames.len() {
             return Err(InternalError::FrameStack("invalid completed call boundary").into());
         }
         self.validate_result_tags(value_base, result_tys)?;
         self.code = None;
         self.release_reentry(stop_depth)?;
-        let cells = self.values.get(value_base..).unwrap_or_default();
+        let cells = self.slots.get(value_base..).unwrap_or_default();
         let results = cells
             .iter()
             .zip(result_tys)
-            .map(|(&cell, ty)| cell::decode(cell, ty))
+            .map(|(slot, ty)| cell::decode(slot.cell, ty))
             .collect();
-        self.values.truncate(value_base);
-        self.shadow.truncate(value_base);
+        self.slots.truncate(value_base);
         self.frames.truncate(stop_depth);
         self.sync_floor();
         Ok(results)
@@ -269,17 +262,12 @@ impl Execution {
     /// On a trap / uncaught exception in a (sub-)call: discards its frames and operands, restoring
     /// the shared stacks to the parked outer state so that call resumes pristine.
     pub(crate) fn discard_to(&mut self, value_base: usize, stop_depth: usize) -> Result<()> {
-        if self.values.len() != self.shadow.len()
-            || value_base > self.values.len()
-            || value_base > self.shadow.len()
-            || stop_depth > self.frames.len()
-        {
+        if value_base > self.slots.len() || stop_depth > self.frames.len() {
             return Err(InternalError::FrameStack("invalid failed call boundary").into());
         }
         self.release_reentry(stop_depth)?;
         self.code = None;
-        self.values.truncate(value_base);
-        self.shadow.truncate(value_base);
+        self.slots.truncate(value_base);
         self.frames.truncate(stop_depth);
         self.sync_floor();
         Ok(())
@@ -314,11 +302,11 @@ impl Execution {
         self.stack_bytes_for(self.live_top(), self.frames.len())
     }
 
-    /// [`stack_bytes`](Self::stack_bytes) for a prospective `values`-slot buffer and `frames`
+    /// [`stack_bytes`](Self::stack_bytes) for a prospective `slots`-slot buffer and `frames`
     /// frames.
     #[inline]
-    fn stack_bytes_for(&self, values: usize, frames: usize) -> Result<usize> {
-        let values = values
+    fn stack_bytes_for(&self, slots: usize, frames: usize) -> Result<usize> {
+        let values = slots
             .checked_mul(SLOT_CHARGE)
             .ok_or(InternalError::FrameStack(
                 "operand stack byte size overflow",
