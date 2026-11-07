@@ -30,6 +30,20 @@ impl StoreInner {
         self.memories.get_mut(handle.index)
     }
 
+    /// The memory at `index`, which must be the arena index of a [`Memory`] handle of *this* store
+    /// whose store was already checked — no store check here (the execution's memory-0 cache).
+    /// `None` if there is none.
+    #[inline]
+    pub(crate) fn resolved_memory(&self, index: u32) -> Option<&MemoryEntity> {
+        self.memories.get_opt(index)
+    }
+
+    /// Mutable [`resolved_memory`](Self::resolved_memory).
+    #[inline]
+    pub(crate) fn resolved_memory_mut(&mut self, index: u32) -> Option<&mut MemoryEntity> {
+        self.memories.get_opt_mut(index)
+    }
+
     #[inline]
     pub(crate) fn table(&self, handle: Table) -> &TableEntity {
         self.check_handle(handle.store);

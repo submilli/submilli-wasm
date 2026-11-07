@@ -57,6 +57,11 @@ fn pooled(code: &Code, idx: u32) -> Result<(u32, u64)> {
     Ok((big.memory, big.offset))
 }
 
+#[cold]
+fn missing_memory() -> Error {
+    crate::error::InternalError::FrameStack("cached memory not in this store").into()
+}
+
 /// The instance's memory at index `idx` (imported memories first, then defined â the wasm index
 /// space). `memory.grow` is serviced separately in the run loop (for the limiter).
 #[inline]
@@ -189,6 +194,22 @@ impl Execution {
         Ok(ea as usize)
     }
 
+    /// The arena index of `instance`'s memory `memory`. Memory 0 of the instance used last comes
+    /// from the cache (`Execution::mem0`); anything else resolves through the instance (its handle
+    /// checked), refreshing the cache when it is a memory 0.
+    #[inline]
+    fn memory_index(&mut self, inner: &StoreInner, instance: Instance, memory: u32) -> u32 {
+        if memory == 0 && self.mem0.0 == instance.index {
+            return self.mem0.1;
+        }
+        let handle = mem(inner, instance, memory);
+        inner.check_handle(handle.store);
+        if memory == 0 {
+            self.mem0 = (instance.index, handle.index);
+        }
+        handle.index
+    }
+
     /// An `N`-byte load from the address at slot `at` (the caller writes the result over it).
     pub(super) fn load_at<const N: usize>(
         &mut self,
@@ -197,7 +218,8 @@ impl Execution {
         (memory, offset): (u32, u64),
         at: usize,
     ) -> Result<[u8; N]> {
-        let entity = inner.memory(mem(inner, instance, memory));
+        let index = self.memory_index(inner, instance, memory);
+        let entity = inner.resolved_memory(index).ok_or_else(missing_memory)?;
         let ea = self.mem_ea::<N>(entity, offset, at)?;
         let mut buf = [0u8; N];
         buf.copy_from_slice(&entity.bytes[ea..ea + N]);
@@ -231,10 +253,7 @@ impl Execution {
         data: [u8; N],
     ) -> Result<()> {
         let at = self.ensure_operands(1)?;
-        let (memory, offset) = pooled(code, *m)?;
-        let entity = inner.memory_mut(mem(inner, instance, memory));
-        let ea = self.mem_ea::<N>(entity, offset, at)?;
-        entity.bytes[ea..ea + N].copy_from_slice(&data);
+        self.store_at::<N>(inner, instance, pooled(code, *m)?, at, data)?;
         self.sp = at;
         Ok(())
     }
@@ -248,7 +267,10 @@ impl Execution {
         at: usize,
         data: [u8; N],
     ) -> Result<()> {
-        let entity = inner.memory_mut(mem(inner, instance, memory));
+        let index = self.memory_index(inner, instance, memory);
+        let entity = inner
+            .resolved_memory_mut(index)
+            .ok_or_else(missing_memory)?;
         let ea = self.mem_ea::<N>(entity, offset, at)?;
         entity.bytes[ea..ea + N].copy_from_slice(&data);
         Ok(())

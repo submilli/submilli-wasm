@@ -965,3 +965,19 @@ faster still — not worth 1.8× the operand memory. Checking a three-address op
 reads ~14%, and **memory access ~25%** — every load/store resolves its memory through the store
 twice (instance → memories[i] → memory entity, each an arena lookup with a store-id check). That
 is the next lever for the memory-heavy workloads.
+
+## 20. Session 7 — cheaper memory resolution
+
+Each load/store resolved its memory through two arena lookups (instance → `memories[i]` → memory
+entity), each behind a store-id check. Now the `Execution` caches the last memory-0 resolution as
+`(instance index, arena index)`; a hit goes straight to a checked `get` on the memories arena. A
+handle's arena index never changes and instances are never reclaimed, so the cache can't go stale;
+the cold path still checks the handle's store before filling it.
+
+**Measured** (cycles, M4 Pro) vs §19: CoreMark 1.05×, linked_list 1.05×, memory_tree 1.05×,
+memory/sum 1.03×, fib flat. Smaller than the ~25% profile share suggested — most of that time is
+the access itself (effective address, bounds check, byte copy), not the lookup.
+
+**Tried and reverted:** resolving memory 0 eagerly into a per-frame context (base/length kept
+next to the frame) regressed 5–10%. The extra live state in the dispatch loop cost more registers
+than the lookups it saved.

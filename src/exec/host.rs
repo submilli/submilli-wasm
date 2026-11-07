@@ -130,6 +130,7 @@ pub(super) fn enter<T>(
     let value_base = exec.slots.len();
     let stop_depth = exec.frames.len();
     let delim = if stop_depth == 0 {
+        exec.mem0 = super::NO_MEM0; // a recycled execution carries nothing over
         Delimiter::TopLevel
     } else {
         Delimiter::HostReentry

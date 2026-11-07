@@ -86,6 +86,12 @@ pub(crate) struct Execution {
     /// The current stack window's top: where a stack-window op (GC, SIMD, a host call's args)
     /// pops/pushes. Set by `enter_window`; slot-addressed ops never touch it.
     sp: usize,
+    /// The last memory-0 resolution, `(instance index, arena index)`: loads and stores of the same
+    /// instance's memory 0 reuse it instead of looking the memory up through the instance (see
+    /// `memory_index`). It can't go stale: an execution never leaves its store (so a hit may skip
+    /// the store check), instance indices are never reused, and an instance's memories are fixed
+    /// at instantiation. Reset per top-level call all the same (`host::enter`).
+    mem0: (u32, u32),
     /// The run loop's [`Code`] handle, kept while it is suspended so resuming needs no store
     /// lookup — a hint only: the loop re-points it at the actual top frame (`top_into`). Cleared
     /// when a call completes, so a reused execution doesn't keep a module alive.
@@ -121,6 +127,9 @@ const HOST_REENTRY_RESERVE: usize = 4096;
 /// thus at most ~2× the configured bytes: still a linear bound.
 const SLOT_CHARGE: usize = 8;
 
+/// `Execution::mem0` with nothing cached (no instance has index `u32::MAX`).
+const NO_MEM0: (u32, u32) = (u32::MAX, u32::MAX);
+
 // Parkability: keep `Execution` `Send` so async can await with it at rest. Compile-time check —
 // a future non-`Send` field (e.g. an `Rc`) fails here rather than at an `.await`.
 const _: fn() = || {
@@ -139,6 +148,7 @@ impl Default for Execution {
             floor: usize::MAX,
             control: None,
             sp: 0,
+            mem0: NO_MEM0,
             code: None,
             stack_limit: 0,
             gates_passed: false,

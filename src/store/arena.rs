@@ -26,6 +26,10 @@ impl<E> Arena<E> {
         self.0.get(index as usize)
     }
 
+    pub(super) fn get_opt_mut(&mut self, index: u32) -> Option<&mut E> {
+        self.0.get_mut(index as usize)
+    }
+
     pub(super) fn get_mut(&mut self, index: u32) -> &mut E {
         &mut self.0[index as usize]
     }
