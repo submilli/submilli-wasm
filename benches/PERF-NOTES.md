@@ -1037,3 +1037,43 @@ wasmi 2.0).
 make those pointer moves, but it touches the async/cancellation guards. Also: entry bookkeeping
 (delimiter frame, `Code` clone), and re-growing the truncated operand buffer (`extend_slots`) on
 every top-level call.
+
+## 23. Session 7 — compile profiling (`Module::new`)
+
+Baselines corrected: vs the true pre-Step-2 commit (`6b883c6`), `Module::new` was +12% cycles on
+spidermonkey and +15% on pulldown-cmark (an earlier "+19–22%" was against an older binary).
+
+- **Split.** Validation (wasmparser, measured with `Module::validate`) is ~55% of `Module::new` and
+  identical in every build; the rest is our translator, which grew +30% cycles with the static-slot
+  IR. Allocation counts were identical before and after Step 2 (arenas are pre-sized from the
+  input), so the growth is per-op bookkeeping spread thin: no single hot spot.
+- **vs wasmi 2.0** in eager mode (the like-for-like comparison; its default translates lazily):
+  spidermonkey 365M vs 743M cycles (2.0× faster), pulldown-cmark 54M vs 94M (1.7×).
+- **Allocation churn** (`05cb0c8`): each control frame's patch list allocated on its first branch
+  and was freed at `end`, and each `br_table` collected targets/patches into fresh vectors — 82%
+  of compile-time allocations (spidermonkey 53.6K → 9.8K). Pooling them: 1.074× / 1.093×.
+- **Tried and dropped:** deferring `i32.const` until the next opcode is known (so a folding binop
+  never emits-then-pops it) — ~0.4% instructions, not worth a peek in the driver loop. The const
+  path is ~7% of compile, but its cost is the general per-op bookkeeping, not the emit/pop.
+
+## 24. Session 7 — loop rotation and relop+`if` fusion (`e8898e2`)
+
+linked_list was the furthest case (3.7× wasmi 2.0), all in its 5–16 ops per iteration.
+
+- **Loop rotation.** `loop { br_if $exit c; …; br $loop }` paid the back-edge jump plus the head
+  test every iteration; the back-edge now runs the head test inverted (to the body) and falls to
+  the plain jump only on exit.
+- **relop + `if` fusion** was lost when the `if`'s block entry materialized a pending `local.get`
+  (the copy landed between the compare and the branch); the compare is now re-emitted fused after
+  the copies.
+
+**Measured** (cycles): linked_list 1.12×, memory/sum 1.02–1.03×, others flat; compile unchanged.
+Race vs wasmi 2.0 (SIMD both): tiny 1.5×, memory/sum 2.8×, CoreMark 3.1×, fib 3.1–3.2×,
+linked_list 3.1–3.3×, memory_tree 3.3×.
+
+**Measured, not applied (a security trade-off):** `scalar_at` checks every numeric operand's shadow
+tag so a miscompiled op can't read a reference's handle bits as a number. Dropping that check is
+worth CoreMark 1.06×, memory_tree 1.04×, linked_list 1.045×, fib 1.02×.
+
+**Cost of the stack-bound fixes** (`d90c40c`, `bfd51b9`): the thread-local native-stack entry on
+every `Func::call` costs tiny ~8% instructions / ~4% cycles per call; nothing else moved.
