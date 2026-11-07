@@ -86,8 +86,25 @@ impl ModuleInner {
         self.engine = Some(engine.clone());
     }
 
-    /// The engine-canonical id of a module type index.
-    pub(crate) fn canonical_type_id(&self, type_index: u32) -> CanonicalTypeId {
+    /// The engine-canonical id of a module type index — an error, not a panic, when out of range:
+    /// op and const-expr immediates reach here, and only validation keeps those in range.
+    pub(crate) fn canonical_type_id(&self, type_index: u32) -> crate::Result<CanonicalTypeId> {
+        crate::error::ir_get(&self.type_ids, type_index).copied()
+    }
+
+    /// The canonical signature id of a module-space function index (imported or defined) — one a
+    /// `FuncEntity::Wasm` records (see [`declared_type_id`](Self::declared_type_id) for range).
+    #[allow(clippy::indexing_slicing)]
+    pub(crate) fn func_type_id(&self, module_func_idx: u32) -> CanonicalTypeId {
+        self.declared_type_id(self.func_types[module_func_idx as usize])
+    }
+
+    /// [`canonical_type_id`](Self::canonical_type_id) for a module-level type index (function,
+    /// import, and tag signatures) on the infallible API paths. Validation guarantees these in
+    /// range for a module compiled here; a crafted deserialized artifact may panic here, which the
+    /// `Module::deserialize` contract accepts.
+    #[allow(clippy::indexing_slicing)]
+    fn declared_type_id(&self, type_index: u32) -> CanonicalTypeId {
         self.type_ids[type_index as usize]
     }
 
@@ -280,10 +297,7 @@ pub(crate) enum ConstOp {
 impl ModuleInner {
     /// The signature handle of any module-space function index (imported or defined).
     pub(crate) fn func_type(&self, module_func_idx: u32) -> FuncType {
-        canon::func_handle(
-            self.engine(),
-            self.canonical_type_id(self.func_types[module_func_idx as usize]),
-        )
+        canon::func_handle(self.engine(), self.func_type_id(module_func_idx))
     }
 
     /// The materialized `(params, results)` of a function's type, built once and shared:
@@ -302,7 +316,7 @@ impl ModuleInner {
         let (engine, ids) = (self.engine(), &self.type_ids);
         match kind {
             ImportKind::Func(t) => {
-                ExternType::Func(canon::func_handle(engine, self.canonical_type_id(*t)))
+                ExternType::Func(canon::func_handle(engine, self.declared_type_id(*t)))
             }
             ImportKind::Table(tt) => ExternType::Table(canon::materialize_table(engine, ids, tt)),
             ImportKind::Memory(mt) => ExternType::Memory(mt.clone()),
@@ -311,7 +325,7 @@ impl ModuleInner {
             }
             ImportKind::Tag(t) => ExternType::Tag(TagType::new(canon::func_handle(
                 engine,
-                self.canonical_type_id(*t),
+                self.declared_type_id(*t),
             ))),
         }
     }
@@ -386,7 +400,7 @@ impl ModuleInner {
     pub(crate) fn tag_type(&self, type_index: u32) -> TagType {
         TagType::new(canon::func_handle(
             self.engine(),
-            self.canonical_type_id(type_index),
+            self.declared_type_id(type_index),
         ))
     }
 }

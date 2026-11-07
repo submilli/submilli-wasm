@@ -16,6 +16,14 @@ fn chunk8(b: &[u8; 16], i: usize) -> [u8; 8] {
     core::array::from_fn(|k| b[i * 8 + k])
 }
 
+/// A lane immediate as an index into an `N`-lane array: validated `< N`, but reduced mod `N`
+/// anyway (an AND — `N` is a power of two) so a corrupt deserialized artifact can't index out of
+/// bounds, like the `i8x16.shuffle` selectors.
+#[inline]
+pub(super) fn lane<const N: usize>(l: u8) -> usize {
+    usize::from(l) % N
+}
+
 // --- split: v128 bits → typed lanes ---
 #[inline]
 pub(super) fn i8x16(v: u128) -> [i8; 16] {

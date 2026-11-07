@@ -394,7 +394,7 @@ impl Execution {
         // `Arc`→`Vec`→len pointer chase, and the `None` case doubles as the end-of-function return
         // (so there is no separate bounds check anywhere on the hot path).
         'frame: loop {
-            let ops = code.ops_in(func.ops);
+            let ops = code.ops_in(func.ops)?;
             loop {
                 let Some(op) = ops.get(ip as usize) else {
                     if self.do_return(func.n_results, stop_depth)? {

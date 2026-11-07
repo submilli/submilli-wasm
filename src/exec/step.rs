@@ -56,11 +56,13 @@ impl Execution {
             Op::Select(s) => self.select_at(slot(base, *s))?,
             Op::Copy(dst, src) => self.copy_slot(slot(base, *src), slot(base, *dst))?,
             Op::GlobalGet(s, g) => {
-                let v = inner.global(index_space::global(inner, instance, *g)).value;
+                let v = inner
+                    .global(index_space::global(inner, instance, *g)?)
+                    .value;
                 self.set_val(slot(base, *s), v)?;
             }
             Op::GlobalSet(s, g) => {
-                let handle = index_space::global(inner, instance, *g);
+                let handle = index_space::global(inner, instance, *g)?;
                 let v = self.take_typed(slot(base, *s), inner.global(handle).ty.content())?;
                 inner.global_mut(handle).value = v;
             }
@@ -109,7 +111,7 @@ impl Execution {
             }
             Op::BrTable(range, s) => {
                 // Targets live out-of-line in `code.br_tables`: `len` cases then the default.
-                let pool = code.br_tables();
+                let pool = code.br_tables()?;
                 let end = range.base.checked_add(range.len).ok_or(
                     crate::error::InternalError::Compiler("branch table range overflow"),
                 )? as usize;
@@ -128,7 +130,7 @@ impl Execution {
             // The run loop makes the call (it re-reads the op): see `CALL_INTERNAL`.
             Op::CallInternal(..) => return Ok(CALL_INTERNAL),
             call_op @ (Op::Call(f, s) | Op::ReturnCall(f, s)) => {
-                let callee = index_space::func(inner, instance, *f);
+                let callee = index_space::func(inner, instance, *f)?;
                 let kind = call_kind(matches!(call_op, Op::ReturnCall(..)), next);
                 let resolved = call::resolve(inner, callee)?;
                 let outcome = call::call_outcome(inner, resolved, instance, kind, slot(base, *s));
@@ -175,7 +177,7 @@ impl Execution {
                 // Routed through the driver so the (T-generic) limiter is consulted; it writes the
                 // old size (or -1) back over the delta's slot.
                 let at = slot(base, *s);
-                let memory = index_space::memory(inner, instance, *i);
+                let memory = index_space::memory(inner, instance, *i)?;
                 let delta = self.index_at(at, inner.memory(memory).ty.is_64())?;
                 return Ok(self.control(StepOutcome::Grow {
                     memory,
@@ -188,7 +190,7 @@ impl Execution {
                 // Routed through the driver (limiter-consulted), like `memory.grow`; operands
                 // `init, delta`, and the old size (or -1) replaces them.
                 let at = slot(base, *s);
-                let table = index_space::table(inner, instance, *t);
+                let table = index_space::table(inner, instance, *t)?;
                 let tt = &inner.table(table).ty;
                 let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
                 let init = self.take_ref(at, kind)?.to_ref();
@@ -730,34 +732,34 @@ fn call_kind(tail: bool, next: u32) -> CallKind {
     }
 }
 
-/// Lookups into the executing instance's index spaces. Their indices are wasmparser-validated for
-/// that instance (#33 carve-out); scoping the indexing allowance here keeps the dispatch arms
-/// themselves under `clippy::indexing_slicing`.
-#[allow(clippy::indexing_slicing)]
+/// Lookups into the executing instance's index spaces by an index from the op stream (in range for
+/// a validated module; fail-closed for a corrupt artifact — see [`ir_get`](crate::error::ir_get)).
 mod index_space {
+    use crate::error::ir_get;
     use crate::extern_::{Global, Memory, Table};
     use crate::func::Func;
     use crate::instance::Instance;
     use crate::store::StoreInner;
+    use crate::Result;
 
     #[inline]
-    pub(super) fn global(inner: &StoreInner, instance: Instance, index: u32) -> Global {
-        inner.instance(instance).globals[index as usize]
+    pub(super) fn global(inner: &StoreInner, instance: Instance, index: u32) -> Result<Global> {
+        ir_get(&inner.instance(instance).globals, index).copied()
     }
 
     #[inline]
-    pub(super) fn func(inner: &StoreInner, instance: Instance, index: u32) -> Func {
-        inner.instance(instance).funcs[index as usize]
+    pub(super) fn func(inner: &StoreInner, instance: Instance, index: u32) -> Result<Func> {
+        ir_get(&inner.instance(instance).funcs, index).copied()
     }
 
     #[inline]
-    pub(super) fn memory(inner: &StoreInner, instance: Instance, index: u32) -> Memory {
-        inner.instance(instance).memories[index as usize]
+    pub(super) fn memory(inner: &StoreInner, instance: Instance, index: u32) -> Result<Memory> {
+        ir_get(&inner.instance(instance).memories, index).copied()
     }
 
     #[inline]
-    pub(super) fn table(inner: &StoreInner, instance: Instance, index: u32) -> Table {
-        inner.instance(instance).tables[index as usize]
+    pub(super) fn table(inner: &StoreInner, instance: Instance, index: u32) -> Result<Table> {
+        ir_get(&inner.instance(instance).tables, index).copied()
     }
 }
 

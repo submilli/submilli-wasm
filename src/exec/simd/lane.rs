@@ -2,7 +2,7 @@
 
 use super::lanes::{
     f64x2, from_f32x4, from_f64x2, from_i16x8, from_i32x4, from_i64x2, from_i8x16, from_u8x16,
-    i16x8, i32x4, i64x2, i8x16, u16x8, u32x4, u64x2, u8x16,
+    i16x8, i32x4, i64x2, i8x16, lane, u16x8, u32x4, u64x2, u8x16,
 };
 use super::Execution;
 use crate::module::code::Code;
@@ -44,62 +44,62 @@ impl Execution {
             }
 
             S::I8x16ExtractLaneS(l) => {
-                self.extract(|v| i32::from(i8x16(v)[*l as usize]), Val::I32)?;
+                self.extract(|v| i32::from(i8x16(v)[lane::<16>(*l)]), Val::I32)?;
             }
             S::I8x16ExtractLaneU(l) => {
-                self.extract(|v| i32::from(u8x16(v)[*l as usize]), Val::I32)?;
+                self.extract(|v| i32::from(u8x16(v)[lane::<16>(*l)]), Val::I32)?;
             }
             S::I16x8ExtractLaneS(l) => {
-                self.extract(|v| i32::from(i16x8(v)[*l as usize]), Val::I32)?;
+                self.extract(|v| i32::from(i16x8(v)[lane::<8>(*l)]), Val::I32)?;
             }
             S::I16x8ExtractLaneU(l) => {
-                self.extract(|v| i32::from(u16x8(v)[*l as usize]), Val::I32)?;
+                self.extract(|v| i32::from(u16x8(v)[lane::<8>(*l)]), Val::I32)?;
             }
-            S::I32x4ExtractLane(l) => self.extract(|v| i32x4(v)[*l as usize], Val::I32)?,
-            S::I64x2ExtractLane(l) => self.extract(|v| i64x2(v)[*l as usize], Val::I64)?,
-            S::F32x4ExtractLane(l) => self.extract(|v| u32x4(v)[*l as usize], Val::F32)?,
-            S::F64x2ExtractLane(l) => self.extract(|v| u64x2(v)[*l as usize], Val::F64)?,
+            S::I32x4ExtractLane(l) => self.extract(|v| i32x4(v)[lane::<4>(*l)], Val::I32)?,
+            S::I64x2ExtractLane(l) => self.extract(|v| i64x2(v)[lane::<2>(*l)], Val::I64)?,
+            S::F32x4ExtractLane(l) => self.extract(|v| u32x4(v)[lane::<4>(*l)], Val::F32)?,
+            S::F64x2ExtractLane(l) => self.extract(|v| u64x2(v)[lane::<2>(*l)], Val::F64)?,
 
             S::I8x16ReplaceLane(l) => {
                 let x = self.pop_i32()? as i8;
                 let v = self.pop_v128()?;
                 let mut a = i8x16(v);
-                a[*l as usize] = x;
+                a[lane::<16>(*l)] = x;
                 self.push_v128(from_i8x16(a));
             }
             S::I16x8ReplaceLane(l) => {
                 let x = self.pop_i32()? as i16;
                 let v = self.pop_v128()?;
                 let mut a = i16x8(v);
-                a[*l as usize] = x;
+                a[lane::<8>(*l)] = x;
                 self.push_v128(from_i16x8(a));
             }
             S::I32x4ReplaceLane(l) => {
                 let x = self.pop_i32()?;
                 let v = self.pop_v128()?;
                 let mut a = i32x4(v);
-                a[*l as usize] = x;
+                a[lane::<4>(*l)] = x;
                 self.push_v128(from_i32x4(a));
             }
             S::I64x2ReplaceLane(l) => {
                 let x = self.pop_i64()?;
                 let v = self.pop_v128()?;
                 let mut a = i64x2(v);
-                a[*l as usize] = x;
+                a[lane::<2>(*l)] = x;
                 self.push_v128(from_i64x2(a));
             }
             S::F32x4ReplaceLane(l) => {
                 let x = self.pop_f32()?;
                 let v = self.pop_v128()?;
                 let mut a = super::lanes::f32x4(v);
-                a[*l as usize] = x;
+                a[lane::<4>(*l)] = x;
                 self.push_v128(from_f32x4(a));
             }
             S::F64x2ReplaceLane(l) => {
                 let x = self.pop_f64()?;
                 let v = self.pop_v128()?;
                 let mut a = f64x2(v);
-                a[*l as usize] = x;
+                a[lane::<2>(*l)] = x;
                 self.push_v128(from_f64x2(a));
             }
 

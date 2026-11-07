@@ -139,7 +139,7 @@ impl super::Execution {
         args_at: usize,
     ) -> crate::Result<(FrameFunc, u32)> {
         let func = code.func(); // resolved once; the frame caches the record
-        let local_types = code.local_types_of(&func);
+        let local_types = code.local_types_of(&func)?;
         let geometry = frame_geometry(args_at, &func, local_types.len())?;
         let args_end = args_at.saturating_add(func.n_params as usize);
         if args_at < self.floor || args_end > self.slots.len() {

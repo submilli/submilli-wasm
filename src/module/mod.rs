@@ -165,9 +165,11 @@ impl Module {
     /// # Safety
     /// Matches `wasmtime::Module::deserialize`: the artifact must be a trusted blob
     /// produced by a matching version of this crate (it is not guest-reachable input).
-    /// A corrupted artifact cannot cause undefined behavior here — the interpreter runs
-    /// in safe Rust with bounds-checked dispatch, so the worst case is a trap rather than
-    /// memory unsafety — but cross-version/garbage blobs are rejected up front.
+    /// Cross-version blobs are rejected up front, and so are accidentally corrupted ones (a body
+    /// checksum catches truncation, bit rot, a partial write). The artifact is not re-validated:
+    /// a deliberately crafted one cannot cause undefined behavior — the interpreter is safe Rust
+    /// with bounds-checked dispatch — but it may panic or misbehave, so never deserialize bytes an
+    /// untrusted party could have written.
     ///
     /// The validation-time module-size ceiling (#32) is intentionally **not** applied here:
     /// the artifact is a trusted, embedder-only blob (not guest-reachable), matching wasmtime's

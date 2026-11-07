@@ -67,3 +67,27 @@ fn deserialize_rejects_garbage() {
     bytes[8] ^= 0xff; // corrupt the version field (just past the 8-byte magic)
     assert!(unsafe { Module::deserialize(&engine, &bytes) }.is_err());
 }
+
+/// Every single-byte corruption past the version (checksum or body) and every truncation is
+/// rejected at decode — an error, never a panic or a module that misbehaves later.
+#[test]
+fn deserialize_rejects_corrupted_artifacts() {
+    let engine = Engine::default();
+    let module = Module::new(&engine, wat::parse_str(ADD).unwrap()).unwrap();
+    let bytes = module.serialize().unwrap();
+    for at in 12..bytes.len() {
+        let mut bad = bytes.clone();
+        bad[at] ^= 0x01;
+        assert!(
+            unsafe { Module::deserialize(&engine, &bad) }.is_err(),
+            "flip at {at}"
+        );
+    }
+    for len in 0..bytes.len() {
+        let truncated = &bytes[..len];
+        assert!(
+            unsafe { Module::deserialize(&engine, truncated) }.is_err(),
+            "length {len}"
+        );
+    }
+}

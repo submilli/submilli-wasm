@@ -87,7 +87,12 @@ impl StoreInner {
             Val::AnyRef(None) => return Ok(Val::ExternRef(None)),
             Val::AnyRef(Some(r)) => r.raw(),
             Val::ExternRef(_) => return Ok(v),
-            _ => unreachable!("extern.convert_any operand is a reference"),
+            _ => {
+                return Err(InternalError::Compiler(
+                    "extern.convert_any operand is not a reference",
+                )
+                .into())
+            }
         };
         if let AnyRefHandle::Slot(i) = decode_anyref_handle(handle) {
             let object = self.gc.get(i).ok_or(InternalError::GcMetadata(
@@ -114,7 +119,12 @@ impl StoreInner {
             Val::ExternRef(None) => return Ok(Val::AnyRef(None)),
             Val::ExternRef(Some(r)) => r.raw(),
             Val::AnyRef(_) => return Ok(v),
-            _ => unreachable!("any.convert_extern operand is a reference"),
+            _ => {
+                return Err(InternalError::Compiler(
+                    "any.convert_extern operand is not a reference",
+                )
+                .into())
+            }
         };
         match self.externrefs.get(idx) {
             Some(ExternEntry::Internal(h)) => return Ok(anyref_value(*h)),

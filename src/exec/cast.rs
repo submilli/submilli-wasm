@@ -5,6 +5,7 @@
 
 use super::{cell, Execution};
 use crate::canon::{AggKind, CanonicalTypeId, IrHeap, RefKind};
+use crate::error::ir_get;
 use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::code::Code;
@@ -86,8 +87,7 @@ impl Execution {
         // The edge is pooled (bit 31 of the packed index is the cast's nullable flag). The
         // index is emitted by our own compile pass, in-bounds by construction (#33 carve-out).
         let nullable = packed & NULLABLE_BIT != 0;
-        #[allow(clippy::indexing_slicing)]
-        let target = code.br_tables()[(packed & !NULLABLE_BIT) as usize];
+        let target = *ir_get(code.br_tables()?, packed & !NULLABLE_BIT)?;
         let r = self.pop_ref(cell::refkind_of_irheap(ty))?;
         let matched = matches_heaptype(inner, instance, &r, ty, nullable)?;
         self.push(r);
@@ -145,7 +145,7 @@ fn concrete_matches(
         .instance(instance)
         .module
         .inner()
-        .canonical_type_id(idx);
+        .canonical_type_id(idx)?;
     let actual = match kind {
         AggKind::Func => match value {
             Val::FuncRef(Some(f)) => Some(func_type_id(inner, *f)),
@@ -204,13 +204,11 @@ fn func_type_id(inner: &StoreInner, f: crate::func::Func) -> CanonicalTypeId {
         FuncEntity::Wasm {
             instance,
             func_index,
-        } => {
-            let m = inner.instance(*instance).module.inner();
-            // `func_index` is a wasmparser-validated function index for this module (#33 carve-out).
-            #[allow(clippy::indexing_slicing)]
-            let id = m.canonical_type_id(m.func_types[*func_index as usize]);
-            id
-        }
+        } => inner
+            .instance(*instance)
+            .module
+            .inner()
+            .func_type_id(*func_index),
         FuncEntity::Host { ty, .. } => ty.canonical_id(),
         #[cfg(feature = "async")]
         FuncEntity::HostAsync { ty, .. } => ty.canonical_id(),

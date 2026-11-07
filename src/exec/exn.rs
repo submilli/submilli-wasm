@@ -7,6 +7,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use crate::canon::RefKind;
+use crate::error::ir_get;
 use crate::error::InternalError;
 use crate::exception::ThrownException;
 use crate::extern_::Tag;
@@ -70,7 +71,7 @@ impl Execution {
         ip: u32,
         at: usize,
     ) -> Result<StepOutcome> {
-        let tag = inner.instance(instance).tags[tag_idx as usize];
+        let tag = *ir_get(&inner.instance(instance).tags, tag_idx)?;
         let params: Vec<ValType> = inner.tag(tag).ty.ty().params().collect();
         // A GC safepoint: the args (at `at..`) stay live roots while the exception is reserved.
         self.enter_window(at.saturating_add(params.len()))?;
@@ -225,7 +226,7 @@ fn find_clause(
     instance: Instance,
     thrown: Tag,
 ) -> Result<Option<HandlerRec>> {
-    for span in code.handlers() {
+    for span in code.handlers()? {
         if ip >= span.start_ip && ip < span.end_ip {
             for rec in &span.clauses {
                 let matches = match rec.tag {

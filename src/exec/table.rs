@@ -7,6 +7,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::{cell, Execution};
+use crate::error::{ir_get, ir_get_mut};
 use crate::instance::Instance;
 use crate::module::op::{Op, Slot};
 use crate::store::StoreInner;
@@ -37,13 +38,13 @@ impl Execution {
                 s,
             } => self.table_copy(inner, instance, (*dst_table, *src_table), at(*s)),
             Op::ElemDrop(elem) => {
-                inner.instance_mut(instance).elems[*elem as usize] = Vec::new();
+                *ir_get_mut(&mut inner.instance_mut(instance).elems, *elem)? = Vec::new();
                 Ok(())
             }
             Op::TableGet(t, s) => self.table_get(inner, instance, *t, at(*s)),
             Op::TableSet(t, s) => self.table_set(inner, instance, *t, at(*s)),
             Op::TableSize(t, s) => {
-                let handle = inner.instance(instance).tables[*t as usize];
+                let handle = *ir_get(&inner.instance(instance).tables, *t)?;
                 let size = inner.table(handle).size();
                 self.put_index(at(*s), inner.table(handle).ty.is_64(), size)
             }
@@ -60,7 +61,7 @@ impl Execution {
         table: u32,
         at: usize,
     ) -> Result<()> {
-        let handle = inner.instance(instance).tables[table as usize];
+        let handle = *ir_get(&inner.instance(instance).tables, table)?;
         let idx = self.index_at(at, inner.table(handle).ty.is_64())?;
         let r = inner.table(handle).get(idx).ok_or_else(oob)?;
         self.set_val(at, Val::from_ref(r))
@@ -74,7 +75,7 @@ impl Execution {
         table: u32,
         at: usize,
     ) -> Result<()> {
-        let handle = inner.instance(instance).tables[table as usize];
+        let handle = *ir_get(&inner.instance(instance).tables, table)?;
         let tt = &inner.table(handle).ty;
         let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
         let idx = self.index_at(at, is_64)?;
@@ -94,7 +95,7 @@ impl Execution {
         table: u32,
         at: usize,
     ) -> Result<()> {
-        let handle = inner.instance(instance).tables[table as usize];
+        let handle = *ir_get(&inner.instance(instance).tables, table)?;
         let tt = &inner.table(handle).ty;
         let (is_64, kind) = (tt.is_64(), cell::refkind_of_heap(tt.element().heap_type()));
         let dst = self.index_at(at, is_64)?;
@@ -116,14 +117,14 @@ impl Execution {
         (elem, table): (u32, u32),
         at: usize,
     ) -> Result<()> {
-        let handle = inner.instance(instance).tables[table as usize];
+        let handle = *ir_get(&inner.instance(instance).tables, table)?;
         let dst = self.index_at(at, inner.table(handle).ty.is_64())?;
         let src = u64::from(self.scalar_at(at + 1)?.unwrap_i32() as u32);
         let len = u64::from(self.scalar_at(at + 2)?.unwrap_i32() as u32);
 
         let entity = inner.instance(instance);
         // The element instance was evaluated once at instantiation (`elem.drop` empties it).
-        let refs = entity.elems[elem as usize].clone();
+        let refs = ir_get(&entity.elems, elem)?.clone();
 
         let src_end = checked_range(src, len, refs.len() as u64)?;
         checked_range(dst, len, inner.table(handle).size())?;
@@ -143,8 +144,8 @@ impl Execution {
         at: usize,
     ) -> Result<()> {
         let entity = inner.instance(instance);
-        let dst_handle = entity.tables[dst_table as usize];
-        let src_handle = entity.tables[src_table as usize];
+        let dst_handle = *ir_get(&entity.tables, dst_table)?;
+        let src_handle = *ir_get(&entity.tables, src_table)?;
         let (dst_64, src_64) = (
             inner.table(dst_handle).ty.is_64(),
             inner.table(src_handle).ty.is_64(),

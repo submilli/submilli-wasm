@@ -3,6 +3,7 @@
 use super::outcome::Callee;
 use super::{CallReq, Execution, ResolvedCall, StepOutcome};
 use crate::canon::{CanonicalTypeId, RefKind};
+use crate::error::ir_get;
 use crate::func::Func;
 use crate::instance::Instance;
 use crate::store::{FuncEntity, StoreInner};
@@ -62,9 +63,7 @@ impl Execution {
         kind: CallKind,
         at: usize,
     ) -> Result<StepOutcome> {
-        // `table` is a wasmparser-validated table index for this instance (#33 carve-out).
-        #[allow(clippy::indexing_slicing)]
-        let handle = inner.instance(instance).tables[table as usize];
+        let handle = *ir_get(&inner.instance(instance).tables, table)?;
         let idx = self.index_at(at, inner.table(handle).ty.is_64())?;
         let f = match inner.table(handle).get(idx) {
             Some(Ref::Func(Some(f))) => f,
@@ -75,7 +74,7 @@ impl Execution {
 
         let expected_module = inner.instance(instance).module.clone();
         // Engine-canonical id of the expected type (cross-module, recursion-safe identity).
-        let expected_id = expected_module.inner().canonical_type_id(type_idx);
+        let expected_id = expected_module.inner().canonical_type_id(type_idx)?;
         let resolved = resolve(inner, f)?;
         match &resolved {
             // The callee's type must be a subtype of the expected one (funcref subtyping).
@@ -84,7 +83,7 @@ impl Execution {
                     .instance(callee.instance)
                     .module
                     .inner()
-                    .canonical_type_id(callee.type_idx);
+                    .canonical_type_id(callee.type_idx)?;
                 if !inner.engine().is_subtype(actual_id, expected_id) {
                     return Err(Trap::BadSignature.into());
                 }

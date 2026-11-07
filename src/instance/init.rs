@@ -3,6 +3,7 @@
 
 use super::const_eval::{elem_refs, eval_const, eval_const_ref, ConstCtx};
 use crate::canon::{self, AggKind, IrGlobalType, IrHeap, IrTableType};
+use crate::error::ir_get;
 use crate::extern_::{Extern, Global, Memory, Table, Tag};
 use crate::func::Func;
 use crate::instance::Instance;
@@ -180,7 +181,7 @@ fn link_imports(inner: &StoreInner, module: &Module, imports: &[Extern]) -> Resu
 /// Tag imports match by **exact** func-type identity (invariant — unlike covariant funcs/globals):
 /// the provided tag's signature must canonically equal the importer's declared one.
 fn check_tag(inner: &StoreInner, module: &Module, type_idx: u32, tag: Tag) -> Result<()> {
-    let expected_id = module.inner().canonical_type_id(type_idx);
+    let expected_id = module.inner().canonical_type_id(type_idx)?;
     if inner.tag(tag).ty.ty().canonical_id() == expected_id {
         Ok(())
     } else {
@@ -189,14 +190,17 @@ fn check_tag(inner: &StoreInner, module: &Module, type_idx: u32, tag: Tag) -> Re
 }
 
 fn check_func(inner: &StoreInner, module: &Module, type_idx: u32, f: Func) -> Result<()> {
-    let expected_id = module.inner().canonical_type_id(type_idx);
+    let expected_id = module.inner().canonical_type_id(type_idx)?;
     let ok = match inner.func(f) {
         FuncEntity::Wasm {
             instance,
             func_index,
         } => {
-            let pmod = inner.instance(*instance).module.inner();
-            let actual_id = pmod.canonical_type_id(pmod.func_types[*func_index as usize]);
+            let actual_id = inner
+                .instance(*instance)
+                .module
+                .inner()
+                .func_type_id(*func_index);
             inner.engine().is_subtype(actual_id, expected_id)
         }
         // Host func types are interned too — compare canonical ids uniformly.
@@ -324,7 +328,7 @@ fn apply_active_elems(
     for (seg, refs) in module.inner().elems.iter().zip(evaluated) {
         if let ElemMode::Active { table, offset } = &seg.mode {
             let dst = const_to_usize(eval_const(inner, &ctx, offset)?, Trap::TableOutOfBounds)?;
-            apply_active_elem(inner, tables[*table as usize], dst, refs)?;
+            apply_active_elem(inner, *ir_get(tables, *table)?, dst, refs)?;
         }
     }
     Ok(())
@@ -364,7 +368,7 @@ fn init_datas(
             globals,
         };
         let dst = const_to_usize(eval_const(inner, &ctx, offset)?, Trap::MemoryOutOfBounds)?;
-        let mem = memories[*memory as usize];
+        let mem = *ir_get(memories, *memory)?;
         let len = seg.bytes.len();
         let mem_len = inner.memory(mem).bytes.len();
         if dst.checked_add(len).is_none_or(|end| end > mem_len) {

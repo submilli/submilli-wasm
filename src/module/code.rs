@@ -20,10 +20,25 @@ pub(crate) struct Span {
 }
 
 impl Span {
+    /// The arena range. `start + len` can't overflow for a span the compiler built; saturating
+    /// keeps a corrupt artifact's span from wrapping into a valid-looking range (it then fails the
+    /// arena bounds check instead).
     #[inline]
     pub(crate) fn range(self) -> std::ops::Range<usize> {
-        self.start as usize..(self.start + self.len) as usize
+        self.start as usize..self.start.saturating_add(self.len) as usize
     }
+
+    /// This span of `arena` — an error, not a panic, if it doesn't fit: spans are built by the
+    /// compiler against the arenas they index, so only a corrupt deserialized artifact misses.
+    #[inline]
+    fn of<T>(self, arena: &[T]) -> crate::Result<&[T]> {
+        arena.get(self.range()).ok_or_else(span_error)
+    }
+}
+
+#[cold]
+fn span_error() -> crate::Error {
+    crate::error::InternalError::Compiler("code span out of range").into()
 }
 
 /// Module-wide arenas for compiled code: every defined function's streams, back to back,
@@ -81,8 +96,7 @@ pub(crate) struct Code {
     pub index: u32,
 }
 
-// Slice/field access is by validated construction: spans are produced by the compiler
-// against the same arenas they index (#33 carve-out).
+// `index` is a defined-function index by construction (instantiation, `enter_defined`).
 #[allow(clippy::indexing_slicing)]
 impl Code {
     /// The module's identity, for comparison only: frames record it instead of holding a handle
@@ -120,46 +134,40 @@ impl Code {
 
     /// The op stream at a frame-cached span (the run loop's fast path).
     #[inline]
-    pub(crate) fn ops_in(&self, span: Span) -> &[Op] {
-        &self.module.code.ops[span.range()]
+    pub(crate) fn ops_in(&self, span: Span) -> crate::Result<&[Op]> {
+        span.of(&self.module.code.ops)
     }
 
     /// The declared locals of an already-copied record (the `push_call` fast path).
     #[inline]
-    pub(crate) fn local_types_of(&self, f: &CompiledFunc) -> &[IrVal] {
-        &self.module.code.local_types[f.local_types.range()]
+    pub(crate) fn local_types_of(&self, f: &CompiledFunc) -> crate::Result<&[IrVal]> {
+        f.local_types.of(&self.module.code.local_types)
     }
 
     #[inline]
-    pub(crate) fn ops(&self) -> &[Op] {
-        &self.module.code.ops[self.f().ops.range()]
+    pub(crate) fn handlers(&self) -> crate::Result<&[HandlerSpan]> {
+        self.f().handlers.of(&self.module.code.handlers)
     }
 
     #[inline]
-    pub(crate) fn local_types(&self) -> &[IrVal] {
-        &self.module.code.local_types[self.f().local_types.range()]
+    pub(crate) fn br_tables(&self) -> crate::Result<&[BranchTarget]> {
+        self.f().br_tables.of(&self.module.code.br_tables)
     }
 
     #[inline]
-    pub(crate) fn handlers(&self) -> &[HandlerSpan] {
-        &self.module.code.handlers[self.f().handlers.range()]
+    pub(crate) fn big_memargs(&self) -> crate::Result<&[BigMemArg]> {
+        self.f().big_memargs.of(&self.module.code.big_memargs)
     }
 
-    #[inline]
-    pub(crate) fn br_tables(&self) -> &[BranchTarget] {
-        &self.module.code.br_tables[self.f().br_tables.range()]
-    }
-
-    #[inline]
-    pub(crate) fn big_memargs(&self) -> &[BigMemArg] {
-        &self.module.code.big_memargs[self.f().big_memargs.range()]
-    }
-
-    /// Per-`Op` source offsets, or `None` when debug retention was off at compile.
+    /// Per-`Op` source offsets, or `None` when debug retention was off at compile (or the span is
+    /// corrupt — offsets are advisory, so a backtrace just goes without).
     #[inline]
     pub(crate) fn offsets(&self) -> Option<&[u32]> {
         let span = self.f().offsets;
-        (span.len > 0).then(|| &self.module.code.offsets[span.range()])
+        if span.len == 0 {
+            return None;
+        }
+        span.of(&self.module.code.offsets).ok()
     }
 
     /// A pooled `br_on_cast` heap type (see [`CodeArenas::cast_heaps`]).

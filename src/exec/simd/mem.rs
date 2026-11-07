@@ -3,8 +3,8 @@
 //! [`store_n`](Execution::store_n) (memory64-aware), so out-of-bounds traps exactly as scalar ops.
 
 use super::lanes::{
-    from_i16x8, from_i32x4, from_i64x2, from_u16x8, from_u32x4, from_u64x2, from_u8x16, u16x8,
-    u32x4, u64x2, u8x16,
+    from_i16x8, from_i32x4, from_i64x2, from_u16x8, from_u32x4, from_u64x2, from_u8x16, lane,
+    u16x8, u32x4, u64x2, u8x16,
 };
 use super::Execution;
 use crate::instance::Instance;
@@ -99,49 +99,49 @@ impl Execution {
                 let b = self.load_n::<8>(inner, code, instance, m)?;
                 self.push_v128(u128::from(u64::from_le_bytes(b)));
             }
-            S::V128Load8Lane { mem, lane } => {
+            S::V128Load8Lane { mem, lane: idx } => {
                 let v = self.pop_v128()?;
                 let b = self.load_n::<1>(inner, code, instance, mem)?;
                 let mut a = u8x16(v);
-                a[*lane as usize] = b[0];
+                a[lane::<16>(*idx)] = b[0];
                 self.push_v128(from_u8x16(a));
             }
-            S::V128Load16Lane { mem, lane } => {
+            S::V128Load16Lane { mem, lane: idx } => {
                 let v = self.pop_v128()?;
                 let b = self.load_n::<2>(inner, code, instance, mem)?;
                 let mut a = u16x8(v);
-                a[*lane as usize] = u16::from_le_bytes(b);
+                a[lane::<8>(*idx)] = u16::from_le_bytes(b);
                 self.push_v128(from_u16x8(a));
             }
-            S::V128Load32Lane { mem, lane } => {
+            S::V128Load32Lane { mem, lane: idx } => {
                 let v = self.pop_v128()?;
                 let b = self.load_n::<4>(inner, code, instance, mem)?;
                 let mut a = u32x4(v);
-                a[*lane as usize] = u32::from_le_bytes(b);
+                a[lane::<4>(*idx)] = u32::from_le_bytes(b);
                 self.push_v128(from_u32x4(a));
             }
-            S::V128Load64Lane { mem, lane } => {
+            S::V128Load64Lane { mem, lane: idx } => {
                 let v = self.pop_v128()?;
                 let b = self.load_n::<8>(inner, code, instance, mem)?;
                 let mut a = u64x2(v);
-                a[*lane as usize] = u64::from_le_bytes(b);
+                a[lane::<2>(*idx)] = u64::from_le_bytes(b);
                 self.push_v128(from_u64x2(a));
             }
-            S::V128Store8Lane { mem, lane } => {
+            S::V128Store8Lane { mem, lane: idx } => {
                 let a = u8x16(self.pop_v128()?);
-                self.store_n::<1>(inner, code, instance, mem, [a[*lane as usize]])?;
+                self.store_n::<1>(inner, code, instance, mem, [a[lane::<16>(*idx)]])?;
             }
-            S::V128Store16Lane { mem, lane } => {
+            S::V128Store16Lane { mem, lane: idx } => {
                 let a = u16x8(self.pop_v128()?);
-                self.store_n::<2>(inner, code, instance, mem, a[*lane as usize].to_le_bytes())?;
+                self.store_n::<2>(inner, code, instance, mem, a[lane::<8>(*idx)].to_le_bytes())?;
             }
-            S::V128Store32Lane { mem, lane } => {
+            S::V128Store32Lane { mem, lane: idx } => {
                 let a = u32x4(self.pop_v128()?);
-                self.store_n::<4>(inner, code, instance, mem, a[*lane as usize].to_le_bytes())?;
+                self.store_n::<4>(inner, code, instance, mem, a[lane::<4>(*idx)].to_le_bytes())?;
             }
-            S::V128Store64Lane { mem, lane } => {
+            S::V128Store64Lane { mem, lane: idx } => {
                 let a = u64x2(self.pop_v128()?);
-                self.store_n::<8>(inner, code, instance, mem, a[*lane as usize].to_le_bytes())?;
+                self.store_n::<8>(inner, code, instance, mem, a[lane::<2>(*idx)].to_le_bytes())?;
             }
             _ => return Ok(false),
         }

@@ -34,6 +34,25 @@ impl Display for InternalError {
 
 impl std::error::Error for InternalError {}
 
+/// `items[index]` for an index read from compiled code or module metadata. Validation keeps these
+/// in range for a module compiled here, but a corrupt deserialized artifact need not, so this fails
+/// closed instead of panicking. Same cost as indexing: one bounds check.
+#[inline]
+pub(crate) fn ir_get<T>(items: &[T], index: u32) -> Result<&T> {
+    items.get(index as usize).ok_or_else(ir_index_error)
+}
+
+/// Mutable [`ir_get`].
+#[inline]
+pub(crate) fn ir_get_mut<T>(items: &mut [T], index: u32) -> Result<&mut T> {
+    items.get_mut(index as usize).ok_or_else(ir_index_error)
+}
+
+#[cold]
+fn ir_index_error() -> Error {
+    InternalError::Compiler("index out of range").into()
+}
+
 /// The error type, mirroring `wasmtime::Error`.
 pub struct Error(anyhow::Error);
 

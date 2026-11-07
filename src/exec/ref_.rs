@@ -3,6 +3,7 @@
 
 use super::cell::Cell;
 use super::Execution;
+use crate::error::ir_get;
 use crate::instance::Instance;
 use crate::module::op::{Op, Slot};
 use crate::store::StoreInner;
@@ -22,9 +23,7 @@ impl Execution {
         match op {
             Op::RefNull(heap, s) => self.set_val(at(*s), Val::null_for_heap(heap)),
             Op::RefFunc(f, s) => {
-                // `f` is a wasmparser-validated function index for this instance (#33 carve-out).
-                #[allow(clippy::indexing_slicing)]
-                let func = inner.instance(instance).funcs[*f as usize];
+                let func = *ir_get(&inner.instance(instance).funcs, *f)?;
                 self.set_val(at(*s), Val::FuncRef(Some(func)))
             }
             Op::RefIsNull(s) => {

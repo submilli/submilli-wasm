@@ -56,7 +56,7 @@ impl Execution {
         default: bool,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let type_id = module.inner().canonical_type_id(ty);
+        let type_id = module.inner().canonical_type_id(ty)?;
         let layout = module.inner().struct_layout(ty)?;
         let fields = layout.fields();
         let mut data = vec![0u8; layout.size()];

@@ -17,6 +17,7 @@
 use super::gc::anyref_slot;
 use super::Execution;
 use crate::canon::{ArrayLayout, CanonicalTypeId, Layout, Slot};
+use crate::error::ir_get;
 use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::op::Op;
@@ -64,7 +65,7 @@ impl Execution {
         default: bool,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let type_id = module.inner().canonical_type_id(ty);
+        let type_id = module.inner().canonical_type_id(ty)?;
         let layout = module.inner().array_layout(ty)?;
         let count = self.pop_i32()? as u32 as usize;
         // `byte_len` (count Ã stride) was already bounded by `gc_reserve` before this op ran
@@ -89,7 +90,7 @@ impl Execution {
         n: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let type_id = module.inner().canonical_type_id(ty);
+        let type_id = module.inner().canonical_type_id(ty)?;
         let layout = module.inner().array_layout(ty)?;
         let count = n as usize;
         let mut data = vec![0u8; layout.body_size(count)];
@@ -108,13 +109,13 @@ impl Execution {
         data: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let type_id = module.inner().canonical_type_id(ty);
+        let type_id = module.inner().canonical_type_id(ty)?;
         let stride = module.inner().array_layout(ty)?.stride();
         let count = self.pop_i32()? as u32 as usize;
         let offset = self.pop_i32()? as u32 as usize;
         let byte_len = elem_bytes(count, stride)?;
-        let dropped = inner.instance(instance).dropped_data[data as usize];
-        let seg = &module.inner().datas[data as usize].bytes;
+        let dropped = *ir_get(&inner.instance(instance).dropped_data, data)?;
+        let seg = &ir_get(&module.inner().datas, data)?.bytes;
         let seg_len = if dropped { 0 } else { seg.len() };
         range(offset, byte_len, seg_len, Trap::MemoryOutOfBounds)?;
         inner.gc_check_capacity(byte_len)?;
@@ -131,11 +132,11 @@ impl Execution {
         elem: u32,
     ) -> Result<()> {
         let module = inner.instance(instance).module.clone();
-        let type_id = module.inner().canonical_type_id(ty);
+        let type_id = module.inner().canonical_type_id(ty)?;
         let layout = module.inner().array_layout(ty)?;
         let count = self.pop_i32()? as u32 as usize;
         let offset = self.pop_i32()? as u32 as usize;
-        let refs = self.segment_refs(inner, instance, elem);
+        let refs = self.segment_refs(inner, instance, elem)?;
         range(offset, count, refs.len(), Trap::TableOutOfBounds)?;
         inner.gc_check_capacity(elem_bytes(count, layout.stride())?)?;
         let mut data = vec![0u8; layout.body_size(count)];
@@ -269,8 +270,8 @@ impl Execution {
             Trap::ArrayOutOfBounds,
         )?;
         let byte_len = elem_bytes(len, stride)?;
-        let dropped = inner.instance(instance).dropped_data[data as usize];
-        let seg = &module.inner().datas[data as usize].bytes;
+        let dropped = *ir_get(&inner.instance(instance).dropped_data, data)?;
+        let seg = &ir_get(&module.inner().datas, data)?.bytes;
         let seg_len = if dropped { 0 } else { seg.len() };
         range(src, byte_len, seg_len, Trap::MemoryOutOfBounds)?;
         let bytes = seg[src..src + byte_len].to_vec();
@@ -300,7 +301,7 @@ impl Execution {
             arr_len(inner, obj, layout.stride())?,
             Trap::ArrayOutOfBounds,
         )?;
-        let refs = self.segment_refs(inner, instance, elem);
+        let refs = self.segment_refs(inner, instance, elem)?;
         range(src, len, refs.len(), Trap::TableOutOfBounds)?;
         let data = &mut gc_object_mut(inner, obj)?.data;
         for (i, r) in refs[src..src + len].iter().enumerate() {
@@ -344,8 +345,8 @@ impl Execution {
         inner: &StoreInner,
         instance: Instance,
         elem: u32,
-    ) -> Vec<crate::value::Ref> {
-        inner.instance(instance).elems[elem as usize].clone()
+    ) -> Result<Vec<crate::value::Ref>> {
+        ir_get(&inner.instance(instance).elems, elem).cloned()
     }
 }
 

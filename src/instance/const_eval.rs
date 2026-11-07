@@ -5,14 +5,18 @@
 // Index/width juggling on validated inputs is intentional narrowing.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use crate::canon::CanonicalTypeId;
+// Validation guarantees a well-typed, balanced expression with in-range indices; a corrupt
+// deserialized artifact doesn't, so every pop, index and field write below fails closed.
+
+use crate::canon::{CanonicalTypeId, Slot};
+use crate::error::{ir_get, InternalError};
 use crate::extern_::Global;
 use crate::func::Func;
 use crate::module::inner::{ConstExpr, ConstOp, ElemItems};
 use crate::module::Module;
 use crate::store::{
-    anyref_handle_i31, anyref_handle_slot, anyref_value, default_for_slot, write_slot, GcObject,
-    StoreInner,
+    anyref_handle_i31, anyref_handle_slot, anyref_value, default_for_slot, slot_accepts,
+    write_slot, GcObject, StoreInner,
 };
 use crate::trap::Trap;
 use crate::value::{Ref, Val};
@@ -40,15 +44,15 @@ pub(crate) fn eval_const(inner: &mut StoreInner, ctx: &ConstCtx<'_>, e: &ConstEx
             #[cfg(feature = "simd")]
             ConstOp::V128(v) => Val::V128(crate::value::V128::from(*v)),
             ConstOp::RefNull(heap) => Val::null_for_heap(heap),
-            ConstOp::RefFunc(i) => Val::FuncRef(Some(ctx.funcs[*i as usize])),
-            ConstOp::GlobalGet(g) => inner.global(ctx.globals[*g as usize]).value,
-            ConstOp::I32Add => i32_bin(&mut stack, i32::wrapping_add),
-            ConstOp::I32Sub => i32_bin(&mut stack, i32::wrapping_sub),
-            ConstOp::I32Mul => i32_bin(&mut stack, i32::wrapping_mul),
-            ConstOp::I64Add => i64_bin(&mut stack, i64::wrapping_add),
-            ConstOp::I64Sub => i64_bin(&mut stack, i64::wrapping_sub),
-            ConstOp::I64Mul => i64_bin(&mut stack, i64::wrapping_mul),
-            ConstOp::RefI31 => anyref_value(anyref_handle_i31(pop(&mut stack).unwrap_i32())),
+            ConstOp::RefFunc(i) => Val::FuncRef(Some(*ir_get(ctx.funcs, *i)?)),
+            ConstOp::GlobalGet(g) => inner.global(*ir_get(ctx.globals, *g)?).value,
+            ConstOp::I32Add => i32_bin(&mut stack, i32::wrapping_add)?,
+            ConstOp::I32Sub => i32_bin(&mut stack, i32::wrapping_sub)?,
+            ConstOp::I32Mul => i32_bin(&mut stack, i32::wrapping_mul)?,
+            ConstOp::I64Add => i64_bin(&mut stack, i64::wrapping_add)?,
+            ConstOp::I64Sub => i64_bin(&mut stack, i64::wrapping_sub)?,
+            ConstOp::I64Mul => i64_bin(&mut stack, i64::wrapping_mul)?,
+            ConstOp::RefI31 => anyref_value(anyref_handle_i31(pop_i32(&mut stack)?)),
             ConstOp::StructNew(ty) => const_struct(inner, ctx, &mut stack, *ty, false)?,
             ConstOp::StructNewDefault(ty) => const_struct(inner, ctx, &mut stack, *ty, true)?,
             ConstOp::ArrayNew(ty) => const_array(inner, ctx, &mut stack, *ty, false)?,
@@ -60,12 +64,15 @@ pub(crate) fn eval_const(inner: &mut StoreInner, ctx: &ConstCtx<'_>, e: &ConstEx
             ConstOp::ArrayNewElem { ty, elem } => {
                 const_array_elem(inner, ctx, &mut stack, *ty, *elem)?
             }
-            ConstOp::AnyConvertExtern => inner.any_convert_extern(pop(&mut stack))?,
-            ConstOp::ExternConvertAny => inner.extern_convert_any(pop(&mut stack))?,
+            ConstOp::AnyConvertExtern => inner.any_convert_extern(pop(&mut stack)?)?,
+            ConstOp::ExternConvertAny => inner.extern_convert_any(pop(&mut stack)?)?,
         };
         stack.push(v);
     }
-    Ok(stack.pop().expect("const expr yields one value"))
+    match (stack.pop(), stack.is_empty()) {
+        (Some(v), true) => Ok(v),
+        _ => Err(malformed()),
+    }
 }
 
 pub(crate) fn eval_const_ref(
@@ -85,8 +92,8 @@ pub(crate) fn elem_refs(
     match items {
         ElemItems::Funcs(idxs) => Ok(idxs
             .iter()
-            .map(|&i| Ref::Func(Some(ctx.funcs[i as usize])))
-            .collect()),
+            .map(|&i| Ok(Ref::Func(Some(*ir_get(ctx.funcs, i)?))))
+            .collect::<Result<_>>()?),
         ElemItems::Exprs(exprs) => {
             let mut refs = Vec::with_capacity(exprs.len());
             for e in exprs {
@@ -97,21 +104,44 @@ pub(crate) fn elem_refs(
     }
 }
 
-fn pop(stack: &mut Vec<Val>) -> Val {
-    stack.pop().expect("const-expr operand stack underflow")
+#[cold]
+fn malformed() -> Error {
+    InternalError::Compiler("malformed constant expression").into()
+}
+
+fn pop(stack: &mut Vec<Val>) -> Result<Val> {
+    stack.pop().ok_or_else(malformed)
+}
+
+fn pop_i32(stack: &mut Vec<Val>) -> Result<i32> {
+    pop(stack)?.i32().ok_or_else(malformed)
+}
+
+fn pop_i64(stack: &mut Vec<Val>) -> Result<i64> {
+    pop(stack)?.i64().ok_or_else(malformed)
+}
+
+/// Pops a value for GC field `slot`, checking its kind fits (as validation would have).
+fn pop_for(stack: &mut Vec<Val>, slot: Slot) -> Result<Val> {
+    let v = pop(stack)?;
+    if slot_accepts(slot, &v) {
+        Ok(v)
+    } else {
+        Err(malformed())
+    }
 }
 
 /// Extended-const binop: `(op a b)` pushed `a` then `b`, so pop yields `b` then `a` (#40).
-fn i32_bin(stack: &mut Vec<Val>, f: fn(i32, i32) -> i32) -> Val {
-    let b = pop(stack).unwrap_i32();
-    let a = pop(stack).unwrap_i32();
-    Val::I32(f(a, b))
+fn i32_bin(stack: &mut Vec<Val>, f: fn(i32, i32) -> i32) -> Result<Val> {
+    let b = pop_i32(stack)?;
+    let a = pop_i32(stack)?;
+    Ok(Val::I32(f(a, b)))
 }
 
-fn i64_bin(stack: &mut Vec<Val>, f: fn(i64, i64) -> i64) -> Val {
-    let b = pop(stack).unwrap_i64();
-    let a = pop(stack).unwrap_i64();
-    Val::I64(f(a, b))
+fn i64_bin(stack: &mut Vec<Val>, f: fn(i64, i64) -> i64) -> Result<Val> {
+    let b = pop_i64(stack)?;
+    let a = pop_i64(stack)?;
+    Ok(Val::I64(f(a, b)))
 }
 
 fn const_struct(
@@ -121,7 +151,7 @@ fn const_struct(
     ty: u32,
     default: bool,
 ) -> Result<Val> {
-    let type_id = ctx.module.inner().canonical_type_id(ty);
+    let type_id = ctx.module.inner().canonical_type_id(ty)?;
     let layout = ctx.module.inner().struct_layout(ty)?;
     let fields = layout.fields();
     let mut data = vec![0u8; layout.size()];
@@ -131,7 +161,7 @@ fn const_struct(
         }
     } else {
         for &slot in fields.iter().rev() {
-            write_slot(slot, &mut data, pop(stack));
+            write_slot(slot, &mut data, pop_for(stack, slot)?);
         }
     }
     alloc(
@@ -147,16 +177,16 @@ fn const_array(
     ty: u32,
     default: bool,
 ) -> Result<Val> {
-    let type_id = ctx.module.inner().canonical_type_id(ty);
+    let type_id = ctx.module.inner().canonical_type_id(ty)?;
     let layout = ctx.module.inner().array_layout(ty)?;
-    let count = pop(stack).unwrap_i32() as u32 as usize;
+    let count = pop_i32(stack)? as u32 as usize;
     let byte_len = elem_bytes(count, layout.stride())?;
     inner.gc_check_capacity(byte_len)?;
     let mut data = vec![0u8; byte_len];
     let fill = if default {
         default_for_slot(layout.elem_at(0))
     } else {
-        pop(stack)
+        pop_for(stack, layout.elem_at(0))?
     };
     for i in 0..count {
         write_slot(layout.elem_at(i), &mut data, fill);
@@ -171,12 +201,19 @@ fn const_array_fixed(
     ty: u32,
     n: u32,
 ) -> Result<Val> {
-    let type_id = ctx.module.inner().canonical_type_id(ty);
+    let type_id = ctx.module.inner().canonical_type_id(ty)?;
     let layout = ctx.module.inner().array_layout(ty)?;
     let count = n as usize;
+    if count > stack.len() {
+        return Err(malformed());
+    }
     let mut data = vec![0u8; layout.body_size(count)];
     for i in (0..count).rev() {
-        write_slot(layout.elem_at(i), &mut data, pop(stack));
+        write_slot(
+            layout.elem_at(i),
+            &mut data,
+            pop_for(stack, layout.elem_at(i))?,
+        );
     }
     alloc_array(inner, type_id, data)
 }
@@ -188,12 +225,12 @@ fn const_array_data(
     ty: u32,
     data: u32,
 ) -> Result<Val> {
-    let type_id = ctx.module.inner().canonical_type_id(ty);
+    let type_id = ctx.module.inner().canonical_type_id(ty)?;
     let stride = ctx.module.inner().array_layout(ty)?.stride();
-    let count = pop(stack).unwrap_i32() as u32 as usize;
-    let offset = pop(stack).unwrap_i32() as u32 as usize;
+    let count = pop_i32(stack)? as u32 as usize;
+    let offset = pop_i32(stack)? as u32 as usize;
     let byte_len = elem_bytes(count, stride)?;
-    let seg = &ctx.module.inner().datas[data as usize].bytes;
+    let seg = &ir_get(&ctx.module.inner().datas, data)?.bytes;
     range(offset, byte_len, seg.len(), Trap::MemoryOutOfBounds)?;
     inner.gc_check_capacity(byte_len)?;
     let body = seg[offset..offset + byte_len].to_vec();
@@ -207,16 +244,20 @@ fn const_array_elem(
     ty: u32,
     elem: u32,
 ) -> Result<Val> {
-    let type_id = ctx.module.inner().canonical_type_id(ty);
+    let type_id = ctx.module.inner().canonical_type_id(ty)?;
     let layout = ctx.module.inner().array_layout(ty)?;
-    let count = pop(stack).unwrap_i32() as u32 as usize;
-    let offset = pop(stack).unwrap_i32() as u32 as usize;
-    let refs = elem_refs(inner, ctx, &ctx.module.inner().elems[elem as usize].items)?;
+    let count = pop_i32(stack)? as u32 as usize;
+    let offset = pop_i32(stack)? as u32 as usize;
+    let refs = elem_refs(inner, ctx, &ir_get(&ctx.module.inner().elems, elem)?.items)?;
     range(offset, count, refs.len(), Trap::TableOutOfBounds)?;
     inner.gc_check_capacity(elem_bytes(count, layout.stride())?)?;
     let mut data = vec![0u8; layout.body_size(count)];
     for (i, r) in refs[offset..offset + count].iter().enumerate() {
-        write_slot(layout.elem_at(i), &mut data, Val::from_ref(r.clone()));
+        let (slot, v) = (layout.elem_at(i), Val::from_ref(r.clone()));
+        if !slot_accepts(slot, &v) {
+            return Err(malformed());
+        }
+        write_slot(slot, &mut data, v);
     }
     alloc_array(inner, type_id, data)
 }

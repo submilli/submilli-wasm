@@ -7,6 +7,7 @@ pub(crate) mod init;
 #[path = "tests.rs"]
 mod tests;
 
+use crate::error::ir_get;
 use crate::extern_::{Extern, Global, Memory, Table};
 use crate::func::{Func, TypedFunc, WasmParams, WasmResults};
 use crate::module::inner::ExportKind;
@@ -100,10 +101,13 @@ fn instantiate_resolve_start(
 ) -> Result<(Instance, Option<Func>)> {
     check_limits(store, module)?;
     let instance = init::instantiate(store.as_context_mut().into_inner_mut(), module, imports)?;
-    let start = module
-        .inner()
-        .start
-        .map(|idx| store.as_context_mut().inner().instance(instance).funcs[idx as usize]);
+    let start = match module.inner().start {
+        Some(idx) => Some(*ir_get(
+            &store.as_context_mut().inner().instance(instance).funcs,
+            idx,
+        )?),
+        None => None,
+    };
     Ok((instance, start))
 }
 
@@ -226,12 +230,13 @@ impl Instance {
             .exports
             .iter()
             .find(|e| e.name == name)?;
+        // A validated export index is in range; `None` (not a panic) for a corrupt artifact.
         Some(match export.kind {
-            ExportKind::Func(i) => Extern::Func(entity.funcs[i as usize]),
-            ExportKind::Table(i) => Extern::Table(entity.tables[i as usize]),
-            ExportKind::Memory(i) => Extern::Memory(entity.memories[i as usize]),
-            ExportKind::Global(i) => Extern::Global(entity.globals[i as usize]),
-            ExportKind::Tag(i) => Extern::Tag(entity.tags[i as usize]),
+            ExportKind::Func(i) => Extern::Func(*entity.funcs.get(i as usize)?),
+            ExportKind::Table(i) => Extern::Table(*entity.tables.get(i as usize)?),
+            ExportKind::Memory(i) => Extern::Memory(*entity.memories.get(i as usize)?),
+            ExportKind::Global(i) => Extern::Global(*entity.globals.get(i as usize)?),
+            ExportKind::Tag(i) => Extern::Tag(*entity.tags.get(i as usize)?),
         })
     }
 }

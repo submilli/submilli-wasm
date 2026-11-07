@@ -8,6 +8,7 @@
 #![allow(clippy::trivially_copy_pass_by_ref, clippy::indexing_slicing)]
 
 use super::Execution;
+use crate::error::{ir_get, ir_get_mut};
 use crate::extern_::Memory;
 use crate::instance::Instance;
 use crate::module::code::Code;
@@ -48,12 +49,7 @@ pub(super) fn store_operands(code: &Code, m: &StoreArg) -> Result<(Slot, Slot, (
 /// `op_simd::MemIdx`) as `(memory index, byte offset)`.
 #[cold]
 fn pooled(code: &Code, idx: u32) -> Result<(u32, u64)> {
-    let big = code
-        .big_memargs()
-        .get(idx as usize)
-        .ok_or(crate::error::InternalError::Compiler(
-            "memarg pool index out of range",
-        ))?;
+    let big = ir_get(code.big_memargs()?, idx)?;
     Ok((big.memory, big.offset))
 }
 
@@ -65,8 +61,8 @@ fn missing_memory() -> Error {
 /// The instance's memory at index `idx` (imported memories first, then defined â the wasm index
 /// space). `memory.grow` is serviced separately in the run loop (for the limiter).
 #[inline]
-fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Memory {
-    inner.instance(instance).memories[idx as usize]
+fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Result<Memory> {
+    ir_get(&inner.instance(instance).memories, idx).copied()
 }
 
 impl Execution {
@@ -83,9 +79,11 @@ impl Execution {
         match op {
             // `data.drop` needs no memory (a module may carry passive data segments without one —
             // common in GC modules using `array.new_data`).
-            Op::DataDrop(seg) => inner.instance_mut(instance).dropped_data[*seg as usize] = true,
+            Op::DataDrop(seg) => {
+                *ir_get_mut(&mut inner.instance_mut(instance).dropped_data, *seg)? = true;
+            }
             Op::MemorySize(i, s) => {
-                let entity = inner.memory(mem(inner, instance, *i));
+                let entity = inner.memory(mem(inner, instance, *i)?);
                 let (is_64, pages) = (entity.ty.is_64(), entity.size_pages());
                 self.put_index(at(*s), is_64, pages)?;
             }
@@ -107,7 +105,7 @@ impl Execution {
         mem_i: u32,
         at: usize,
     ) -> Result<()> {
-        let memory = mem(inner, instance, mem_i);
+        let memory = mem(inner, instance, mem_i)?;
         let is_64 = inner.memory(memory).ty.is_64();
         let dst = self.index_at(at, is_64)?;
         let val = self.scalar_at(at + 1)?.unwrap_i32() as u8;
@@ -127,7 +125,7 @@ impl Execution {
         (dst_i, src_i): (u32, u32),
         at: usize,
     ) -> Result<()> {
-        let (dst_mem, src_mem) = (mem(inner, instance, dst_i), mem(inner, instance, src_i));
+        let (dst_mem, src_mem) = (mem(inner, instance, dst_i)?, mem(inner, instance, src_i)?);
         let (dst_64, src_64) = (
             inner.memory(dst_mem).ty.is_64(),
             inner.memory(src_mem).ty.is_64(),
@@ -160,17 +158,17 @@ impl Execution {
         (seg, mem_i): (u32, u32),
         at: usize,
     ) -> Result<()> {
-        let is_64 = inner.memory(mem(inner, instance, mem_i)).ty.is_64();
+        let is_64 = inner.memory(mem(inner, instance, mem_i)?).ty.is_64();
         let dst = self.index_at(at, is_64)?;
         let src = u64::from(self.scalar_at(at + 1)?.unwrap_i32() as u32);
         let len = u64::from(self.scalar_at(at + 2)?.unwrap_i32() as u32);
         let entity = inner.instance(instance);
         let module = entity.module.clone();
-        let dropped = entity.dropped_data[seg as usize];
-        let data = &module.inner().datas[seg as usize].bytes;
+        let dropped = *ir_get(&entity.dropped_data, seg)?;
+        let data = &ir_get(&module.inner().datas, seg)?.bytes;
         let data_len = if dropped { 0 } else { data.len() };
         let src_end = checked_range(src, len, data_len as u64)?;
-        let mem = mem(inner, instance, mem_i);
+        let mem = mem(inner, instance, mem_i)?;
         checked_range(dst, len, inner.memory(mem).bytes.len() as u64)?;
         let (dst, src, src_end, len) = (dst as usize, src as usize, src_end as usize, len as usize);
         inner.memory_mut(mem).bytes[dst..dst + len].copy_from_slice(&data[src..src_end]);
@@ -198,16 +196,16 @@ impl Execution {
     /// from the cache (`Execution::mem0`); anything else resolves through the instance (its handle
     /// checked), refreshing the cache when it is a memory 0.
     #[inline]
-    fn memory_index(&mut self, inner: &StoreInner, instance: Instance, memory: u32) -> u32 {
+    fn memory_index(&mut self, inner: &StoreInner, instance: Instance, memory: u32) -> Result<u32> {
         if memory == 0 && self.mem0.0 == instance.index {
-            return self.mem0.1;
+            return Ok(self.mem0.1);
         }
-        let handle = mem(inner, instance, memory);
+        let handle = mem(inner, instance, memory)?;
         inner.check_handle(handle.store);
         if memory == 0 {
             self.mem0 = (instance.index, handle.index);
         }
-        handle.index
+        Ok(handle.index)
     }
 
     /// An `N`-byte load from the address at slot `at` (the caller writes the result over it).
@@ -218,7 +216,7 @@ impl Execution {
         (memory, offset): (u32, u64),
         at: usize,
     ) -> Result<[u8; N]> {
-        let index = self.memory_index(inner, instance, memory);
+        let index = self.memory_index(inner, instance, memory)?;
         let entity = inner.resolved_memory(index).ok_or_else(missing_memory)?;
         let ea = self.mem_ea::<N>(entity, offset, at)?;
         let mut buf = [0u8; N];
@@ -267,7 +265,7 @@ impl Execution {
         at: usize,
         data: [u8; N],
     ) -> Result<()> {
-        let index = self.memory_index(inner, instance, memory);
+        let index = self.memory_index(inner, instance, memory)?;
         let entity = inner
             .resolved_memory_mut(index)
             .ok_or_else(missing_memory)?;

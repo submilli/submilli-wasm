@@ -12,6 +12,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::{Execution, StepOutcome};
+use crate::error::ir_get;
 use crate::instance::Instance;
 use crate::module::op::Op;
 use crate::store::StoreInner;
@@ -91,17 +92,17 @@ impl Execution {
             }
             Op::ArrayNewData { ty, data, .. } => {
                 let stride = module.inner().array_layout(*ty)?.stride();
-                let dropped = inner.instance(instance).dropped_data[*data as usize];
+                let dropped = *ir_get(&inner.instance(instance).dropped_data, *data)?;
                 let seg = if dropped {
                     0
                 } else {
-                    module.inner().datas[*data as usize].bytes.len()
+                    ir_get(&module.inner().datas, *data)?.bytes.len()
                 };
                 seg_clamped_charge(self.peek_count()?, stride, seg)
             }
             Op::ArrayNewElem { ty, elem, .. } => {
                 let stride = module.inner().array_layout(*ty)?.stride();
-                let seg = inner.instance(instance).elems[*elem as usize]
+                let seg = ir_get(&inner.instance(instance).elems, *elem)?
                     .len()
                     .saturating_mul(stride);
                 seg_clamped_charge(self.peek_count()?, stride, seg)
