@@ -221,9 +221,8 @@ fn call_wasm<T>(
     let (param_tys, result_tys) = module.func_sig(func_index)?;
     check_call(&store.inner, params, n_results, param_tys, result_tys)?;
     let args = crate::extern_::coerce_args(&mut store.inner, params, param_tys)?;
-    let out = crate::exec::host::execute(store, instance, func_index, code, args, result_tys)?;
-    validate_results(&mut store.inner, &out, result_tys)?;
-    Ok(out)
+    // `execute` validates each result against its type (and roots references) as it decodes.
+    crate::exec::host::execute(store, instance, func_index, code, &args, result_tys)
 }
 
 /// [`check_call`] against a host callee's signature (materialized here; host signatures aren't

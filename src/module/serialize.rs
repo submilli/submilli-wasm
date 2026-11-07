@@ -25,7 +25,8 @@ const MAGIC: &[u8; 8] = b"submwc01";
 /// v13: `v128.const`/`i8x16.shuffle` immediates pooled in `CodeArenas::v128s` (16-byte `Op`).
 /// v14: slot-addressed `Op`s (static-height frame slots, step 2a) + pooled `br_on_cast` heaps.
 /// v15: three-address numeric/load/store `Op`s, `Copy`, two-slot `BrIfCmp` (step 2b).
-const ARTIFACT_VERSION: u32 = 15;
+/// v16: i32 immediate-operand `Op`s and `BrIfCmpImm` (step 2c).
+const ARTIFACT_VERSION: u32 = 16;
 
 /// Encodes a compiled module into the binary artifact format.
 pub(crate) fn encode(inner: &ModuleInner) -> Result<Vec<u8>> {

@@ -87,6 +87,10 @@ pub(crate) struct Execution {
     /// The current stack window's top: where a stack-window op (GC, SIMD, a host call's args)
     /// pops/pushes. Set by `enter_window`; slot-addressed ops never touch it.
     sp: usize,
+    /// The run loop's [`Code`] handle, kept while it is suspended so resuming needs no store
+    /// lookup — a hint only: the loop re-points it at the actual top frame (`top_into`). Cleared
+    /// when a call completes, so a reused execution doesn't keep a module alive.
+    code: Option<Code>,
     /// The engine's `max_wasm_stack` (bytes), cached at entry so every frame push is charged
     /// against it; `0` (fail closed) until an entry sets it.
     stack_limit: usize,
@@ -137,6 +141,7 @@ impl Default for Execution {
             floor: usize::MAX,
             control: None,
             sp: 0,
+            code: None,
             stack_limit: 0,
             gates_passed: false,
         }
@@ -151,7 +156,10 @@ impl Execution {
     /// Whether nothing at all survives from earlier calls — the condition for a store to reuse
     /// this execution's allocations ([`is_empty`](Self::is_empty) plus the transient fields).
     pub(crate) fn is_pristine(&self) -> bool {
-        self.is_empty() && self.host_reentry_depth == 0 && self.control.is_none()
+        self.is_empty()
+            && self.host_reentry_depth == 0
+            && self.control.is_none()
+            && self.code.is_none()
     }
 
     /// Heap bytes held by the stacks' capacity (bounds what a store keeps between calls).
@@ -178,7 +186,7 @@ impl Execution {
         instance: Instance,
         func_index: u32,
         code: Code,
-        args: Vec<Val>,
+        args: &[Val],
     ) -> Result<()> {
         let value_base = self.values.len();
         let frame_base = self.frames.len();
@@ -189,13 +197,13 @@ impl Execution {
                 .checked_add(1)
                 .ok_or(InternalError::FrameStack("host re-entry depth overflow"))?;
         }
-        if let Err(error) = self.push_delimiter(delim, instance, code.clone()) {
+        if let Err(error) = self.push_delimiter(delim, instance, &code) {
             self.host_reentry_depth = old_reentry_depth;
             return Err(error);
         }
         self.shadow.extend(args.iter().map(cell::RefTag::of_val));
-        self.values.extend(args.into_iter().map(cell::encode));
-        if let Err(error) = self.push_call(instance, func_index, code, value_base) {
+        self.values.extend(args.iter().map(|&v| cell::encode(v)));
+        if let Err(error) = self.push_call(instance, func_index, &code, value_base) {
             self.values.truncate(value_base);
             self.shadow.truncate(value_base);
             self.frames.truncate(frame_base);
@@ -203,6 +211,7 @@ impl Execution {
             self.host_reentry_depth = old_reentry_depth;
             return Err(error);
         }
+        self.code = Some(code);
         Ok(())
     }
 
@@ -226,14 +235,15 @@ impl Execution {
         Ok(())
     }
 
-    /// On a finished (sub-)call: splits off its result cells (everything above `value_base`) and
-    /// restores the shared stacks to the parked outer state (frames back to `stop_depth`).
+    /// On a finished (sub-)call: decodes its results (everything above `value_base`, against the
+    /// entry function's result types — the cells are untyped) and restores the shared stacks to
+    /// the parked outer state (frames back to `stop_depth`).
     fn take_results(
         &mut self,
         value_base: usize,
         stop_depth: usize,
         result_tys: &[ValType],
-    ) -> Result<Vec<cell::Cell>> {
+    ) -> Result<Vec<Val>> {
         if self.values.len() != self.shadow.len()
             || value_base > self.values.len()
             || stop_depth > self.frames.len()
@@ -241,8 +251,15 @@ impl Execution {
             return Err(InternalError::FrameStack("invalid completed call boundary").into());
         }
         self.validate_result_tags(value_base, result_tys)?;
+        self.code = None;
         self.release_reentry(stop_depth)?;
-        let results = self.values.split_off(value_base);
+        let cells = self.values.get(value_base..).unwrap_or_default();
+        let results = cells
+            .iter()
+            .zip(result_tys)
+            .map(|(&cell, ty)| cell::decode(cell, ty))
+            .collect();
+        self.values.truncate(value_base);
         self.shadow.truncate(value_base);
         self.frames.truncate(stop_depth);
         self.sync_floor();
@@ -260,6 +277,7 @@ impl Execution {
             return Err(InternalError::FrameStack("invalid failed call boundary").into());
         }
         self.release_reentry(stop_depth)?;
+        self.code = None;
         self.values.truncate(value_base);
         self.shadow.truncate(value_base);
         self.frames.truncate(stop_depth);
@@ -293,7 +311,7 @@ impl Execution {
     /// [`SLOT_CHARGE`]).
     #[inline]
     fn stack_bytes(&self) -> Result<usize> {
-        self.stack_bytes_for(self.values.len(), self.frames.len())
+        self.stack_bytes_for(self.live_top(), self.frames.len())
     }
 
     /// [`stack_bytes`](Self::stack_bytes) for a prospective `values`-slot buffer and `frames`
@@ -355,19 +373,37 @@ impl Execution {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // the resumable dispatch loop; arms are short
+    /// Runs the dispatch loop with the running frame's [`Code`] handle: the one stashed when the
+    /// loop last suspended (re-pointed at the top frame), else looked up from its instance.
     fn dispatch<T, const GATED: bool>(
         &mut self,
         store: &mut Store<T>,
         stop_depth: usize,
         gates: (bool, bool),
     ) -> Result<Outcome> {
+        let mut code = match self.code.take() {
+            Some(code) => code,
+            None => self.top_frame()?.code_in(&store.inner)?,
+        };
+        let outcome = self.dispatch_loop::<T, GATED>(store, stop_depth, gates, &mut code);
+        self.code = Some(code);
+        outcome
+    }
+
+    #[allow(clippy::too_many_lines)] // the resumable dispatch loop; arms are short
+    fn dispatch_loop<T, const GATED: bool>(
+        &mut self,
+        store: &mut Store<T>,
+        stop_depth: usize,
+        gates: (bool, bool),
+        code: &mut Code,
+    ) -> Result<Outcome> {
         // Amortized GC-pressure safepoint: armed only when the engine-wide axis exists, and
         // anchored to guest *calls* (zero per-op cost; call sites are already heavyweight).
         let gc_watch =
             store.inner.gc.is_collecting() && store.inner.engine().gc_memory_threshold().is_some();
         let mut gc_countdown: u32 = GC_CHECK_INTERVAL;
-        let (mut code, mut func, mut ip, mut base, mut instance) = self.top()?;
+        let (mut func, mut ip, mut base, mut instance) = self.top_into(&store.inner, code)?;
         // Two-level loop: the outer level re-derives the current frame's `ops` slice whenever the
         // frame changes; the inner level then fetches each op with a single `.get` — no per-op
         // `Arc`→`Vec`→len pointer chase, and the `None` case doubles as the end-of-function return
@@ -379,7 +415,7 @@ impl Execution {
                     if self.do_return(func.n_results, stop_depth)? {
                         return Ok(Outcome::Finished);
                     }
-                    (func, ip, base, instance) = self.top_into(&mut code)?;
+                    (func, ip, base, instance) = self.top_into(&store.inner, code)?;
                     continue 'frame;
                 };
                 if GATED {
@@ -387,11 +423,11 @@ impl Execution {
                         return Ok(out);
                     }
                 }
-                let next = match self.step(&mut store.inner, &code, op, ip + 1, base, instance) {
+                let next = match self.step(&mut store.inner, code, op, ip + 1, base, instance) {
                     Ok(next) => next,
                     Err(e) => match self.unwind(&mut store.inner, e, ip, stop_depth) {
                         Ok(()) => {
-                            (func, ip, base, instance) = self.top_into(&mut code)?;
+                            (func, ip, base, instance) = self.top_into(&store.inner, code)?;
                             continue 'frame;
                         }
                         Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
@@ -416,13 +452,15 @@ impl Execution {
                         // end below them.
                         caller.live_end = u32::try_from(req.args_at)
                             .map_err(|_| InternalError::FrameStack("operand index exceeds u32"))?;
-                        // A frame push past `max_wasm_stack` traps (`StackOverflow`) at this call.
-                        if let Err(e) =
-                            self.push_call(req.instance, req.func_index, req.code, req.args_at)
+                        // The callee's frame is known: switch to it directly (no `top_into`). A
+                        // frame push past `max_wasm_stack` traps (`StackOverflow`) at this call.
+                        let callee = req.callee;
+                        frame::switch_code(&store.inner, code, &callee);
+                        match self.push_call(callee.instance, callee.func_index, code, req.args_at)
                         {
-                            return Err(self.attach_trap_backtrace(&store.inner, e, ip));
+                            Ok((f, b)) => (func, ip, base, instance) = (f, 0, b, callee.instance),
+                            Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
                         }
-                        (func, ip, base, instance) = self.top_into(&mut code)?;
                         if gc_watch {
                             gc_countdown -= 1;
                             if gc_countdown == 0 {
@@ -436,13 +474,13 @@ impl Execution {
                     // the frame's base and pops it, then `push_call` lays the callee there.
                     StepOutcome::TailCall(req) => {
                         let dst = self.frame_base()?;
-                        let n_params = req.code.n_params() as usize;
-                        self.return_from(req.args_at, n_params, stop_depth)?;
-                        if let Err(e) = self.push_call(req.instance, req.func_index, req.code, dst)
-                        {
-                            return Err(self.attach_suspension_backtrace(&store.inner, e));
+                        let callee = req.callee;
+                        self.return_from(req.args_at, callee.n_params as usize, stop_depth)?;
+                        frame::switch_code(&store.inner, code, &callee);
+                        match self.push_call(callee.instance, callee.func_index, code, dst) {
+                            Ok((f, b)) => (func, ip, base, instance) = (f, 0, b, callee.instance),
+                            Err(e) => return Err(self.attach_suspension_backtrace(&store.inner, e)),
                         }
-                        (func, ip, base, instance) = self.top_into(&mut code)?;
                         if gc_watch {
                             gc_countdown -= 1;
                             if gc_countdown == 0 {
@@ -467,7 +505,7 @@ impl Execution {
                         if self.frames.len() == stop_depth {
                             return Ok(Outcome::Finished);
                         }
-                        (func, ip, base, instance) = self.top_into(&mut code)?;
+                        (func, ip, base, instance) = self.top_into(&store.inner, code)?;
                         continue 'frame;
                     }
                     #[cfg(feature = "async")]
@@ -502,7 +540,7 @@ impl Execution {
                         if self.frames.len() == stop_depth {
                             return Ok(Outcome::Finished);
                         }
-                        (func, ip, base, instance) = self.top_into(&mut code)?;
+                        (func, ip, base, instance) = self.top_into(&store.inner, code)?;
                         continue 'frame;
                     }
                     #[cfg(feature = "async")]

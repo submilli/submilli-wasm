@@ -23,7 +23,7 @@ pub(crate) async fn execute_async<T>(
     instance: Instance,
     func_index: u32,
     code: Code,
-    args: Vec<Val>,
+    args: &[Val],
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     let (mut exec, b) = enter(store, instance, func_index, code, args)?;

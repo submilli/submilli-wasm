@@ -1,14 +1,15 @@
-//! Call frames. One per active wasm call; the function's code is held as an
-//! `Arc<CompiledFunc>` so the run loop can read ops without borrowing the store
-//! or the value/frame stacks.
-
-use std::sync::Arc;
+//! Call frames. One per active wasm call. A frame names its function by module identity + index
+//! rather than holding the module (its instance does): the run loop keeps one [`Code`] handle for
+//! the running frame and re-points it on a frame switch, cloning only when the module changes.
 
 use super::cell::{Cell, RefTag, SLOT_BYTES};
 use crate::error::InternalError;
 use crate::instance::Instance;
 use crate::module::code::{Code, Span};
 use crate::module::op::{BranchTarget, CompiledFunc};
+use crate::store::StoreInner;
+
+use super::outcome::Callee;
 use crate::trap::Trap;
 
 /// The part of a function's [`CompiledFunc`] the run loop reads on every frame switch, cached so
@@ -31,7 +32,12 @@ impl FrameFunc {
 
 #[derive(Debug)]
 pub(crate) struct Frame {
-    pub code: Code,
+    /// The defining module's identity ([`Code::key`]): compared, never dereferenced. Sound because
+    /// the frame's instance keeps the module alive and instances are never reclaimed while their
+    /// store lives (`StoreInner::instances` is grow-only), so no other module can take its address.
+    pub module: usize,
+    /// Defined-function index in that module ([`Code::index`]).
+    pub index: u32,
     pub func: FrameFunc,
     /// Resume point in `code.ops` (saved when this frame makes a call).
     pub ip: u32,
@@ -39,9 +45,11 @@ pub(crate) struct Frame {
     pub locals_base: u32,
     /// First operand-stack slot above this frame's parameters and locals.
     pub operand_base: u32,
-    /// The operand buffer's length while this frame is on top (its slots end here, or further
-    /// if the caller's do); restored when a callee returns.
-    pub extent: u32,
+    /// One past the last slot of this frame *or any frame below it* — a callee starts inside its
+    /// caller's operand area, so its own slots can end below the caller's (a delimiter's is its
+    /// base). The buffer itself only grows within a call — returns leave callees' slots behind,
+    /// reused by the next call — so the top frame's `end` is the live stack top.
+    pub end: u32,
     /// One past this frame's last live slot, exact at its safepoints (a call, a stack-window op,
     /// a throw, a host return, a caught exception): the collector scans `[locals_base, live_end)`
     /// and clears the tags of dead slots above it. Between safepoints it goes stale (hot ops write
@@ -55,8 +63,35 @@ pub(crate) struct Frame {
     pub func_index: u32,
     /// A boundary marker, not an executable frame: it separates one (sub-)call's frames from the
     /// parked outer call's on the single shared operand/frame stack. The run loop never executes
-    /// one (`stop_depth` stops the call above it); its `code`/`instance` are inert filler.
+    /// one (`stop_depth` stops the call above it); its function/`instance` are inert filler.
     pub delimiter: Option<Delimiter>,
+}
+
+impl Frame {
+    /// A [`Code`] handle for this frame's function, from its instance (which owns the module).
+    /// Not for a delimiter (its function is filler).
+    pub(crate) fn code_in(&self, inner: &StoreInner) -> crate::Result<Code> {
+        if self.delimiter.is_some() {
+            return Err(InternalError::FrameStack("delimiter has no code").into());
+        }
+        let instance = inner
+            .try_instance(self.instance)
+            .ok_or(InternalError::FrameStack("frame instance is missing"))?;
+        Ok(instance.module.code(self.func_index))
+    }
+}
+
+/// Points the run loop's `code` at a callee, cloning the module handle only on a module switch.
+#[inline]
+pub(super) fn switch_code(inner: &StoreInner, code: &mut Code, callee: &Callee) {
+    if callee.key == code.key() {
+        code.index = callee.index;
+    } else {
+        *code = inner
+            .instance(callee.instance)
+            .module
+            .code(callee.func_index);
+    }
 }
 
 /// What a delimiter frame marks. `HostReentry` is a host→wasm re-entry (`Func::call` from a host
@@ -82,14 +117,16 @@ impl super::Execution {
     /// become its first locals; its results land back there). Grows the operand buffer to the
     /// frame's extent with zeroed cells and default-initializes the declared locals; the
     /// temporaries above are never read before written (validation), so they aren't cleared.
+    /// `code` is the callee's (the run loop's handle, already switched); returns the new frame's
+    /// cached record and base for the run loop.
     #[inline]
     pub(super) fn push_call(
         &mut self,
         instance: Instance,
         func_index: u32,
-        code: Code,
+        code: &Code,
         args_at: usize,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<(FrameFunc, u32)> {
         let func = code.func(); // resolved once; the frame caches the record
         let local_types = code.local_types_of(&func);
         let geometry = frame_geometry(args_at, &func, local_types.len())?;
@@ -97,18 +134,20 @@ impl super::Execution {
         if args_at < self.floor || args_end > self.values.len() {
             return Err(InternalError::OperandStack("call arguments out of place").into());
         }
-        let extent = geometry.end.max(self.values.len());
-        self.grow_for_frame(extent)?;
+        let end = geometry.end.max(self.live_top());
+        self.grow_for_frame(end)?;
         for (i, ty) in local_types.iter().enumerate() {
             self.set_default(args_end + i, ty)?;
         }
+        let frame_func = FrameFunc::of(&func);
         self.frames.push(Frame {
-            code,
-            func: FrameFunc::of(&func),
+            module: code.key(),
+            index: code.index,
+            func: frame_func,
             ip: 0,
             locals_base: geometry.base,
             operand_base: geometry.operand_base,
-            extent: to_u32(extent)?,
+            end: to_u32(end)?,
             live_end: geometry.operand_base,
             instance,
             func_index,
@@ -116,28 +155,41 @@ impl super::Execution {
         });
         self.sync_floor();
         self.sp = geometry.operand_base as usize;
-        Ok(())
+        Ok((frame_func, geometry.base))
     }
 
-    /// Charges a new frame (the buffer grown to `extent`) against `max_wasm_stack` *before*
+    /// Charges a new frame ending at `end` (the live stack top) against `max_wasm_stack` *before*
     /// allocating — a frame's operand area is sized statically, so one call can claim a large
-    /// extent — then grows the buffer zeroed. An allocation failure traps instead of aborting.
-    fn grow_for_frame(&mut self, extent: usize) -> crate::Result<()> {
+    /// extent — then grows the buffer zeroed if it doesn't reach that far yet (it usually does:
+    /// returns leave earlier frames' slots behind). An allocation failure traps, not aborts.
+    fn grow_for_frame(&mut self, end: usize) -> crate::Result<()> {
         let frames = self.frames.len().saturating_add(1);
-        if self.stack_bytes_for(extent, frames)? >= self.stack_limit {
+        if self.stack_bytes_for(end, frames)? >= self.stack_limit {
             return Err(Trap::StackOverflow.into());
         }
-        let extra = extent.saturating_sub(self.values.len());
+        let extra = end.saturating_sub(self.values.len());
         if extra == 0 {
             return Ok(());
         }
         if self.values.try_reserve(extra).is_err() || self.shadow.try_reserve(extra).is_err() {
             return Err(Trap::StackOverflow.into());
         }
-        self.values
-            .resize(extent, Cell::of_bytes([0u8; SLOT_BYTES]));
-        self.shadow.resize(extent, RefTag::NONE);
+        self.values.resize(end, Cell::of_bytes([0u8; SLOT_BYTES]));
+        self.shadow.resize(end, RefTag::NONE);
         Ok(())
+    }
+
+    /// The live stack top: the top frame's end (the buffer may extend past it, see `Frame::end`).
+    pub(super) fn live_top(&self) -> usize {
+        self.frames.last().map_or(0, |frame| frame.end as usize)
+    }
+
+    /// Drops the buffer past the live stack top — before a (re-)entered call appends its
+    /// arguments and boundary there.
+    pub(super) fn trim_to_live(&mut self) {
+        let top = self.live_top();
+        self.values.truncate(top);
+        self.shadow.truncate(top);
     }
 
     /// Pushes a [`Delimiter`] boundary marker (no slots, inert `code`/`instance` filler) at the
@@ -148,7 +200,7 @@ impl super::Execution {
         &mut self,
         kind: Delimiter,
         instance: Instance,
-        code: Code,
+        code: &Code,
     ) -> crate::Result<()> {
         if self.values.len() != self.shadow.len() {
             return Err(InternalError::OperandStack("value/shadow length mismatch").into());
@@ -156,12 +208,13 @@ impl super::Execution {
         let base = to_u32(self.values.len())?;
         let func = FrameFunc::of(&code.func());
         self.frames.push(Frame {
-            code,
+            module: code.key(),
+            index: code.index,
             func,
             ip: 0,
             locals_base: base,
             operand_base: base,
-            extent: base,
+            end: base,
             live_end: base,
             instance,
             func_index: 0,
@@ -220,12 +273,6 @@ impl super::Execution {
         Ok(())
     }
 
-    #[inline]
-    pub(super) fn top(&self) -> crate::Result<(Code, FrameFunc, u32, u32, Instance)> {
-        let f = self.top_frame()?;
-        Ok((f.code.clone(), f.func, f.ip, f.locals_base, f.instance))
-    }
-
     /// [`top`](Self::top) for the run loop's frame switches: retargets the loop's `code` handle
     /// in place, bumping the module `Arc` only when the new frame runs in a different module.
     /// Kept out of line: inlined into the dispatch loop it perturbed the hot ops' code layout
@@ -233,19 +280,20 @@ impl super::Execution {
     #[inline(never)]
     pub(super) fn top_into(
         &self,
+        inner: &StoreInner,
         code: &mut Code,
     ) -> crate::Result<(FrameFunc, u32, u32, Instance)> {
         let f = self.top_frame()?;
-        if Arc::ptr_eq(&code.module, &f.code.module) {
-            code.index = f.code.index;
+        if f.module == code.key() {
+            code.index = f.index;
         } else {
-            *code = f.code.clone();
+            *code = f.code_in(inner)?;
         }
         Ok((f.func, f.ip, f.locals_base, f.instance))
     }
 
     #[inline]
-    fn top_frame(&self) -> crate::Result<&Frame> {
+    pub(super) fn top_frame(&self) -> crate::Result<&Frame> {
         let f = self
             .frames
             .last()
@@ -293,20 +341,22 @@ impl super::Execution {
         stop_depth: usize,
     ) -> crate::Result<bool> {
         self.move_slots(src, dst, n)?;
-        self.pop_frame(dst.saturating_add(n));
-        Ok(self.frames.len() == stop_depth)
+        self.pop_frame();
+        let finished = self.frames.len() == stop_depth;
+        if finished {
+            // Back at the call's boundary: its results must end the buffer.
+            let end = dst.saturating_add(n);
+            self.values.truncate(end);
+            self.shadow.truncate(end);
+        }
+        Ok(finished)
     }
 
-    /// Pops the top frame and shrinks the operand buffer back to the caller's extent, keeping at
-    /// least `keep_to` cells (results just returned below the old frame).
+    /// Pops the top frame. The buffer keeps its slots for the next call (see `Frame::end`).
     #[inline]
-    pub(super) fn pop_frame(&mut self, keep_to: usize) {
+    pub(super) fn pop_frame(&mut self) {
         self.frames.pop();
         self.sync_floor();
-        let caller_extent = self.frames.last().map_or(0, |frame| frame.extent as usize);
-        let len = caller_extent.max(keep_to);
-        self.values.truncate(len);
-        self.shadow.truncate(len);
     }
 
     /// The current (top, executable) frame's base: a tail call lays its callee there.

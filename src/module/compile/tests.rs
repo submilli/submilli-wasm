@@ -4,7 +4,7 @@
 use super::{translate_function, wp_err, CompileCtx};
 use crate::canon::{AggKind, CompositeBody, IrVal, ModuleType};
 use crate::engine::Engine;
-use crate::module::op::{BranchTarget, Op, StoreArg};
+use crate::module::op::{BranchTarget, CmpKind, Op, StoreArg};
 use crate::value::{Finality, ValType};
 use crate::Result;
 use wasmparser::{FuncValidatorAllocations, Parser, ValidPayload, Validator};
@@ -288,4 +288,39 @@ fn dropped_relop_does_not_fuse_into_br_if() {
     // `br_if` tests local 0, not the dropped comparison.
     assert!(ops.iter().any(|op| matches!(op, Op::BrIf(..))));
     assert!(!ops.iter().any(|op| matches!(op, Op::BrIfCmp { .. })));
+}
+
+#[test]
+fn constant_operands_fold_into_immediates() {
+    let (sigs, ft) = one((&[ValType::I32], &[ValType::I32]));
+    let ops = compile_one(
+        "(module (func (param i32) (result i32) local.get 0 i32.const 1 i32.sub))",
+        &sigs,
+        &ft,
+        0,
+    )
+    .unwrap();
+    assert!(matches!(ops.as_slice(), [Op::I32AddImm(1, 0, -1)]));
+}
+
+#[test]
+fn compare_against_constant_fuses_into_one_branch() {
+    let (sigs, ft) = one((&[ValType::I32], &[]));
+    let ops = compile_one(
+        "(module (func (param i32) (block (br_if 0 (i32.lt_s (local.get 0) (i32.const 2))))))",
+        &sigs,
+        &ft,
+        0,
+    )
+    .unwrap();
+    assert!(matches!(
+        ops.as_slice(),
+        [Op::BrIfCmpImm {
+            kind: CmpKind::LtS,
+            negate: false,
+            lhs: 0,
+            imm: 2,
+            ..
+        }]
+    ));
 }

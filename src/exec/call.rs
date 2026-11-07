@@ -1,5 +1,6 @@
 //! `call_indirect`: table-element lookup, signature check, then a (wasm or host) call.
 
+use super::outcome::Callee;
 use super::{CallReq, Execution, ResolvedCall, StepOutcome};
 use crate::canon::{CanonicalTypeId, RefKind};
 use crate::func::Func;
@@ -21,20 +22,32 @@ pub(super) enum CallKind {
 /// host func. Imported functions resolve transparently — the handle already points at
 /// the defining instance's `FuncEntity`.
 #[inline]
-pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
-    match inner.func(f) {
+pub(super) fn resolve(inner: &StoreInner, f: Func) -> Result<ResolvedCall> {
+    Ok(match inner.func(f) {
         FuncEntity::Wasm {
             instance,
             func_index,
         } => {
-            let def_inst = *instance;
-            let code = inner.instance(def_inst).module.code(*func_index);
-            ResolvedCall::Wasm(def_inst, *func_index, code)
+            let module = &inner.instance(*instance).module;
+            let (index, func) =
+                module
+                    .defined(*func_index)
+                    .ok_or(crate::error::InternalError::FrameStack(
+                        "call target is not a defined function",
+                    ))?;
+            ResolvedCall::Wasm(Callee {
+                instance: *instance,
+                func_index: *func_index,
+                index,
+                key: module.key(),
+                n_params: func.n_params,
+                type_idx: func.type_idx,
+            })
         }
         FuncEntity::Host { .. } => ResolvedCall::Host(f),
         #[cfg(feature = "async")]
         FuncEntity::HostAsync { .. } => ResolvedCall::HostAsync(f),
-    }
+    })
 }
 
 impl Execution {
@@ -63,15 +76,15 @@ impl Execution {
         let expected_module = inner.instance(instance).module.clone();
         // Engine-canonical id of the expected type (cross-module, recursion-safe identity).
         let expected_id = expected_module.inner().canonical_type_id(type_idx);
-        let resolved = resolve(inner, f);
+        let resolved = resolve(inner, f)?;
         match &resolved {
             // The callee's type must be a subtype of the expected one (funcref subtyping).
-            ResolvedCall::Wasm(def_inst, _, code) => {
+            ResolvedCall::Wasm(callee) => {
                 let actual_id = inner
-                    .instance(*def_inst)
+                    .instance(callee.instance)
                     .module
                     .inner()
-                    .canonical_type_id(code.type_idx());
+                    .canonical_type_id(callee.type_idx);
                 if !inner.engine().is_subtype(actual_id, expected_id) {
                     return Err(Trap::BadSignature.into());
                 }
@@ -100,7 +113,7 @@ impl Execution {
             Ref::Func(None) => return Err(Trap::NullReference.into()),
             _ => return Err(Trap::BadSignature.into()),
         };
-        let resolved = resolve(inner, f);
+        let resolved = resolve(inner, f)?;
         let args_at = args_below(inner, &resolved, at)?;
         Ok(call_outcome(inner, resolved, instance, kind, args_at))
     }
@@ -117,7 +130,7 @@ pub(super) fn call_outcome(
     args_at: usize,
 ) -> StepOutcome {
     match resolved {
-        ResolvedCall::Wasm(def_inst, func_index, code) => {
+        ResolvedCall::Wasm(callee) => {
             let return_ip = match kind {
                 CallKind::Tail => 0,
                 CallKind::Nested(return_ip) => return_ip,
@@ -125,9 +138,7 @@ pub(super) fn call_outcome(
             let req = CallReq {
                 return_ip,
                 args_at,
-                instance: def_inst,
-                func_index,
-                code,
+                callee,
             };
             match kind {
                 CallKind::Tail => StepOutcome::TailCall(req),
@@ -183,7 +194,7 @@ fn host_sig_ok(inner: &StoreInner, func: Func, expected_id: CanonicalTypeId) -> 
 /// sits at `operand_at` (the arguments sit just below it).
 fn args_below(inner: &StoreInner, resolved: &ResolvedCall, operand_at: usize) -> Result<usize> {
     let n_params = match resolved {
-        ResolvedCall::Wasm(_, _, code) => code.n_params() as usize,
+        ResolvedCall::Wasm(callee) => callee.n_params as usize,
         ResolvedCall::Host(f) => host_n_params(inner, *f),
         #[cfg(feature = "async")]
         ResolvedCall::HostAsync(f) => host_n_params(inner, *f),

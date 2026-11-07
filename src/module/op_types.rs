@@ -73,3 +73,22 @@ pub(crate) const NULLABLE_BIT: u32 = 1 << 31;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[rustfmt::skip]
 pub(crate) enum CmpKind { Eq, Ne, LtS, LtU, GtS, GtU, LeS, LeU, GeS, GeU }
+
+impl CmpKind {
+    /// The same comparison with its operands swapped (`a < b` is `b > a`).
+    pub(crate) fn mirror(self) -> Self {
+        use CmpKind::{Eq, GeS, GeU, GtS, GtU, LeS, LeU, LtS, LtU, Ne};
+        match self {
+            Eq => Eq,
+            Ne => Ne,
+            LtS => GtS,
+            GtS => LtS,
+            LtU => GtU,
+            GtU => LtU,
+            LeS => GeS,
+            GeS => LeS,
+            LeU => GeU,
+            GeU => LeU,
+        }
+    }
+}

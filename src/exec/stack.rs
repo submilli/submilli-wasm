@@ -233,13 +233,13 @@ impl Execution {
         Ok(())
     }
 
-    /// Widens the top frame's live range to the buffer's end before host code runs at an
+    /// Widens the top frame's live range to its end (the live stack top) before host code runs at an
     /// arbitrary op (the epoch callback), where its `live_end` may be stale: call results, catch
     /// payloads and hot-op references can sit above it. Over-approximate but sound — every
     /// collection clears the tags of the slots it does not scan (see `operand_roots`), so a
     /// widened range only ever holds references to allocated objects.
     pub(super) fn widen_top_live_range(&mut self) -> Result<()> {
-        self.set_live_end(self.values.len())
+        self.set_live_end(self.live_top())
     }
 
     /// Reads the value at slot `at` as `ty`, refusing a tag that doesn't match the type.

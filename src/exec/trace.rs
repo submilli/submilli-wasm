@@ -3,7 +3,6 @@
 
 use crate::backtrace::{FrameInfo, WasmBacktrace};
 use crate::instance::Instance;
-use crate::module::code::Code;
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::Error;
@@ -18,10 +17,10 @@ pub(crate) fn frame_info(
     inner: &StoreInner,
     instance: Instance,
     func_index: u32,
-    code: &Code,
     ip: u32,
 ) -> Option<FrameInfo> {
     let module = inner.try_instance(instance)?.module.clone();
+    let code = module.code(func_index);
     let code_offset = code.offsets().and_then(|o| o.get(ip as usize).copied());
     Some(FrameInfo::new(module, func_index, code_offset))
 }
@@ -44,7 +43,7 @@ fn build(inner: &StoreInner, frames: &[Frame], top_ip: Option<u32>) -> WasmBackt
                     Some(ip) if Some(i) == last_real => ip,
                     _ => f.ip.saturating_sub(1),
                 };
-                if let Some(info) = frame_info(inner, f.instance, f.func_index, &f.code, ip) {
+                if let Some(info) = frame_info(inner, f.instance, f.func_index, ip) {
                     infos.push(info);
                 }
             }

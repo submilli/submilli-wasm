@@ -197,23 +197,35 @@ pub(crate) fn ensure_values_match(
 /// The untyped operand stack stores only a bare handle, so leaving the cross-hierarchy value as an
 /// externref would make execution read it against the wrong arena. Other arguments pass through
 /// untouched. See ARCHITECTURE §6.
-pub(crate) fn coerce_args(
+/// Borrows `params` unchanged when nothing needs internalizing (the common case: no allocation).
+pub(crate) fn coerce_args<'a>(
     inner: &mut StoreInner,
-    params: &[Val],
+    params: &'a [Val],
     param_tys: &[ValType],
-) -> Result<Vec<Val>> {
-    params
+) -> Result<std::borrow::Cow<'a, [Val]>> {
+    if !params
+        .iter()
+        .zip(param_tys)
+        .any(|(v, t)| needs_coercion(v, t))
+    {
+        return Ok(std::borrow::Cow::Borrowed(params));
+    }
+    let coerced = params
         .iter()
         .zip(param_tys)
         .map(|(&v, pty)| coerce_arg(inner, v, pty))
-        .collect()
+        .collect::<Result<Vec<Val>>>()?;
+    Ok(std::borrow::Cow::Owned(coerced))
+}
+
+fn needs_coercion(v: &Val, ty: &ValType) -> bool {
+    matches!((v, ty), (Val::ExternRef(Some(_)), ValType::Ref(rt)) if matches!(rt.heap_type(), HeapType::Any))
 }
 
 fn coerce_arg(inner: &mut StoreInner, v: Val, ty: &ValType) -> Result<Val> {
-    match (v, ty) {
-        (Val::ExternRef(Some(_)), ValType::Ref(rt)) if matches!(rt.heap_type(), HeapType::Any) => {
-            inner.any_convert_extern(v)
-        }
-        _ => Ok(v),
+    if needs_coercion(&v, ty) {
+        inner.any_convert_extern(v)
+    } else {
+        Ok(v)
     }
 }

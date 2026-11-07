@@ -93,6 +93,18 @@ impl Execution {
                     return Ok(*ip);
                 }
             }
+            Op::BrIfCmpImm {
+                kind,
+                negate,
+                ip,
+                lhs,
+                imm,
+            } => {
+                let a = self.scalar_at(slot(base, *lhs))?.unwrap_i32();
+                if cmp_i32(*kind, a, *imm) != *negate {
+                    return Ok(*ip);
+                }
+            }
             Op::BrTable(range, s) => {
                 // Targets live out-of-line in `code.br_tables`: `len` cases then the default.
                 let pool = code.br_tables();
@@ -114,7 +126,7 @@ impl Execution {
             call_op @ (Op::Call(f, s) | Op::ReturnCall(f, s)) => {
                 let callee = index_space::func(inner, instance, *f);
                 let kind = call_kind(matches!(call_op, Op::ReturnCall(..)), next);
-                let resolved = call::resolve(inner, callee);
+                let resolved = call::resolve(inner, callee)?;
                 let outcome = call::call_outcome(inner, resolved, instance, kind, slot(base, *s));
                 return Ok(self.control(outcome));
             }
@@ -384,6 +396,29 @@ impl Execution {
                 self.exec_gc(inner, alloc, instance)?;
             }
             // Numerics: flat for the same reason as loads/stores.
+            // --- i32 with an immediate right operand ---
+            Op::I32AddImm(d, a, k) => self.i32_unop(un(base, *d, *a), |x| x.wrapping_add(*k))?,
+            Op::I32MulImm(d, a, k) => self.i32_unop(un(base, *d, *a), |x| x.wrapping_mul(*k))?,
+            Op::I32AndImm(d, a, k) => self.i32_unop(un(base, *d, *a), |x| x & *k)?,
+            Op::I32OrImm(d, a, k) => self.i32_unop(un(base, *d, *a), |x| x | *k)?,
+            Op::I32XorImm(d, a, k) => self.i32_unop(un(base, *d, *a), |x| x ^ *k)?,
+            Op::I32ShlImm(d, a, k) => {
+                self.i32_unop(un(base, *d, *a), |x| x.wrapping_shl(*k as u32))?;
+            }
+            Op::I32ShrSImm(d, a, k) => {
+                self.i32_unop(un(base, *d, *a), |x| x.wrapping_shr(*k as u32))?;
+            }
+            Op::I32ShrUImm(d, a, k) => {
+                self.i32_unop(un(base, *d, *a), |x| {
+                    (x as u32).wrapping_shr(*k as u32) as i32
+                })?;
+            }
+            Op::I32CmpImm {
+                kind,
+                dst,
+                lhs,
+                imm,
+            } => self.i32_unop(un(base, *dst, *lhs), |x| i32::from(cmp_i32(*kind, x, *imm)))?,
             // --- i32 ---
             Op::I32Eqz(d, a) => self.i32_unop(un(base, *d, *a), |a| i32::from(a == 0))?,
             Op::I32Eq(d, a, b) => self.i32_relop(bin(base, *d, *a, *b), |a, b| a == b)?,

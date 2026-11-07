@@ -127,11 +127,12 @@ impl Execution {
             let frame = self.frames.last().ok_or(InternalError::FrameStack(
                 "missing frame during exception unwind",
             ))?;
-            let (code, floor, instance) = (frame.code.clone(), frame.operand_base, frame.instance);
+            let (code, floor, instance) =
+                (frame.code_in(inner)?, frame.operand_base, frame.instance);
             if let Some(rec) = find_clause(&code, fault_ip, inner, instance, thrown)? {
                 return self.enter_exception_handler(inner, exn, rec, floor);
             }
-            self.pop_frame(0);
+            self.pop_frame();
             // Stop at this call's boundary: an exception uncaught within these frames does not cross
             // the delimiter into a parked outer call (it surfaces to that call's `Func::call`).
             if self.frames.len() == stop_depth {

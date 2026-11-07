@@ -73,6 +73,8 @@ pub(crate) struct StoreInner {
     /// (freed on store drop); its `args` are GC roots the tracing collector (#27g) enumerates
     /// transitively (the exn arena itself is not reclaimed yet — see `gc_collect`).
     pub(super) exns: ReclaimArena<ExnEntity>,
+    /// Grow-only: execution frames identify their module by address (`exec::Frame::module`),
+    /// which is only sound while every instance — and so its module — lives as long as the store.
     pub(super) instances: Arena<InstanceEntity>,
     /// Host payloads backing `externref` values; `Rooted<ExternRef>` indexes here. Traced for GC
     /// reachability; box reclamation is a follow-up (see `gc_collect`).

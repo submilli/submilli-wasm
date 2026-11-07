@@ -88,7 +88,7 @@ fn compile_wat(
     Ok((engine, code))
 }
 
-fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: Vec<Val>) -> Result<Vec<Val>> {
+fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: &[Val]) -> Result<Vec<Val>> {
     let (engine, code) = compile_wat(wat, params, results)?;
     let mut store = Store::new(&engine, ());
     host::execute(
@@ -106,7 +106,7 @@ fn operand_underflow_is_internal_uncatchable_and_store_remains_usable() {
     let (engine, code) = compile_wat("(module (func))", &[], &[]).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance { index: 0, store: 0 };
-    let (mut exec, boundary) = host::enter(&mut store, instance, 0, code.clone(), vec![]).unwrap();
+    let (mut exec, boundary) = host::enter(&mut store, instance, 0, code.clone(), &[]).unwrap();
 
     let error = exec.pop().unwrap_err();
     assert!(error.is::<crate::error::InternalError>());
@@ -114,7 +114,7 @@ fn operand_underflow_is_internal_uncatchable_and_store_remains_usable() {
     assert!(error.is::<crate::error::InternalError>());
     assert!(!error.is::<super::exn::PendingException>());
 
-    assert!(host::execute(&mut store, instance, 0, code, vec![], &[])
+    assert!(host::execute(&mut store, instance, 0, code, &[], &[])
         .unwrap()
         .is_empty());
 }
@@ -142,7 +142,7 @@ fn operand_underflow_bypasses_guest_catch_all() {
         Instance { index: 0, store: 0 },
         0,
         code,
-        vec![],
+        &[],
         &[],
     )
     .unwrap_err();
@@ -156,7 +156,7 @@ fn inconsistent_operand_shadow_fails_without_partial_pop() {
     let mut store = Store::new(&engine, ());
     let instance = Instance { index: 0, store: 0 };
     let (mut exec, boundary) =
-        host::enter(&mut store, instance, 0, code.clone(), vec![Val::I32(7)]).unwrap();
+        host::enter(&mut store, instance, 0, code.clone(), &[Val::I32(7)]).unwrap();
     exec.shadow.pop();
     let values_before = exec.values.len();
 
@@ -171,20 +171,20 @@ fn inconsistent_operand_shadow_fails_without_partial_pop() {
     assert!(error.is::<crate::error::InternalError>());
 
     assert!(
-        host::execute(&mut store, instance, 0, code, vec![Val::I32(9)], &[],)
+        host::execute(&mut store, instance, 0, code, &[Val::I32(9)], &[],)
             .unwrap()
             .is_empty()
     );
 }
 
-fn run_i32(wat: &str, params: &[ValType], args: Vec<Val>) -> i32 {
+fn run_i32(wat: &str, params: &[ValType], args: &[Val]) -> i32 {
     run_wat(wat, params, &[ValType::I32], args).unwrap()[0].unwrap_i32()
 }
 
 #[test]
 fn const_return() {
     assert_eq!(
-        run_i32("(module (func (result i32) i32.const 42))", &[], vec![]),
+        run_i32("(module (func (result i32) i32.const 42))", &[], &[]),
         42
     );
 }
@@ -194,7 +194,7 @@ fn local_get_param() {
     let got = run_i32(
         "(module (func (param i32 i32) (result i32) local.get 1))",
         &[ValType::I32, ValType::I32],
-        vec![Val::I32(7), Val::I32(9)],
+        &[Val::I32(7), Val::I32(9)],
     );
     assert_eq!(got, 9);
 }
@@ -204,7 +204,7 @@ fn local_tee_and_drop() {
     let got = run_i32(
         "(module (func (result i32) (local i32) i32.const 5 local.tee 0 drop local.get 0))",
         &[],
-        vec![],
+        &[],
     );
     assert_eq!(got, 5);
 }
@@ -214,7 +214,7 @@ fn select_picks_second_when_zero() {
     let got = run_i32(
         "(module (func (result i32) i32.const 10 i32.const 20 i32.const 0 select))",
         &[],
-        vec![],
+        &[],
     );
     assert_eq!(got, 20);
 }
@@ -225,7 +225,7 @@ fn multi_value_results() {
         "(module (func (result i32 i32) i32.const 1 i32.const 2))",
         &[],
         &[ValType::I32, ValType::I32],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(res[0].unwrap_i32(), 1);
@@ -237,7 +237,7 @@ fn block_branch() {
     let got = run_i32(
         "(module (func (result i32) (block (result i32) i32.const 5 br 0)))",
         &[],
-        vec![],
+        &[],
     );
     assert_eq!(got, 5);
 }
@@ -246,8 +246,8 @@ fn block_branch() {
 fn if_else_both_arms() {
     let wat = "(module (func (param i32) (result i32) local.get 0 \
         (if (result i32) (then i32.const 1) (else i32.const 2))))";
-    assert_eq!(run_i32(wat, &[ValType::I32], vec![Val::I32(1)]), 1);
-    assert_eq!(run_i32(wat, &[ValType::I32], vec![Val::I32(0)]), 2);
+    assert_eq!(run_i32(wat, &[ValType::I32], &[Val::I32(1)]), 1);
+    assert_eq!(run_i32(wat, &[ValType::I32], &[Val::I32(0)]), 2);
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn loop_fallthrough() {
     let got = run_i32(
         "(module (func (result i32) (loop (result i32) i32.const 7)))",
         &[],
-        vec![],
+        &[],
     );
     assert_eq!(got, 7);
 }
@@ -265,7 +265,7 @@ fn explicit_return() {
     let got = run_i32(
         "(module (func (param i32) (result i32) local.get 0 return))",
         &[ValType::I32],
-        vec![Val::I32(3)],
+        &[Val::I32(3)],
     );
     assert_eq!(got, 3);
 }
@@ -274,7 +274,7 @@ fn const_i32(wat_body: &str) -> i32 {
     run_i32(
         &format!("(module (func (result i32) {wat_body}))"),
         &[],
-        vec![],
+        &[],
     )
 }
 
@@ -283,7 +283,7 @@ fn trap_of(wat_body: &str) -> Trap {
         &format!("(module (func (result i32) {wat_body}))"),
         &[],
         &[ValType::I32],
-        vec![],
+        &[],
     )
     .unwrap_err();
     *err.downcast_ref::<Trap>().expect("a Trap")
@@ -321,7 +321,7 @@ fn i64_division() {
         "(module (func (result i64) i64.const 10 i64.const 3 i64.div_u))",
         &[],
         &[ValType::I64],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(got[0].unwrap_i64(), 3);
@@ -333,7 +333,7 @@ fn float_arithmetic() {
         "(module (func (result f64) f64.const 1.5 f64.const 2.25 f64.add))",
         &[],
         &[ValType::F64],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(add[0].unwrap_f64().to_bits(), 3.75_f64.to_bits());
@@ -342,7 +342,7 @@ fn float_arithmetic() {
         "(module (func (result f32) f32.const 4 f32.sqrt))",
         &[],
         &[ValType::F32],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(sqrt[0].unwrap_f32().to_bits(), 2.0_f32.to_bits());
@@ -351,7 +351,7 @@ fn float_arithmetic() {
         "(module (func (result f32) f32.const 1 f32.const -2 f32.copysign))",
         &[],
         &[ValType::F32],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(copysign[0].unwrap_f32().to_bits(), (-1.0_f32).to_bits());
@@ -363,7 +363,7 @@ fn float_min_canonical_nan() {
         "(module (func (result f32) f32.const nan f32.const 1 f32.min))",
         &[],
         &[ValType::F32],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(res[0].unwrap_f32().to_bits(), 0x7fc0_0000);
@@ -389,7 +389,7 @@ fn conversions() {
         "(module (func (result i64) i32.const -1 i64.extend_i32_s))",
         &[],
         &[ValType::I64],
-        vec![],
+        &[],
     )
     .unwrap();
     assert_eq!(ext[0].unwrap_i64(), -1);

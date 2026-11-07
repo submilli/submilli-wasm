@@ -9,6 +9,7 @@ mod control;
 mod conv;
 mod core;
 mod gc;
+mod imm;
 mod memory;
 mod numeric;
 mod provider;
@@ -206,11 +207,14 @@ struct Translator<'a> {
     /// Byte offset of the operator currently being translated; recorded per emitted `Op` into
     /// the offsets arena (when retained) so a frame's `ip` maps back to source via DWARF (#29a).
     cur_offset: u32,
-    /// `Some((kind, lhs, rhs, dst))` while the last emitted op is a fusable i32 relop that a
-    /// following `br_if`/`if` testing its result (`dst`) may collapse into an [`Op::BrIfCmp`]. Set
-    /// by [`Translator::emit`] per op; cleared at every control boundary where a branch label
-    /// could land between the pair (see `control`).
-    fusable_cmp: Option<(CmpKind, Slot, Slot, Slot)>,
+    /// `Some((kind, lhs, rhs, dst))` while the last emitted op is a fusable i32 comparison that a
+    /// following `br_if`/`if` testing its result (`dst`) may collapse into one branch op
+    /// ([`fused_branch`]). Set by the helpers emitting comparisons; cleared by every other emit
+    /// and at every control boundary where a branch label could land between the pair.
+    fusable_cmp: Option<(CmpKind, Slot, CmpRhs, Slot)>,
+    /// `Some((dst, k))` while the last emitted op is `i32.const k` into `dst`, which a following
+    /// binop may fold into an immediate form (see `imm`). Same lifetime as `fusable_cmp`.
+    pending_const: Option<(Slot, i32)>,
     /// `Some((ip, dst))` while the last emitted op computes into a free destination `dst`
     /// ([`Op::dst_mut`]) that a following `local.set`/`local.tee` of that result may retarget
     /// at the local. Same lifetime as `fusable_cmp`.
@@ -250,6 +254,7 @@ impl<'a> Translator<'a> {
             cur_offset: 0,
             fusable_cmp: None,
             fusable_dst: None,
+            pending_const: None,
             error: None,
         }
     }
@@ -383,6 +388,24 @@ impl<'a> Translator<'a> {
     fn clear_fusion(&mut self) {
         self.fusable_cmp = None;
         self.fusable_dst = None;
+        self.pending_const = None;
+    }
+
+    /// Removes the last emitted op if it is `i32.const k` into `dst` (an immediate form takes its
+    /// place, at the same ip), returning its source offset; `None` if it is not that constant.
+    fn unemit_const(&mut self, dst: Slot, k: i32) -> Option<u32> {
+        let is_const =
+            matches!(self.code.ops.last(), Some(&Op::I32Const(d, v)) if d == dst && v == k);
+        if !is_const || self.next_ip() == 0 {
+            return None;
+        }
+        self.code.ops.pop();
+        let offset = if self.retain_offsets {
+            self.code.offsets.pop()
+        } else {
+            None
+        };
+        Some(offset.unwrap_or(self.cur_offset))
     }
 
     fn height_below(&mut self, n: u32) -> u32 {
@@ -426,7 +449,10 @@ impl<'a> Translator<'a> {
         let src = self.operand(0);
         let dst = self.height_slot(1);
         self.produce(1, dst);
-        self.emit_result(op(dst, src), dst);
+        let op = op(dst, src);
+        let cmp = fusable_cmp_of(&op); // `i32.eqz`
+        self.emit_result(op, dst);
+        self.fusable_cmp = cmp;
     }
 
     /// pop `n`, push 1, in place: the result overwrites the first operand's slot (the cold
@@ -504,9 +530,29 @@ impl<'a> Translator<'a> {
     }
 }
 
-/// The comparison kind if `op` is a fusable i32 relop (the [`Op::BrIfCmp`] candidates).
-fn fusable_cmp_of(op: &Op) -> Option<(CmpKind, Slot, Slot, Slot)> {
-    Some(match *op {
+/// A fusable comparison's right operand.
+#[derive(Copy, Clone, Debug)]
+pub(super) enum CmpRhs {
+    Slot(Slot),
+    Imm(i32),
+}
+
+/// `(kind, lhs, rhs, dst)` if `op` is an i32 comparison a following branch may fuse with:
+/// a relop, its immediate form, or `i32.eqz` (`== 0`).
+fn fusable_cmp_of(op: &Op) -> Option<(CmpKind, Slot, CmpRhs, Slot)> {
+    if let Op::I32CmpImm {
+        kind,
+        dst,
+        lhs,
+        imm,
+    } = *op
+    {
+        return Some((kind, lhs, CmpRhs::Imm(imm), dst));
+    }
+    if let Op::I32Eqz(dst, src) = *op {
+        return Some((CmpKind::Eq, src, CmpRhs::Imm(0), dst));
+    }
+    let (kind, a, b, d) = match *op {
         Op::I32Eq(d, a, b) => (CmpKind::Eq, a, b, d),
         Op::I32Ne(d, a, b) => (CmpKind::Ne, a, b, d),
         Op::I32LtS(d, a, b) => (CmpKind::LtS, a, b, d),
@@ -518,5 +564,37 @@ fn fusable_cmp_of(op: &Op) -> Option<(CmpKind, Slot, Slot, Slot)> {
         Op::I32GeS(d, a, b) => (CmpKind::GeS, a, b, d),
         Op::I32GeU(d, a, b) => (CmpKind::GeU, a, b, d),
         _ => return None,
-    })
+    };
+    Some((kind, a, CmpRhs::Slot(b), d))
+}
+
+/// The single branch a comparison and the `br_if` (`negate == false`) or `if` (`negate == true`)
+/// testing it fuse into: against zero, a plain conditional branch on `lhs` itself.
+pub(super) fn fused_branch(
+    kind: CmpKind,
+    negate: bool,
+    target: BranchTarget,
+    lhs: Slot,
+    rhs: CmpRhs,
+) -> Op {
+    match (kind, rhs) {
+        (CmpKind::Eq, CmpRhs::Imm(0)) if negate => Op::BrIf(target, lhs),
+        (CmpKind::Eq, CmpRhs::Imm(0)) => Op::BrIfNot(target, lhs),
+        (CmpKind::Ne, CmpRhs::Imm(0)) if negate => Op::BrIfNot(target, lhs),
+        (CmpKind::Ne, CmpRhs::Imm(0)) => Op::BrIf(target, lhs),
+        (_, CmpRhs::Slot(rhs)) => Op::BrIfCmp {
+            kind,
+            negate,
+            ip: target.ip,
+            lhs,
+            rhs,
+        },
+        (_, CmpRhs::Imm(imm)) => Op::BrIfCmpImm {
+            kind,
+            negate,
+            ip: target.ip,
+            lhs,
+            imm,
+        },
+    }
 }

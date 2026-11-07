@@ -36,6 +36,14 @@ pub(crate) enum Op {
         lhs: Slot,
         rhs: Slot,
     },
+    /// [`Op::BrIfCmp`] against an immediate right operand (a folded constant, step 2c).
+    BrIfCmpImm {
+        kind: CmpKind,
+        negate: bool,
+        ip: u32,
+        lhs: Slot,
+        imm: i32,
+    },
     /// Targets live in [`CompiledFunc::br_tables`]; see [`BrTableRange`].
     BrTable(BrTableRange, Slot),
     // Calls: a direct call's slot is its first argument (the callee's frame starts there; results
@@ -147,6 +155,25 @@ pub(crate) enum Op {
     TableGrow(TableIdx, Slot),
     /// `(table, s)`: operands `dst, value, len`.
     TableFill(TableIdx, Slot),
+
+    // --- i32 with an immediate right operand (step 2c): `(dst, lhs, k)`, a constant folded out
+    // of the op stream ---
+    /// `lhs + k` (also `lhs - c`, as `k = -c`).
+    I32AddImm(Slot, Slot, i32),
+    I32MulImm(Slot, Slot, i32),
+    I32AndImm(Slot, Slot, i32),
+    I32OrImm(Slot, Slot, i32),
+    I32XorImm(Slot, Slot, i32),
+    I32ShlImm(Slot, Slot, i32),
+    I32ShrSImm(Slot, Slot, i32),
+    I32ShrUImm(Slot, Slot, i32),
+    /// An i32 comparison against an immediate: `dst` = `lhs <kind> imm`.
+    I32CmpImm {
+        kind: CmpKind,
+        dst: Slot,
+        lhs: Slot,
+        imm: i32,
+    },
 
     // --- constants (floats as raw bits) ---
     I32Const(Slot, i32),
@@ -482,13 +509,15 @@ impl Op {
                 I64ReinterpretF64 F32ReinterpretI32 F64ReinterpretI64 I32Extend8S I32Extend16S
                 I64Extend8S I64Extend16S I64Extend32S I32TruncSatF32S I32TruncSatF32U
                 I32TruncSatF64S I32TruncSatF64U I64TruncSatF32S I64TruncSatF32U I64TruncSatF64S
-                I64TruncSatF64U I32Const I64Const F32Const F64Const GlobalGet
+                I64TruncSatF64U I32Const I64Const F32Const F64Const GlobalGet I32AddImm I32MulImm
+                I32AndImm I32OrImm I32XorImm I32ShlImm I32ShrSImm I32ShrUImm
             ) => Some(d),
             // A pooled load keeps its address in place at `dst`.
             first_field_of!(m;
                 I32Load I64Load F32Load F64Load I32Load8S I32Load8U I32Load16S I32Load16U
                 I64Load8S I64Load8U I64Load16S I64Load16U I64Load32S I64Load32U
             ) => (m.offset != BIG_MEMARG).then_some(&mut m.dst),
+            Op::I32CmpImm { dst, .. } => Some(dst),
             _ => None,
         }
     }

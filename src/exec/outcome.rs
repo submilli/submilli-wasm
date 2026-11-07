@@ -5,7 +5,6 @@
 use crate::extern_::{Memory, Table};
 use crate::func::Func;
 use crate::instance::Instance;
-use crate::module::code::Code;
 use crate::value::Ref;
 
 /// Why [`Execution::run`](super::Execution::run) returned: either the call finished or it
@@ -113,13 +112,27 @@ pub(super) enum StepOutcome {
     },
 }
 
-/// A resolved callee: a wasm body (defining instance + func index + code) to push a frame for,
-/// or a host func to suspend on.
+/// A resolved callee: a wasm body to push a frame for, or a host func to suspend on.
 pub(super) enum ResolvedCall {
-    Wasm(Instance, u32, Code),
+    Wasm(Callee),
     Host(Func),
     #[cfg(feature = "async")]
     HostAsync(Func),
+}
+
+/// A wasm callee, resolved without taking a handle on its module.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Callee {
+    /// The defining instance.
+    pub instance: Instance,
+    /// Module-space function index (backtraces; rebuilding a [`Code`](crate::module::code::Code) on a module switch).
+    pub func_index: u32,
+    /// Defined-function index ([`Code::index`](crate::module::code::Code::index)).
+    pub index: u32,
+    /// The module's identity ([`Code::key`](crate::module::code::Code::key)).
+    pub key: usize,
+    pub n_params: u32,
+    pub type_idx: u32,
 }
 
 /// A pending wasm call (frame to push) produced by [`step`](super::Execution::step).
@@ -128,7 +141,5 @@ pub(super) struct CallReq {
     pub return_ip: u32,
     /// Absolute operand index of the first argument (the callee's frame base).
     pub args_at: usize,
-    pub instance: Instance,
-    pub func_index: u32,
-    pub code: Code,
+    pub callee: Callee,
 }

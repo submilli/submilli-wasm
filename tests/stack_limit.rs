@@ -282,3 +282,33 @@ fn many_locals_fit_the_default_budget() {
     let inst = Instance::new(&mut store, &m, &[]).unwrap();
     call_export(&mut store, inst, "run").unwrap();
 }
+
+/// Returns leave callees' slots in the operand buffer for the next call to reuse; a host re-entry
+/// is charged for the live stack, not that high-water mark. `deep(170)` uses ~60% of the budget;
+/// run once directly and once re-entered from a host call, it must fit both times.
+#[test]
+fn reentry_is_charged_for_the_live_stack_not_the_high_water() {
+    let engine = engine_with_stack(256 << 10);
+    let locals = " i64".repeat(100);
+    let wat = format!(
+        r#"(module
+            (import "h" "reenter" (func $reenter))
+            (func $deep (export "deep") (param i32) (local{locals})
+                (if (local.get 0) (then (call $deep (i32.sub (local.get 0) (i32.const 1))))))
+            (func (export "run") (call $deep (i32.const 170)) (call $reenter)))"#
+    );
+    let m = module(&engine, &wat);
+    let mut store = Store::new(&engine, ());
+    let reenter = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        |mut caller, _, _| {
+            let Some(Extern::Func(deep)) = caller.get_export("deep") else {
+                panic!("deep is exported");
+            };
+            deep.call(&mut caller, &[Val::I32(170)], &mut [])
+        },
+    );
+    let inst = Instance::new(&mut store, &m, &[reenter.into()]).unwrap();
+    call_export(&mut store, inst, "run").unwrap();
+}

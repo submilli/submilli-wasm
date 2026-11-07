@@ -85,6 +85,14 @@ pub(crate) struct Code {
 // against the same arenas they index (#33 carve-out).
 #[allow(clippy::indexing_slicing)]
 impl Code {
+    /// The module's identity, for comparison only: frames record it instead of holding a handle
+    /// (their instance keeps the module alive), so a same-module call or return costs no refcount
+    /// traffic. Never turned back into a pointer.
+    #[inline]
+    pub(crate) fn key(&self) -> usize {
+        Arc::as_ptr(&self.module).addr()
+    }
+
     #[inline]
     fn f(&self) -> &CompiledFunc {
         &self.module.functions[self.index as usize]

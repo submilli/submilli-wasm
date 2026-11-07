@@ -9,7 +9,7 @@
 use super::epoch::apply_epoch_deadline;
 use super::exn::surface_exception;
 use super::frame::Delimiter;
-use super::{cell, Execution, Outcome};
+use super::{Execution, Outcome};
 use crate::canon::RefKind;
 use crate::error::InternalError;
 use crate::exception::ThrownException;
@@ -53,21 +53,13 @@ pub(super) fn root_ref_params(inner: &mut StoreInner, params: &[Val]) {
     }
 }
 
-/// Decodes the final operand cells back to public `Val`s using the entry function's result types
-/// (the stack is untyped; the caller's signature supplies the types — see `cell`).
-fn decode_results(
+/// Validates the decoded results against the entry function's result types and roots the
+/// references among them for the host (the operand shadow stops rooting them at the boundary).
+fn check_results(
     inner: &mut StoreInner,
     result_tys: &[ValType],
-    cells: Vec<cell::Cell>,
+    decoded: Vec<Val>,
 ) -> Result<Vec<Val>> {
-    if result_tys.len() != cells.len() {
-        return Err(InternalError::ResultShape("wrong number of execution results").into());
-    }
-    let decoded: Vec<Val> = result_tys
-        .iter()
-        .zip(cells)
-        .map(|(t, c)| cell::decode(c, t))
-        .collect();
     if let Err(error) = crate::extern_::ensure_values_match(
         inner,
         &decoded,
@@ -121,7 +113,7 @@ pub(super) fn enter<T>(
     instance: Instance,
     func_index: u32,
     code: Code,
-    args: Vec<Val>,
+    args: &[Val],
 ) -> Result<(Execution, Boundary)> {
     let error = if store.inner.has_parked_execution() {
         store.inner.internal_error()
@@ -132,6 +124,7 @@ pub(super) fn enter<T>(
         return Err(error);
     }
     let mut exec = store.inner.take_exec();
+    exec.trim_to_live(); // a parked call's buffer may extend past its live top
     exec.stack_limit = store.inner.engine().max_wasm_stack();
     exec.gates_passed = false; // defensive: a recycled execution never carries it over
     let value_base = exec.values.len();
@@ -170,7 +163,7 @@ pub(super) fn finish<T>(
 ) -> Result<Vec<Val>> {
     let result = match outcome {
         Ok(()) => match exec.take_results(b.value_base, b.stop_depth, result_tys) {
-            Ok(cells) => decode_results(&mut store.inner, result_tys, cells),
+            Ok(decoded) => check_results(&mut store.inner, result_tys, decoded),
             Err(error) => match exec.discard_to(b.value_base, b.stop_depth) {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
@@ -203,7 +196,7 @@ pub(crate) fn execute<T>(
     instance: Instance,
     func_index: u32,
     code: Code,
-    args: Vec<Val>,
+    args: &[Val],
     result_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     let (mut exec, b) = enter(store, instance, func_index, code, args)?;
@@ -275,7 +268,14 @@ impl Execution {
         results.clear();
         results.extend_from_slice(&sig.result_defaults);
         params.clear();
-        if let Err(error) = self.pop_params_into(&sig.params, &mut params) {
+        // Popped, the args leave the frame's live range (it now ends where the results will
+        // land); the host holds them rooted (`root_ref_params`) for the call's duration. After a
+        // host tail call they were the popped callee's, past this frame's end — a re-entry trims
+        // the buffer there.
+        let popped = self
+            .pop_params_into(&sig.params, &mut params)
+            .and_then(|()| self.set_live_end(self.sp));
+        if let Err(error) = popped {
             store.inner.put_host_scratch(params, results);
             return Err(error);
         }
@@ -350,7 +350,9 @@ impl Execution {
         self.sp = state.results_at;
         self.push_results_slice(&state.results);
         // A host tail-called from the call's bottom frame returns straight to the boundary: its
-        // results are the call's, so nothing may remain above them.
+        // results are the call's, so nothing may remain above them. (The delimiter's `live_end`
+        // then sits above its `end`; that's fine only because nothing can re-enter — and trim —
+        // before `take_results`: only the async GC-pressure check runs in between.)
         if self.frames.len() == stop_depth {
             self.values.truncate(self.sp);
             self.shadow.truncate(self.sp);

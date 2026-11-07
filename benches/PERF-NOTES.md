@@ -910,3 +910,41 @@ taking params from the polymorphic stack).
 (loop back-edge + `match` jump), about a quarter slot access (`scalar_at`: two vectors, two bounds
 checks, headers reloaded after each slot write). Next levers: 2c immediate/compare forms (constants
 are 17–30% of executed ops) and one combined value+tag slot vector (one bounds check per access).
+
+## 18. Session 7 — step 2c: immediate operands + the call path
+
+**Immediates.** After 2b, `i32.const` was 20–31% of executed ops, mostly feeding `i32.add`, `and`,
+`sub`, compare+branch, shifts and `mul`. An i32 binop whose operand is the constant the previous op
+just pushed now drops that op and emits an immediate form in its place (`I32AddImm`; `sub` as
+`add` of the negation; commutative ops and mirrored compares also fold a left constant). Compares
+against an immediate fuse with `br_if`/`if` into `BrIfCmpImm`; `i32.eqz` fuses into a plain
+`BrIfNot`/`BrIf`. Cost: ~4.5% `Module::new` instructions (the fold path re-does a binop emission
+and removes the constant op).
+
+**Wasm→wasm calls** (fib profile: `top_into` 13%, buffer growth 8% + memset, `Arc` traffic):
+- Frames no longer hold an `Arc<ModuleInner>`; they record the module's address (compare-only)
+  and the function index. A call resolves to a `Callee` (no clone) and the run loop re-points its
+  one `Code` handle, cloning only on a module switch; a call no longer goes through `top_into`.
+  The handle is stashed across suspensions (re-pointed on resume). fib 1.38× on its own — the
+  atomics were mostly cycles, not instructions.
+- The operand buffer only grows within a call (returns leave slots for reuse — no per-call zero
+  fill); the stack charge follows the live top (top frame's end), boundaries trim to their
+  results, and a host re-entry trims to the live top first. fib +8%. Review fix: a frame's `end`
+  includes its caller's (a callee starts inside the caller's operand area, so its own slots can
+  end lower) — without it a host re-entry from a small callee trimmed the caller's slots away.
+
+**Host→wasm calls** (tiny profile: ~14% malloc/free): arguments are borrowed unless one needs
+internalizing (externref→anyref), results decode straight from the operand buffer into the
+returned `Vec` (no intermediate `Vec<Cell>`), and the duplicate result validation is gone. 1.44×.
+
+Fuel is still 1 per executed op, so folding and fusion lower fuel consumption further (one async
+yield test assumed more ops per loop iteration and now uses a 1-unit slice).
+
+**Measured** (cycles, M4 Pro) vs 2b: CoreMark 1.38×, loops 1.40–1.52×, fib 1.69×, per call 1.44×.
+Direct race against wasmi 2.0.0 built like wasm.fyi (M4, wall-clock medians, fresh instance per
+sample; wasmi with simd, submilli default): memory/sum 3.1×, memory_tree 3.5×, CoreMark 3.8×,
+linked_list 3.8–4.5×, per call 4.0×, fib(28) 4.8× (from 10.7–20.8× on `main`).
+Cumulative vs `main`: CoreMark **3.28×** (simd 3.36×), loops 3.9–5.0× (simd 4.4–5.3×), fib 2.08×
+(simd 1.72×), per call 5.5× (simd 5.2×). Estimated gap to wasmi 2.0 on wasm.fyi: CoreMark ~3.8×,
+loops ~3.5–4.3×, fib ~5.3×, per call ~3.8×. `Module::new`: **+19–22% vs `main`** (immediates
++4.5%); the compile-profiling pass is owed.

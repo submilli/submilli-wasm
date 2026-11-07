@@ -1,7 +1,8 @@
-//! Step 2b operand providers: `local.get` emits nothing and consumers read the local's slot, so
-//! every place a local can change while an earlier read of it is still on the stack — or where
-//! control flow merges — must still see the right value. Each case runs over a grid of inputs
-//! against a Rust oracle.
+//! Step 2b operand providers and 2c immediates: `local.get` emits nothing and consumers read the
+//! local's slot, and constants fold into the ops consuming them. Every place a local can change
+//! while an earlier read of it is still on the stack — or where control flow merges, or a folded
+//! constant changes an op's shape — must still compute the right value. Each case runs over a grid
+//! of inputs against a Rust oracle.
 
 #![allow(clippy::unwrap_used)]
 
@@ -59,6 +60,36 @@ const CASES: &[Case] = &[
         "local.get 1 local.get 0 call $sub local.get 0 local.get 1 i32.const 0 call_indirect (type $t) \
             i32.const 1 i32.add i32.mul",
         |a, b| (b - a) * (a - b + 1)),
+    // Step 2c immediate forms: a constant folded into the op that consumes it.
+    ("", "local.get 0 i32.const -2147483648 i32.sub", |a, _| a.wrapping_sub(i32::MIN)),
+    ("", "local.get 0 i32.const 35 i32.shl local.get 0 i32.const 33 i32.shr_s i32.add",
+        |a, _| a.wrapping_shl(35).wrapping_add(a.wrapping_shr(33))),
+    ("", "local.get 0 i32.const -1 i32.shr_u", |a, _| ((a as u32) >> 31) as i32),
+    ("", "(i32.lt_s (i32.const 5) (local.get 0)) \
+          (i32.mul (i32.const 2) (i32.lt_u (i32.const 5) (local.get 0))) i32.add \
+          (i32.mul (i32.const 4) (i32.ge_u (i32.const -3) (local.get 0))) i32.add \
+          (i32.mul (i32.const 8) (i32.gt_s (i32.const 2) (local.get 0))) i32.add",
+        |a, _| i32::from(5 < a) + 2 * i32::from(5 < a as u32) + 4 * i32::from((-3i32) as u32 >= a as u32)
+            + 8 * i32::from(2 > a)),
+    ("", "(block (br_if 0 (i32.eqz (local.get 0))) (return (i32.const 7))) i32.const 9",
+        |a, _| if a == 0 { 9 } else { 7 }),
+    ("", "(if (result i32) (i32.eqz (local.get 1)) (then (i32.const 1)) (else (i32.const 2)))",
+        |_, b| if b == 0 { 1 } else { 2 }),
+    ("", "(block (br_if 0 (i32.ne (local.get 0) (i32.const 0))) (return (i32.const 7))) i32.const 9",
+        |a, _| if a != 0 { 9 } else { 7 }),
+    ("", "(block (br_if 0 (i32.lt_s (local.get 0) (i32.const 3))) (return (i32.const 7))) i32.const 9",
+        |a, _| if a < 3 { 9 } else { 7 }),
+    ("", "(block (br_if 0 (i32.gt_u (i32.const 10) (local.get 0))) (return (i32.const 7))) i32.const 9",
+        |a, _| if 10 > a as u32 { 9 } else { 7 }),
+    ("", "(local $i i32) (loop $l (local.set $i (i32.add (local.get $i) (i32.const 1))) \
+            (br_if $l (i32.lt_u (local.get $i) (i32.const 10)))) local.get $i", |_, _| 10),
+    ("", "i32.const 3 i32.const 4 i32.sub local.get 0 i32.add", |a, _| a - 1),
+    // A constant on the left of a non-commutative op must not fold as if it were on the right.
+    ("", "(i32.shl (i32.const 5) (local.get 1)) (i32.sub (i32.const 100) (local.get 0)) i32.add",
+        |a, b| 5i32.wrapping_shl(b as u32).wrapping_add(100 - a)),
+    ("", "(select (local.get 0) (local.get 1) (i32.gt_s (local.get 0) (i32.const 0)))",
+        |a, b| if a > 0 { a } else { b }),
+    ("", "(local.tee 1 (i32.and (local.get 0) (i32.const 255))) local.get 1 i32.add", |a, _| 2 * (a & 255)),
     // Memory, globals and exceptions.
     ("(memory 1)", "(i32.store (i32.and (local.get 0) (i32.const 0xff0)) (local.get 1)) \
             (i32.load (i32.and (local.get 0) (i32.const 0xff0)))", |_, b| b),

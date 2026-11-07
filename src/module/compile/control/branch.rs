@@ -6,7 +6,7 @@ use wasmparser::BrTable;
 
 use super::{BlockKind, Patch, PatchSlot};
 use crate::error::InternalError;
-use crate::module::compile::{wp_err, Translator};
+use crate::module::compile::{fused_branch, wp_err, Translator};
 use crate::module::op::{BrTableRange, BranchTarget, Op, Slot, NULLABLE_BIT};
 use crate::Result;
 
@@ -59,13 +59,7 @@ impl Translator<'_> {
         let fused = self.fusable_cmp.take();
         if let Some((kind, lhs, rhs, _)) = fused.filter(|f| f.3 == cond && target.keep == 0) {
             let idx = self.next_ip() - 1;
-            *self.op_mut(idx) = Op::BrIfCmp {
-                kind,
-                negate: false,
-                ip: target.ip,
-                lhs,
-                rhs,
-            };
+            *self.op_mut(idx) = fused_branch(kind, false, target, lhs, rhs);
             self.clear_fusion(); // the relop is gone, and with it its destination
             self.register_branch(patch_frame, idx, PatchSlot::Single);
             return Ok(());
@@ -204,7 +198,9 @@ impl Translator<'_> {
             | Op::BrOnNonNull(t, _) => {
                 t.ip = ip;
             }
-            Op::BrIfCmp { ip: target_ip, .. } => *target_ip = ip,
+            Op::BrIfCmp { ip: target_ip, .. } | Op::BrIfCmpImm { ip: target_ip, .. } => {
+                *target_ip = ip;
+            }
             _ => unreachable!("patch on non-branch op"),
         }
     }

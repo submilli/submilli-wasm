@@ -15,6 +15,7 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn visit_i32_const(&mut self, value: i32) -> Result<()> {
         if self.reachable {
             self.fresh(|s| Op::I32Const(s, value));
+            self.pending_const = self.stack.last().map(|&dst| (dst, value));
         }
         Ok(())
     }

@@ -165,14 +165,15 @@ fn caller_set_fuel_refuels_under_yield_interval() {
     let mut store = Store::new(&engine, ());
     // Far less than the loop needs without refuels.
     store.set_fuel(20).unwrap();
-    // A slice smaller than one iteration's cost, so every refilled slice runs dry.
-    store.fuel_async_yield_interval(Some(3)).unwrap();
+    // A slice smaller than any refill-to-refill stretch (≥ 3 ops), so every refilled slice runs
+    // dry — including the last, which no longer reaches another host call.
+    store.fuel_async_yield_interval(Some(1)).unwrap();
     let host = Func::wrap(&mut store, |mut c: Caller<'_, ()>| c.set_fuel(30));
     let inst = block_on(Instance::new_async(&mut store, &m, &[host.into()])).unwrap();
     let run = inst.get_func(&mut store, "run").unwrap();
     let (res, pendings) = drive(run.call_async(&mut store, &[Val::I32(1_000)], &mut []));
     res.unwrap();
-    // Each refill re-splits into a 3-unit slice + reserve, so the run keeps yielding.
+    // Each refill re-splits into a 1-unit slice + reserve, so the run keeps yielding.
     assert!(
         pendings >= 1_000,
         "expected a yield per refilled slice, got {pendings}"

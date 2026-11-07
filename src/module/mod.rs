@@ -241,6 +241,19 @@ impl Module {
         &self.0
     }
 
+    /// This module's identity, for comparison only (see [`code::Code::key`]).
+    pub(crate) fn key(&self) -> usize {
+        Arc::as_ptr(&self.0).addr()
+    }
+
+    /// The defined-function index and record of a *defined* module-space function index — what a
+    /// call site needs, without taking a handle on the module. `None` for an import or an index
+    /// out of range.
+    pub(crate) fn defined(&self, module_func_idx: u32) -> Option<(u32, code::CompiledFunc)> {
+        let index = module_func_idx.checked_sub(self.0.num_imported_funcs)?;
+        Some((index, *self.0.functions.get(index as usize)?))
+    }
+
     /// Runtime handle to the compiled body of a *defined* module-space function index.
     pub(crate) fn code(&self, module_func_idx: u32) -> code::Code {
         code::Code {

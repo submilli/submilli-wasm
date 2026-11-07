@@ -3,7 +3,7 @@
 
 use wasmparser::BlockType;
 
-use super::Translator;
+use super::{fused_branch, Translator};
 use crate::canon::IrHeap;
 use crate::module::op::{BranchTarget, Op, NULLABLE_BIT};
 use crate::Result;
@@ -140,13 +140,7 @@ impl Translator<'_> {
             let fused = self.fusable_cmp.take();
             if let Some((kind, lhs, rhs, _)) = fused.filter(|f| f.3 == s) {
                 let idx = self.next_ip() - 1;
-                *self.op_mut(idx) = Op::BrIfCmp {
-                    kind,
-                    negate: true,
-                    ip: 0,
-                    lhs,
-                    rhs,
-                };
+                *self.op_mut(idx) = fused_branch(kind, true, target, lhs, rhs);
                 else_patch = Some(idx);
             } else {
                 else_patch = Some(self.next_ip());
