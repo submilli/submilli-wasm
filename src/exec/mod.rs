@@ -27,7 +27,7 @@ mod cast;
 mod cell;
 mod collect;
 mod convert;
-mod epoch;
+pub(crate) mod epoch;
 mod exn;
 mod frame;
 mod gates;

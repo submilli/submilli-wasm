@@ -84,6 +84,9 @@ pub struct Store<T: 'static> {
     pub(crate) async_host_funcs: Vec<AsyncHostFunc<T>>,
     /// Action when the epoch deadline is reached; `None` traps.
     pub(crate) epoch_callback: Option<EpochCallback<T>>,
+    /// Set while the epoch callback runs (taken out of `epoch_callback`): the deadline is being
+    /// serviced, so host calls it makes aren't gated by it again.
+    pub(crate) epoch_servicing: bool,
     /// Resource limiter (memory/table growth + entity counts); `None` = no limits
     /// beyond module-declared maxima.
     pub(crate) limiter: Option<ResourceLimiterInner<T>>,
@@ -110,6 +113,7 @@ impl<T: 'static> Store<T> {
             #[cfg(feature = "async")]
             async_host_funcs: Vec::new(),
             epoch_callback: None,
+            epoch_servicing: false,
             limiter: None,
         }
     }

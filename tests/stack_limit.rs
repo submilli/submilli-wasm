@@ -9,7 +9,8 @@
 #![allow(clippy::unwrap_used)]
 
 use submilli_wasm::{
-    Caller, Config, Engine, Error, Extern, Func, FuncType, Instance, Module, Store, Trap, Val,
+    Caller, Config, Engine, Error, Extern, Func, FuncType, Instance, Module, Store, Trap,
+    UpdateDeadline, Val,
 };
 
 fn module(engine: &Engine, wat: &str) -> Module {
@@ -208,6 +209,158 @@ fn host_pingpong_at_default_budget_fits_a_2mib_thread() {
 #[test]
 fn host_recursion_through_a_reexported_import_traps() {
     assert_native_bounded(on_2mib_thread(|| pingpong(&Engine::default(), REEXPORT)));
+}
+
+/// Host→host recursion runs no wasm op, so the nested host call itself is the step that fuel
+/// and the epoch deadline gate. Here the host fn ignores failures and calls `pong` twice — an
+/// exponential fan-out that, ungated, would run effectively forever; fuel ends it.
+#[test]
+fn host_recursion_fan_out_is_bounded_by_fuel() {
+    let engine = Engine::new(Config::new().consume_fuel(true)).unwrap();
+    let mut store = fan_out_store(&engine);
+    store.set_fuel(10_000).unwrap();
+    let pong = store.data().pong.unwrap();
+    let _ = pong.call(&mut store, &[], &mut []);
+    assert_eq!(store.get_fuel().unwrap(), 0);
+}
+
+/// The same recursion past an epoch deadline traps `Interrupt` at the first nested host call.
+#[test]
+fn host_recursion_is_interrupted_by_the_epoch_deadline() {
+    let engine = Engine::new(Config::new().epoch_interruption(true)).unwrap();
+    let mut store = fan_out_store(&engine);
+    store.set_epoch_deadline(0);
+    let pong = store.data().pong.unwrap();
+    let error = pong.call(&mut store, &[], &mut []).unwrap_err();
+    assert_eq!(trap_of(&error), Trap::Interrupt);
+}
+
+/// A `Continue` epoch callback at the nested gate extends the deadline, so the recursion goes on
+/// (to the stack limit) instead of trapping `Interrupt`.
+#[test]
+fn host_recursion_epoch_callback_can_continue() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let engine = Engine::new(Config::new().epoch_interruption(true)).unwrap();
+    let mut store = Store::new(&engine, PingPong::default());
+    let ping = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        |mut caller: Caller<'_, PingPong>, _params, _results| {
+            let pong = caller.data_mut().see()?;
+            pong.call(&mut caller, &[], &mut [])
+        },
+    );
+    let m = module(&engine, REEXPORT);
+    let inst = Instance::new(&mut store, &m, &[Extern::Func(ping)]).unwrap();
+    let pong = inst.get_func(&mut store, "pong").unwrap();
+    store.data_mut().pong = Some(pong);
+    let serviced = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&serviced);
+    store.epoch_deadline_callback(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Ok(UpdateDeadline::Continue(0))
+    });
+    store.set_epoch_deadline(0);
+    let error = pong.call(&mut store, &[], &mut []).unwrap_err();
+    assert_eq!(trap_of(&error), Trap::StackOverflow);
+    assert!(serviced.load(Ordering::Relaxed) > 0);
+}
+
+/// On an async store with wasmtime's yield policy, a nested `call_async` of a host fn past the
+/// deadline yields to the executor and goes on, as the async driver does — it does not trap. The
+/// callee is the async host fn itself here; the sync sibling below calls a sync one.
+#[cfg(feature = "async")]
+#[test]
+fn async_nested_host_call_yields_at_the_epoch_deadline() {
+    use pollster::block_on;
+
+    let mut config = Config::new();
+    config.async_support(true).epoch_interruption(true);
+    let engine = Engine::new(&config).unwrap();
+    let mut store = Store::new(&engine, PingPong::default());
+    let ticker = engine.clone();
+    let ping = Func::new_async(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        move |mut caller: Caller<'_, PingPong>, _params, _results| {
+            let ticker = ticker.clone();
+            Box::new(async move {
+                let first = caller.data().spread.is_none();
+                let pong = caller.data_mut().see()?;
+                if first {
+                    ticker.increment_epoch(); // the deadline passes mid-call
+                    pong.call_async(&mut caller, &[], &mut []).await?;
+                }
+                Ok(())
+            })
+        },
+    );
+    let m = module(&engine, REEXPORT);
+    let inst = block_on(Instance::new_async(&mut store, &m, &[Extern::Func(ping)])).unwrap();
+    let pong = inst.get_func(&mut store, "pong").unwrap();
+    store.data_mut().pong = Some(pong);
+    store.epoch_deadline_async_yield_and_update(1);
+    store.set_epoch_deadline(1);
+    block_on(pong.call_async(&mut store, &[], &mut [])).unwrap();
+}
+
+/// [`async_nested_host_call_yields_at_the_epoch_deadline`] with a sync callee: `call_async` can
+/// still suspend, so it yields too.
+#[cfg(feature = "async")]
+#[test]
+fn async_call_of_a_sync_host_fn_yields_at_the_epoch_deadline() {
+    use pollster::block_on;
+
+    let mut config = Config::new();
+    config.async_support(true).epoch_interruption(true);
+    let engine = Engine::new(&config).unwrap();
+    let mut store = Store::new(&engine, PingPong::default());
+    let leaf = Func::new(&mut store, FuncType::new(&engine, [], []), |_, _, _| Ok(()));
+    let ticker = engine.clone();
+    let caller_fn = Func::new_async(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        move |mut caller: Caller<'_, PingPong>, _params, _results| {
+            let ticker = ticker.clone();
+            Box::new(async move {
+                ticker.increment_epoch(); // the deadline passes mid-call
+                leaf.call_async(&mut caller, &[], &mut []).await
+            })
+        },
+    );
+    let m = module(&engine, REEXPORT);
+    let inst = block_on(Instance::new_async(
+        &mut store,
+        &m,
+        &[Extern::Func(caller_fn)],
+    ))
+    .unwrap();
+    let pong = inst.get_func(&mut store, "pong").unwrap();
+    store.epoch_deadline_async_yield_and_update(1);
+    store.set_epoch_deadline(1);
+    block_on(pong.call_async(&mut store, &[], &mut [])).unwrap();
+}
+
+/// A store whose `pong` export is its own host import `ping`, which calls `pong` twice, ignoring
+/// the first call's failure.
+fn fan_out_store(engine: &Engine) -> Store<PingPong> {
+    let mut store = Store::new(engine, PingPong::default());
+    let ping = Func::new(
+        &mut store,
+        FuncType::new(engine, [], []),
+        |mut caller: Caller<'_, PingPong>, _params, _results| {
+            let pong = caller.data_mut().see()?;
+            let _ = pong.call(&mut caller, &[], &mut []);
+            pong.call(&mut caller, &[], &mut [])
+        },
+    );
+    let m = module(engine, REEXPORT);
+    let inst = Instance::new(&mut store, &m, &[Extern::Func(ping)]).unwrap();
+    let pong = inst.get_func(&mut store, "pong").unwrap();
+    store.data_mut().pong = Some(pong);
+    store
 }
 
 const DEFAULT_MAX_WASM_STACK: usize = 512 << 10;

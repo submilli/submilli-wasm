@@ -15,7 +15,7 @@
 
 ### Non-goals (initially)
 - Peak runtime performance / JIT tiering.
-- **Threads/atomics** (a separate proposal, not part of Wasm 3.0; needs a shared-memory model change), **custom-page-sizes**, the component model (`wasmtime::component::*`), WASI, and module serialization/AOT (`Module::serialize`/`deserialize`). These are the intentional gaps in `wasmtime` API coverage; everything we *do* implement matches `wasmtime`'s signatures. (SIMD/memory64/multi-memory and the other standardized 2.0/3.0 proposals are **in scope** at Phase 9 — the value model and flat instruction table were built to absorb them.)
+- **Threads/atomics** (a separate proposal, not part of Wasm 3.0; needs a shared-memory model change), **custom-page-sizes**, the component model (`wasmtime::component::*`), and WASI. These are the intentional gaps in `wasmtime` API coverage; everything we *do* implement matches `wasmtime`'s signatures. (SIMD/memory64/multi-memory and the other standardized 2.0/3.0 proposals are **in scope** at Phase 9 — the value model and flat instruction table were built to absorb them.)
 - A *moving* or generational/incremental garbage collector. We ship a non-moving, stop-the-world mark-sweep collector; it reclaims cycles but pauses to collect. (The public `Config::collector`/`Collector` API still matches `wasmtime`; only the internal strategy differs.)
 - Native-debugger (GDB/LLDB JIT) integration: there is no native code to attach to. `Config::debug_info`'s debugger aspect is therefore a no-op — but we *do* consume the module's DWARF to produce source-level **backtraces** (Phase 7), so `wasm_backtrace_details` is fully supported.
 
@@ -103,6 +103,8 @@ struct CompiledFunc {
 ```
 
 Compilation does **no** register allocation and **no** second pass beyond back-patching forward branch targets, so cost is ~linear in code size with a tiny constant.
+
+**Serialized modules (#24c).** `Module::serialize` / `Engine::precompile_module` write the *compiled* `ModuleInner` (postcard), and `Module::deserialize[_file]` restores it without re-validating or recompiling — the analog of wasmtime skipping codegen. The artifact header carries a magic, a format version (bumped on any `Op`/layout change; other versions are rejected) and a 64-bit body checksum, so an accidentally corrupted artifact (truncation, bit rot, a partial write) is rejected at decode. Like wasmtime's, `deserialize` is `unsafe` by contract (with no unsafe body): the artifact is trusted, embedder-only input. A deliberately crafted one cannot cause undefined behavior — every access is bounds-checked safe Rust, and op-immediate lookups fail closed — but it is not re-validated, so it may panic or misbehave.
 
 ## 5. Internal bytecode & control flow
 
@@ -382,7 +384,7 @@ UpdateDeadline{Interrupt, Continue, Yield, YieldCustom}; CallHook
 Trap (enum, downcast from Error); WasmBacktrace; Error, Result, bail!, ensure!, format_err!
 ```
 
-**Intentional gaps** (the only places embedder code won't port unchanged): `wasmtime::component::*`, WASI, SIMD/threads/memory64 instructions, `Module::serialize`/`deserialize`. The `Config` knobs for those features exist as no-ops/errors where needed to keep call sites compiling. Internal divergences (resumable loop vs fibers, mark-sweep vs DRC/copying GC) are invisible at the API boundary.
+**Intentional gaps** (the only places embedder code won't port unchanged): `wasmtime::component::*`, WASI, threads/atomics, custom page sizes. The `Config` knobs for those features exist as no-ops/errors where needed to keep call sites compiling. Internal divergences (resumable loop vs fibers, mark-sweep vs DRC/copying GC) are invisible at the API boundary.
 
 ## 10. Host functions
 
@@ -407,6 +409,8 @@ Async support reuses the resumable loop; **no fibers** internally — but the **
 
 - **Fuel**: a per-`Store` counter. The run loop charges **1 unit per executed internal `Op`** (structural ops like `block`/`loop`/`if` are already compiled away, so they cost nothing); the charge happens only on the op-execution path (a function return is not an op). This is a deterministic cost model — `set_fuel(N)` runs exactly `N` ops then traps — and bounds every loop since back-edges re-execute ops. We deliberately do *not* do compiler-injected block batching: runtime speed is secondary here, so a per-op decrement+branch (only when `Config::consume_fuel` is on; zero overhead otherwise) is the simpler, more precise choice. Depletion → `Trap::OutOfFuel` (sync) or yield (async). `set_fuel` (absolute) / `get_fuel` (remaining); both require `Config::consume_fuel`.
 - **Epoch**: `Engine` holds an `AtomicU64` epoch. `Engine::increment_epoch()` is a plain atomic add, safe to call from a background thread/timer/signal. Each `Store` has an absolute deadline (epoch value); when `Config::epoch_interruption` is on, the run loop compares `current_epoch() >= deadline` per executed op (the same uniform checkpoint as fuel — simpler than back-edge-only, runtime speed secondary; a relaxed atomic load, only when enabled). On deadline the loop suspends; the generic driver applies the policy: trap (`Trap::Interrupt`, the default) or invoke a `Store::epoch_deadline_callback` returning `UpdateDeadline` (`Interrupt` → trap, `Continue(n)` → extend deadline by `n` and resume, `Yield` → async/§11). On resume the suspended op runs before the gates are checked again, so even `Continue(0)` makes progress (one op per callback, where wasmtime's back-edge checks give one loop iteration) and the op's fuel is charged once. `set_epoch_deadline` is inert unless `epoch_interruption` is enabled. The embedder runs the ticker (we never spawn it); `Engine::weak` gives it a non-owning handle.
+
+- **Nested host calls**: a host fn called from inside another call (directly, not via wasm) is gated like a wasm op — one unit of fuel and an epoch-deadline check (the same policy: an async call yields at a fuel yield point or an epoch `Yield`; a sync one refuels from the reserve, and its `Yield` traps, as in the sync driver) — because host→host recursion (a guest re-exporting a host import) runs no wasm op at all. A top-level host call from the embedder stays free, as in wasmtime.
 
 Fuel is deterministic but charges per-instruction; epoch is cheap but non-deterministic — both offered, matching wasmtime's tradeoff.
 

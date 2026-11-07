@@ -10,7 +10,7 @@ use crate::Result;
 /// A one-shot yield to the async executor: returns `Pending` once (waking immediately),
 /// then `Ready`, giving the executor a chance to poll other tasks.
 #[cfg(feature = "async")]
-pub(super) async fn yield_now() {
+pub(crate) async fn yield_now() {
     use std::future::Future;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -54,7 +54,10 @@ fn take_epoch_action<T>(exec: &mut Execution, store: &mut Store<T>) -> Result<Up
             .push_gc_root(exception.raw(), crate::canon::RefKind::Exn);
     }
     store.inner.swap_exec(exec); // park (see `invoke_host`)
-    let action = match super::guard::catch_host(|| f(store.as_context_mut())) {
+    let servicing = std::mem::replace(&mut store.epoch_servicing, true);
+    let action = super::guard::catch_host(|| f(store.as_context_mut()));
+    store.epoch_servicing = servicing;
+    let action = match action {
         Ok(action) => action,
         Err(payload) => {
             super::guard::restore_after_panic(
@@ -81,8 +84,51 @@ fn take_epoch_action<T>(exec: &mut Execution, store: &mut Store<T>) -> Result<Up
     action
 }
 
+/// The epoch-deadline action at a host function called from inside another call — host code
+/// recursing into host functions runs no wasm op, so no other gate would see the deadline. Runs the
+/// store's callback (no callback: `Interrupt`) as host code: its GC roots are scoped, a pending
+/// exception stays rooted, and a panic is contained. The caller applies the action.
+pub(crate) fn nested_host_epoch_action<T>(store: &mut Store<T>) -> Result<UpdateDeadline> {
+    let mut cb = store.epoch_callback.take();
+    let Some(f) = cb.as_mut() else {
+        return Ok(UpdateDeadline::Interrupt);
+    };
+    let roots_mark = store.inner.gc_roots_mark();
+    let pending = store.inner.pending_exception();
+    let pending_generation = store.inner.pending_exception_generation();
+    if let Some(exception) = pending {
+        store
+            .inner
+            .push_gc_root(exception.raw(), crate::canon::RefKind::Exn);
+    }
+    let servicing = std::mem::replace(&mut store.epoch_servicing, true);
+    let action = super::guard::catch_host(|| f(store.as_context_mut()));
+    store.epoch_servicing = servicing;
+    let action = match action {
+        Ok(action) => action,
+        Err(payload) => {
+            super::guard::restore_after_panic(
+                &mut store.inner,
+                roots_mark,
+                pending,
+                pending_generation,
+            );
+            store.epoch_callback = cb;
+            super::guard::reraise(payload);
+        }
+    };
+    #[cfg(feature = "async")]
+    store.inner.recover_cancelled_async_calls();
+    store.inner.gc_roots_truncate(roots_mark);
+    store.epoch_callback = cb;
+    if let Some(error) = store.inner.internal_error() {
+        return Err(error);
+    }
+    action
+}
+
 /// Extends the epoch deadline by `delta` ticks beyond the current epoch.
-fn extend_epoch_deadline<T>(store: &mut Store<T>, delta: u64) {
+pub(crate) fn extend_epoch_deadline<T>(store: &mut Store<T>, delta: u64) {
     let next = store.inner.engine().current_epoch().saturating_add(delta);
     store.inner.set_epoch_deadline(next);
 }

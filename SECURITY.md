@@ -52,8 +52,10 @@ zero after a prior store dirtied+dropped its own, table slots null, defaulted ag
 Fuel (charged per executed op, deterministic) and/or epoch interruption interrupt **any** guest loop,
 including tight host-call-free loops (the charge/check sits on every back-edge). At least one must be
 enabled for untrusted code. Both also bound the `start` function and active-segment initializers, which run
-*during* `Instance::new` (see §4). Tested by `tests/instantiation.rs` (fuel/epoch interrupt `start`) and
-`tests/api.rs`.
+*during* `Instance::new` (see §4). A host function called from inside another call is gated the same way
+(one unit of fuel, an epoch check), since host→host recursion through a guest-re-exported import runs no
+wasm op. Tested by `tests/instantiation.rs` (fuel/epoch interrupt `start`), `tests/api.rs`, and
+`tests/stack_limit.rs` (host→host fan-out).
 
 ### Bounded memory, stack, and allocation — no OOM-DoS
 - The installed `ResourceLimiter` gates every growth/allocation/count path: `memory.grow`, `table.grow`,

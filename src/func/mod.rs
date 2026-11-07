@@ -124,6 +124,7 @@ impl Func {
             Callee::Host(host_index) => {
                 let ty = self.ty(&store);
                 let result_tys = check_host_call(store.as_context().inner(), &ty, params, results)?;
+                direct_call::nested_host_gates(store.as_context_mut().store_mut())?;
                 let out = direct_call::call_direct_host(&mut store, host_index, params, &ty)?;
                 validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
                 out

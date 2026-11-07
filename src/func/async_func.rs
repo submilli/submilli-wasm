@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use super::direct_call::{
-    call_direct_host, finish_direct_host_call, preflight_direct_call, DirectCallBoundary,
+    call_direct_host, finish_direct_host_call, nested_host_gates_async, preflight_direct_call,
+    DirectCallBoundary,
 };
 use super::wasm_ty::valtypes_of;
 use super::{check_call, check_host_call, default_results, validate_results};
@@ -25,6 +26,7 @@ async fn call_direct_host_async<S: AsContextMut>(
     params: &[Val],
     ty: &crate::value::FuncType,
 ) -> Result<Vec<Val>> {
+    nested_host_gates_async(store.as_context_mut().store_mut()).await?;
     preflight_direct_call(store.as_context_mut().inner_mut())?;
     let cb = store.as_context_mut().store_mut().async_host_funcs[host_index as usize].clone();
     let mut out = default_results(ty);
@@ -179,6 +181,8 @@ impl Func {
             Callee::Host(host_index) => {
                 let ty = self.ty(&store);
                 let result_tys = check_host_call(store.as_context().inner(), &ty, params, results)?;
+                // The async gates: this call can suspend, even though its callee is sync.
+                nested_host_gates_async(store.as_context_mut().store_mut()).await?;
                 let out = call_direct_host(&mut store, host_index, params, &ty)?;
                 validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
                 out

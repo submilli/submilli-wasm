@@ -1,7 +1,8 @@
 //! Lifecycle for directly-invoked sync and async host functions.
 
 use super::{default_results, validate_results, Caller};
-use crate::store::{AsContextMut, StoreInner};
+use crate::store::{AsContextMut, FuelStep, Store, StoreInner, UpdateDeadline};
+use crate::trap::Trap;
 use crate::value::{ExnRef, FuncType, Rooted, Val, ValType};
 use crate::Result;
 
@@ -40,7 +41,6 @@ pub(super) fn call_direct_host<S: AsContextMut>(
 }
 
 pub(super) fn preflight_direct_call(inner: &mut StoreInner) -> Result<()> {
-    check_native_stack(inner)?;
     let error = if inner.has_parked_execution() {
         inner.internal_error()
     } else {
@@ -52,20 +52,94 @@ pub(super) fn preflight_direct_call(inner: &mut StoreInner) -> Result<()> {
     }
 }
 
-/// A host fn called from inside another call nests on the native stack with no wasm frame to
-/// charge — a guest that re-exports a host import turns a host fn calling that export into pure
-/// native recursion. Charge it like a wasm re-entry: the native bytes used beneath it plus the
-/// parked execution's heap stacks, against `max_wasm_stack`.
-fn check_native_stack(inner: &StoreInner) -> Result<()> {
-    let native = crate::exec::native::nested_bytes();
-    if native == 0 {
+/// The gates of a host fn called from inside another call. A guest that re-exports a host import
+/// can turn a host fn calling that export into pure host→host recursion, which runs no wasm op —
+/// so nothing else would bound its stack or its time. It is charged like a wasm step: its native
+/// stack (the bytes used beneath it plus the parked execution's heap stacks) against
+/// `max_wasm_stack`, one unit of fuel, and the epoch deadline. A top-level call from the embedder
+/// stays free, as in wasmtime. Sync: neither a fuel yield point nor an epoch `Yield` can suspend
+/// here, so the first refuels from the reserve and the second traps, as in the sync driver.
+pub(super) fn nested_host_gates<T>(store: &mut Store<T>) -> Result<()> {
+    if !nested_host_stack_ok(store)? {
         return Ok(());
     }
-    let used = native.saturating_add(inner.parked_heap_stack_bytes());
-    if used >= inner.engine().max_wasm_stack() {
-        return Err(crate::trap::Trap::StackOverflow.into());
+    if store.inner.engine().consume_fuel() {
+        match store.inner.consume_fuel_step() {
+            FuelStep::Ran => {}
+            FuelStep::NeedYield => refuel_and_charge(&mut store.inner)?,
+            FuelStep::Exhausted => return Err(Trap::OutOfFuel.into()),
+        }
+    }
+    if epoch_due(store) {
+        match crate::exec::epoch::nested_host_epoch_action(store)? {
+            UpdateDeadline::Continue(delta) => {
+                crate::exec::epoch::extend_epoch_deadline(store, delta);
+            }
+            _ => return Err(Trap::Interrupt.into()),
+        }
     }
     Ok(())
+}
+
+/// [`nested_host_gates`] for an async direct call, which can suspend: a fuel yield point and an
+/// epoch `Yield` give the executor a turn first, as the async driver does.
+#[cfg(feature = "async")]
+pub(super) async fn nested_host_gates_async<T>(store: &mut Store<T>) -> Result<()> {
+    use crate::exec::epoch::{extend_epoch_deadline, nested_host_epoch_action, yield_now};
+    if !nested_host_stack_ok(store)? {
+        return Ok(());
+    }
+    if store.inner.engine().consume_fuel() {
+        match store.inner.consume_fuel_step() {
+            FuelStep::Ran => {}
+            FuelStep::NeedYield => {
+                yield_now().await;
+                refuel_and_charge(&mut store.inner)?;
+            }
+            FuelStep::Exhausted => return Err(Trap::OutOfFuel.into()),
+        }
+    }
+    if epoch_due(store) {
+        match nested_host_epoch_action(store)? {
+            UpdateDeadline::Continue(delta) => extend_epoch_deadline(store, delta),
+            UpdateDeadline::Yield(delta) => {
+                yield_now().await;
+                extend_epoch_deadline(store, delta);
+            }
+            UpdateDeadline::Interrupt => return Err(Trap::Interrupt.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Whether this direct host call is nested (otherwise it has no gates); if so, checks its native
+/// stack.
+fn nested_host_stack_ok<T>(store: &mut Store<T>) -> Result<bool> {
+    let native = crate::exec::native::nested_bytes();
+    if native == 0 {
+        return Ok(false);
+    }
+    let inner = &mut store.inner;
+    let used = native.saturating_add(inner.parked_heap_stack_bytes());
+    if used >= inner.engine().max_wasm_stack() {
+        return Err(Trap::StackOverflow.into());
+    }
+    Ok(true)
+}
+
+/// A reached epoch deadline — not while the epoch callback itself runs, which is servicing it.
+fn epoch_due<T>(store: &Store<T>) -> bool {
+    let inner = &store.inner;
+    inner.engine().epoch_interruption() && inner.epoch_deadline_reached() && !store.epoch_servicing
+}
+
+/// At a fuel yield point: moves the next interval in from the reserve and charges the unit there.
+fn refuel_and_charge(inner: &mut StoreInner) -> Result<()> {
+    inner.refuel_from_reserve();
+    match inner.consume_fuel_step() {
+        FuelStep::Ran => Ok(()),
+        FuelStep::NeedYield | FuelStep::Exhausted => Err(Trap::OutOfFuel.into()),
+    }
 }
 
 /// State owned by a direct host callback and restored on every abnormal exit.
