@@ -145,6 +145,16 @@ impl Func {
     /// async store; awaits async host callees.
     pub async fn call_async(
         &self,
+        store: impl AsContextMut,
+        params: &[Val],
+        results: &mut [Val],
+    ) -> Result<()> {
+        // Each poll is a native-stack entry (see `exec::native`).
+        crate::exec::native::per_poll(self.call_async_entry(store, params, results)).await
+    }
+
+    async fn call_async_entry(
+        &self,
         mut store: impl AsContextMut,
         params: &[Val],
         results: &mut [Val],

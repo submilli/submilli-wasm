@@ -59,7 +59,8 @@ enabled for untrusted code. Both also bound the `start` function and active-segm
 - The installed `ResourceLimiter` gates every growth/allocation/count path: `memory.grow`, `table.grow`,
   instance/memory/table counts at instantiation, and GC-heap allocation.
 - `Config::max_wasm_stack` (bytes) bounds recursion → `Trap::StackOverflow`, including across the host↔wasm
-  re-entry boundary, so host/guest ping-pong traps rather than aborting the native stack (#30).
+  re-entry boundary and host→host calls, whose native stack is measured and charged, so host/guest
+  ping-pong traps rather than aborting the native stack (#30).
 - Validation-time `Config::max_module_bytes` and `Config::max_expanded_locals` bound the *compiler*
   against a hostile module before it runs (#32), on top of `wasmparser`'s per-dimension limits.
 - **With no limiter installed, the defaults are finite ceilings, never "unbounded"** — a deliberate

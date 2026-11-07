@@ -10,7 +10,7 @@ keywords = ["wasm", "webassembly", "interpreter", "wasmtime", "runtime"]
 categories = ["wasm", "virtualization"]
 # Ship only what `cargo build` needs; tests/benches/docs live on GitHub
 # (the 12 MB spec-testsuite submodule must never end up in the package).
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE", "SECURITY.md"]
+include = ["src/**", "build.rs", "Cargo.toml", "README.md", "LICENSE", "SECURITY.md"]
 
 [package.metadata.docs.rs]
 # Document the full surface: `async` and `simd` are off by default.

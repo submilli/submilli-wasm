@@ -113,6 +113,7 @@ impl Func {
         // Sync `call` is permitted even on an async-enabled store: this interpreter has no
         // fibers, so the sync driver runs fine. (If the call reaches an async host fn, the sync
         // driver still errors with "synchronous context" — the real constraint.)
+        let _entry = crate::exec::native::Entry::begin();
         // Copy out the entity's Copy fields, releasing the borrow before we
         // re-borrow the store mutably for the call.
         let out = match self.resolve_callee(store.as_context().inner()) {

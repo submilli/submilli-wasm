@@ -40,6 +40,7 @@ pub(super) fn call_direct_host<S: AsContextMut>(
 }
 
 pub(super) fn preflight_direct_call(inner: &mut StoreInner) -> Result<()> {
+    check_native_stack(inner)?;
     let error = if inner.has_parked_execution() {
         inner.internal_error()
     } else {
@@ -49,6 +50,22 @@ pub(super) fn preflight_direct_call(inner: &mut StoreInner) -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// A host fn called from inside another call nests on the native stack with no wasm frame to
+/// charge — a guest that re-exports a host import turns a host fn calling that export into pure
+/// native recursion. Charge it like a wasm re-entry: the native bytes used beneath it plus the
+/// parked execution's heap stacks, against `max_wasm_stack`.
+fn check_native_stack(inner: &StoreInner) -> Result<()> {
+    let native = crate::exec::native::nested_bytes();
+    if native == 0 {
+        return Ok(());
+    }
+    let used = native.saturating_add(inner.parked_heap_stack_bytes());
+    if used >= inner.engine().max_wasm_stack() {
+        return Err(crate::trap::Trap::StackOverflow.into());
+    }
+    Ok(())
 }
 
 /// State owned by a direct host callback and restored on every abnormal exit.

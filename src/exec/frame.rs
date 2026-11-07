@@ -69,7 +69,14 @@ pub(crate) struct Frame {
     /// parked outer call's on the single shared operand/frame stack. The run loop never executes
     /// one (`stop_depth` stops the call above it); its function/`instance` are inert filler.
     pub delimiter: Option<Delimiter>,
+    /// On a delimiter frame: the `Execution::native_charge` its call replaced (restored when the
+    /// call ends; saturated — no real stack nears 4 GiB). `0` on executable frames.
+    pub native_saved: u32,
 }
+
+// `native_saved` sits in what was tail padding: a frame stays one 72-byte record.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Frame>() == 72);
 
 impl Frame {
     /// A [`Code`] handle for this frame's function, from its instance (which owns the module).
@@ -156,6 +163,7 @@ impl super::Execution {
             instance,
             func_index,
             delimiter: None,
+            native_saved: 0,
         });
         self.sync_floor();
         self.sp = geometry.operand_base as usize;
@@ -237,6 +245,7 @@ impl super::Execution {
         kind: Delimiter,
         instance: Instance,
         code: &Code,
+        native_saved: usize,
     ) -> crate::Result<()> {
         let base = to_u32(self.slots.len())?;
         let func = FrameFunc::of(&code.func());
@@ -252,6 +261,7 @@ impl super::Execution {
             instance,
             func_index: 0,
             delimiter: Some(kind),
+            native_saved: u32::try_from(native_saved).unwrap_or(u32::MAX),
         });
         self.sync_floor();
         self.sp = base as usize;

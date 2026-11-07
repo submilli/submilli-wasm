@@ -186,71 +186,153 @@ fn tail_calls_not_counted_against_limit() {
 }
 
 /// The cross-boundary gap closure: a host fn that re-enters wasm whose *only* op is another host
-/// call — pure host↔wasm ping-pong with no wasm `DoCall` to trip the in-loop check. The
-/// per-crossing reserve folded into `max_wasm_stack` must trap it `StackOverflow` rather than let
-/// the native Rust stack recurse to abort.
+/// call — pure host↔wasm ping-pong with no wasm `DoCall` to trip the in-loop check. The native
+/// stack each crossing uses is charged against `max_wasm_stack`, so it traps `StackOverflow` rather
+/// than let the native Rust stack recurse to abort.
 #[test]
 fn host_pingpong_traps_not_aborts() {
-    let engine = engine_with_stack(64 * 1024);
-    let mut store = Store::new(&engine, ());
+    let (trap, _) = pingpong(&engine_with_stack(64 * 1024), PINGPONG);
+    assert_eq!(trap, Trap::StackOverflow);
+}
+
+/// At the default budget the ping-pong traps having used no more native stack than
+/// `max_wasm_stack` allows (give or take one crossing), so it fits a 2 MiB thread (the
+/// spawned-thread default) in every build, however large its frames.
+#[test]
+fn host_pingpong_at_default_budget_fits_a_2mib_thread() {
+    assert_native_bounded(on_2mib_thread(|| pingpong(&Engine::default(), PINGPONG)));
+}
+
+/// A guest that re-exports the host import turns a host fn calling that export into pure
+/// host→host recursion, with no wasm frame in between — still charged, still a trap.
+#[test]
+fn host_recursion_through_a_reexported_import_traps() {
+    assert_native_bounded(on_2mib_thread(|| pingpong(&Engine::default(), REEXPORT)));
+}
+
+const DEFAULT_MAX_WASM_STACK: usize = 512 << 10;
+
+/// One crossing's frames are charged only once the next entry measures them.
+const ONE_CROSSING: usize = 64 << 10;
+
+fn assert_native_bounded((trap, native): (Trap, usize)) {
+    assert_eq!(trap, Trap::StackOverflow);
+    assert!(
+        native <= DEFAULT_MAX_WASM_STACK + ONE_CROSSING,
+        "the recursion used {native} bytes of native stack"
+    );
+}
+
+fn on_2mib_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+const PINGPONG: &str = "(module
+    (import \"h\" \"ping\" (func $ping))
+    (func (export \"pong\") (call $ping)))";
+
+const REEXPORT: &str = "(module
+    (import \"h\" \"ping\" (func $ping))
+    (export \"pong\" (func $ping)))";
+
+/// The host fn's state: the `pong` export it calls (held, as an embedder would hold a callback —
+/// a directly-called host fn's `Caller` has no instance to look exports up in), and the lowest and
+/// highest native stack positions it ran at, whose distance is the native stack the recursion used.
+#[derive(Default)]
+struct PingPong {
+    pong: Option<Func>,
+    spread: Option<(usize, usize)>,
+}
+
+impl PingPong {
+    /// Records the current native stack position; returns the `pong` to call next.
+    fn see(&mut self) -> Result<Func, Error> {
+        let marker = 0u8;
+        let at = std::hint::black_box(std::ptr::addr_of!(marker)).addr();
+        let (lo, hi) = self.spread.unwrap_or((at, at));
+        self.spread = Some((lo.min(at), hi.max(at)));
+        self.pong.ok_or_else(|| Error::msg("pong not set"))
+    }
+
+    fn native_bytes(&self) -> usize {
+        self.spread.map_or(0, |(lo, hi)| hi - lo)
+    }
+}
+
+/// Calls `pong`, whose host import `ping` calls `pong` again, until it traps; returns the trap and
+/// the native stack used.
+fn pingpong(engine: &Engine, wat: &str) -> (Trap, usize) {
+    let mut store = Store::new(engine, PingPong::default());
     let ping = Func::new(
         &mut store,
-        FuncType::new(&engine, [], []),
-        |mut caller: Caller<'_, ()>, _params, _results| {
-            let Some(Extern::Func(pong)) = caller.get_export("pong") else {
-                return Err(Error::msg("missing export pong"));
-            };
-            pong.call(&mut caller, &[], &mut [])?;
-            Ok(())
+        FuncType::new(engine, [], []),
+        |mut caller: Caller<'_, PingPong>, _params, _results| {
+            let pong = caller.data_mut().see()?;
+            pong.call(&mut caller, &[], &mut [])
         },
     );
-    let m = module(
-        &engine,
-        "(module
-            (import \"h\" \"ping\" (func $ping))
-            (func (export \"pong\") (call $ping)))",
-    );
+    let m = module(engine, wat);
     let inst = Instance::new(&mut store, &m, &[Extern::Func(ping)]).unwrap();
-    assert_eq!(
-        trap_of(&call_export(&mut store, inst, "pong").unwrap_err()),
-        Trap::StackOverflow
-    );
+    let pong = inst.get_func(&mut store, "pong").unwrap();
+    store.data_mut().pong = Some(pong);
+    let trap = trap_of(&pong.call(&mut store, &[], &mut []).unwrap_err());
+    (trap, store.data().native_bytes())
 }
 
 /// Async sibling of the ping-pong guard: exercises the `invoke_host_async` / `drive_async` path.
 #[cfg(feature = "async")]
 #[test]
 fn host_pingpong_async_traps() {
+    let (trap, _) = pingpong_async(Some(64 * 1024), PINGPONG);
+    assert_eq!(trap, Trap::StackOverflow);
+}
+
+/// The async ping-pong at the default budget, on a 2 MiB thread (see the sync sibling).
+#[cfg(feature = "async")]
+#[test]
+fn host_pingpong_async_at_default_budget_fits_a_2mib_thread() {
+    assert_native_bounded(on_2mib_thread(|| pingpong_async(None, PINGPONG)));
+}
+
+/// Async host→host recursion through a re-exported import (see the sync sibling).
+#[cfg(feature = "async")]
+#[test]
+fn async_host_recursion_through_a_reexported_import_traps() {
+    assert_native_bounded(on_2mib_thread(|| pingpong_async(None, REEXPORT)));
+}
+
+#[cfg(feature = "async")]
+fn pingpong_async(max_wasm_stack: Option<usize>, wat: &str) -> (Trap, usize) {
     use pollster::block_on;
 
     let mut config = Config::new();
     config.async_support(true);
-    config.max_wasm_stack(64 * 1024);
+    if let Some(bytes) = max_wasm_stack {
+        config.max_wasm_stack(bytes);
+    }
     let engine = Engine::new(&config).unwrap();
-    let mut store = Store::new(&engine, ());
+    let mut store = Store::new(&engine, PingPong::default());
     let ping = Func::new_async(
         &mut store,
         FuncType::new(&engine, [], []),
-        |mut caller: Caller<'_, ()>, _params, _results| {
+        |mut caller: Caller<'_, PingPong>, _params, _results| {
             Box::new(async move {
-                let Some(Extern::Func(pong)) = caller.get_export("pong") else {
-                    return Err(Error::msg("missing export pong"));
-                };
-                pong.call_async(&mut caller, &[], &mut []).await?;
-                Ok(())
+                let pong = caller.data_mut().see()?;
+                pong.call_async(&mut caller, &[], &mut []).await
             })
         },
     );
-    let m = module(
-        &engine,
-        "(module
-            (import \"h\" \"ping\" (func $ping))
-            (func (export \"pong\") (call $ping)))",
-    );
+    let m = module(&engine, wat);
     let inst = block_on(Instance::new_async(&mut store, &m, &[Extern::Func(ping)])).unwrap();
     let pong = inst.get_func(&mut store, "pong").unwrap();
-    let err = block_on(pong.call_async(&mut store, &[], &mut [])).unwrap_err();
-    assert_eq!(trap_of(&err), Trap::StackOverflow);
+    store.data_mut().pong = Some(pong);
+    let trap = trap_of(&block_on(pong.call_async(&mut store, &[], &mut [])).unwrap_err());
+    (trap, store.data().native_bytes())
 }
 
 /// A frame's statically-sized operand area is charged against `max_wasm_stack` *before* it is

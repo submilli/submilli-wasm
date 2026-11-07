@@ -267,11 +267,17 @@ unified stack means **`max_wasm_stack` is enforced across the host boundary** by
 allocates — its operand area is sized statically (`max_operands`), so a single call can claim a
 large extent — and an allocation failure traps rather than aborting. Slots are charged 8 bytes each
 (a wasm value's native spill slot, as wasmtime spends), not our 16-byte `simd` cell, so a function
-at wasmparser's 50k-locals limit still fits the default budget. Because each host crossing still nests
-native Rust frames (a sync closure runs on the native stack) that the ~24-byte wasm frame can't
-bound, each `HostReentry` crossing is charged a fixed `HOST_REENTRY_RESERVE` (≈4 KiB) folded into
-`stack_bytes()`, so the budget caps re-entry depth (~128 at the 512 KiB default) below native
-exhaustion — pure host↔wasm ping-pong traps `StackOverflow` instead of aborting the process.
+at wasmparser's 50k-locals limit still fits the default budget. Each host crossing still nests
+native Rust frames (a sync closure runs on the native stack) that the heap frames can't bound, so
+the native stack is **measured** (`exec::native`, the analog of wasmtime bounding the real stack
+pointer — but per thread rather than per store): the outermost entry on a thread
+(`Func::call`, or each poll of `Func::call_async`) records its stack position (the address of a
+local, never dereferenced), and every nested entry is charged the native bytes used beneath it plus
+`HOST_REENTRY_RESERVE` (4 KiB, for the frames it is about to push), folded into `stack_bytes()`. A
+host fn called from inside another call is checked the same way (with the parked execution's heap
+stacks), since a guest that re-exports a host import can turn host code into pure host→host
+recursion. So host↔wasm and host↔host ping-pong trap `StackOverflow` instead of aborting the
+process, in every build — the bound follows the real frame sizes, unoptimized or not.
 
 ### The loop
 ```rust

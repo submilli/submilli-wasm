@@ -38,6 +38,7 @@ pub(crate) mod host;
 #[cfg(feature = "async")]
 pub(crate) mod host_async;
 mod memory;
+pub(crate) mod native;
 mod numeric;
 mod outcome;
 mod ref_;
@@ -73,11 +74,12 @@ pub(crate) struct Execution {
     /// them in one record makes every slot access a single bounds check.
     slots: Vec<cell::TaggedCell>,
     frames: Vec<Frame>,
-    /// Count of live [`Delimiter::HostReentry`] boundaries on `frames` — the host→wasm crossings
-    /// nested on the *native* Rust stack. Each is charged [`HOST_REENTRY_RESERVE`] in `stack_bytes`
-    /// so `max_wasm_stack` bounds re-entry depth below native exhaustion (#30). O(1): bumped in
-    /// `enter_call`, dropped in `take_results`/`discard_to`.
-    host_reentry_depth: usize,
+    /// Native-stack bytes charged for the innermost live call boundary: what the nested entries
+    /// below it used on the *native* Rust stack (measured, see [`native`]) plus
+    /// [`HOST_REENTRY_RESERVE`]; `0` for an outermost call. Charged in `stack_bytes` so
+    /// `max_wasm_stack` bounds host↔wasm recursion below native exhaustion (#30). Set in
+    /// `enter_call`; each delimiter frame saves the value it replaced, restored when its call ends.
+    native_charge: usize,
     /// The top frame's `operand_base` (`usize::MAX` with no frame), re-synced on every frame
     /// push/pop so the per-op underflow check is one compare instead of a frame-stack walk.
     floor: usize,
@@ -113,14 +115,11 @@ pub(crate) struct Execution {
 /// async-host-call safepoint; a non-calling, non-allocating spin adds no GC pressure.
 const GC_CHECK_INTERVAL: u32 = 1024;
 
-/// Native-stack bytes charged per host→wasm re-entry crossing against `max_wasm_stack` (#30). A
-/// host fn that re-enters wasm (`Func::call`) nests interpreter + closure frames on the native Rust
-/// stack — invisible to the heap-based wasm frame accounting (a wasm frame is ~24 B; the native
-/// frame it begets is ~1 KB). Weighting each crossing with this reserve makes the single
-/// `max_wasm_stack` budget bound crossings well below native exhaustion (~128 at the 512 KiB
-/// default) without a separate knob, so unbounded host↔wasm ping-pong traps `StackOverflow` instead
-/// of aborting the process.
-const HOST_REENTRY_RESERVE: usize = 4096;
+/// Headroom charged on top of a nested entry's measured native-stack use (see `native_charge`):
+/// the measurement is taken at entry, before the entered call pushes its own interpreter frames —
+/// about one host crossing's worth (~2.5 KB optimized; ~11 KB unoptimized, where only the
+/// innermost entry's frames go uncounted, never a multiple).
+const HOST_REENTRY_RESERVE: usize = 4 << 10;
 
 /// Bytes charged per operand slot against `max_wasm_stack`: a wasm value's native spill slot, as
 /// wasmtime would spend — not our cell width (16 B under `simd`) plus shadow byte, which would cap
@@ -145,7 +144,7 @@ impl Default for Execution {
         Execution {
             slots: Vec::new(),
             frames: Vec::new(),
-            host_reentry_depth: 0,
+            native_charge: 0,
             floor: usize::MAX,
             control: None,
             sp: 0,
@@ -165,10 +164,7 @@ impl Execution {
     /// Whether nothing at all survives from earlier calls — the condition for a store to reuse
     /// this execution's allocations ([`is_empty`](Self::is_empty) plus the transient fields).
     pub(crate) fn is_pristine(&self) -> bool {
-        self.is_empty()
-            && self.host_reentry_depth == 0
-            && self.control.is_none()
-            && self.code.is_none()
+        self.is_empty() && self.native_charge == 0 && self.control.is_none() && self.code.is_none()
     }
 
     /// Heap bytes held by the stacks' capacity (bounds what a store keeps between calls).
@@ -186,10 +182,11 @@ impl Execution {
 
     /// Enters a (sub-)call on the shared stacks: a [`Delimiter`] boundary, the call's `args`, then
     /// the entry frame. The boundary sits at the current frame depth; the entered call runs with a
-    /// `stop_depth` one above it (so the parked outer frames stay untouched).
+    /// `stop_depth` one above it (so the parked outer frames stay untouched). `native` is the
+    /// entry's native-stack charge (see `native_charge`).
     fn enter_call(
         &mut self,
-        delim: Delimiter,
+        (delim, native): (Delimiter, usize),
         instance: Instance,
         func_index: u32,
         code: Code,
@@ -197,15 +194,10 @@ impl Execution {
     ) -> Result<()> {
         let value_base = self.slots.len();
         let frame_base = self.frames.len();
-        let old_reentry_depth = self.host_reentry_depth;
-        if delim == Delimiter::HostReentry {
-            self.host_reentry_depth = self
-                .host_reentry_depth
-                .checked_add(1)
-                .ok_or(InternalError::FrameStack("host re-entry depth overflow"))?;
-        }
-        if let Err(error) = self.push_delimiter(delim, instance, &code) {
-            self.host_reentry_depth = old_reentry_depth;
+        let saved_charge = self.native_charge;
+        self.native_charge = saved_charge.max(native);
+        if let Err(error) = self.push_delimiter(delim, instance, &code, saved_charge) {
+            self.native_charge = saved_charge;
             return Err(error);
         }
         self.slots.extend(args.iter().map(|&v| cell::TaggedCell {
@@ -216,31 +208,23 @@ impl Execution {
             self.slots.truncate(value_base);
             self.frames.truncate(frame_base);
             self.sync_floor();
-            self.host_reentry_depth = old_reentry_depth;
+            self.native_charge = saved_charge;
             return Err(error);
         }
         self.code = Some(code);
         Ok(())
     }
 
-    /// Drops this call's `HostReentry` reserve (if its boundary at `stop_depth` was one) as its
-    /// frames are about to be truncated away. Mirrors the `enter_call` bump.
+    /// Restores the native charge the call whose boundary sits at `stop_depth` replaced, as its
+    /// frames are about to be truncated away. Mirrors `enter_call`.
     fn release_reentry(&mut self, stop_depth: usize) -> Result<()> {
-        match self
-            .frames
-            .get(stop_depth)
-            .and_then(|frame| frame.delimiter)
-        {
-            Some(Delimiter::HostReentry) => {
-                self.host_reentry_depth = self
-                    .host_reentry_depth
-                    .checked_sub(1)
-                    .ok_or(InternalError::FrameStack("host re-entry depth underflow"))?;
+        match self.frames.get(stop_depth) {
+            Some(frame) if frame.delimiter.is_some() => {
+                self.native_charge = frame.native_saved as usize;
+                Ok(())
             }
-            Some(Delimiter::TopLevel) => {}
-            None => return Err(InternalError::FrameStack("missing call boundary delimiter").into()),
+            _ => Err(InternalError::FrameStack("missing call boundary delimiter").into()),
         }
-        Ok(())
     }
 
     /// On a finished (sub-)call: decodes its results (everything above `value_base`, against the
@@ -322,10 +306,21 @@ impl Execution {
     /// call path).
     #[inline]
     fn stack_bytes_for(&self, slots: usize, frames: usize) -> usize {
+        Self::heap_bytes_for(slots, frames).saturating_add(self.native_charge)
+    }
+
+    /// The heap stacks' share of [`stack_bytes`](Self::stack_bytes) (no native charge).
+    #[inline]
+    fn heap_bytes_for(slots: usize, frames: usize) -> usize {
         slots
             .saturating_mul(SLOT_CHARGE)
             .saturating_add(frames.saturating_mul(std::mem::size_of::<Frame>()))
-            .saturating_add(self.host_reentry_depth.saturating_mul(HOST_REENTRY_RESERVE))
+    }
+
+    /// The heap stacks' current footprint — what a parked execution adds to a nested direct host
+    /// call's native use (see `native`).
+    pub(crate) fn heap_stack_bytes(&self) -> usize {
+        Self::heap_bytes_for(self.live_top(), self.frames.len())
     }
 
     /// Runs frames until the stack falls back to `stop_depth` (the boundary this `run` is

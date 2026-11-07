@@ -143,7 +143,13 @@ pub(super) fn enter<T>(
     } else {
         Delimiter::HostReentry
     };
-    if let Err(error) = exec.enter_call(delim, instance, func_index, code, args) {
+    // A nested entry (wasm re-entered from a host fn, or called from a directly-called one) is
+    // charged the native stack used beneath it.
+    let native = match super::native::nested_bytes() {
+        0 => 0,
+        used => used.saturating_add(super::HOST_REENTRY_RESERVE),
+    };
+    if let Err(error) = exec.enter_call((delim, native), instance, func_index, code, args) {
         // An entry-frame `StackOverflow`: trace the parked outer frames (none at top level).
         let error = exec.attach_suspension_backtrace(&store.inner, error);
         if stop_depth != 0 {

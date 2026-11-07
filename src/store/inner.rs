@@ -209,6 +209,11 @@ impl StoreInner {
         !self.exec_slot.is_empty()
     }
 
+    /// The parked execution's heap stack footprint (`0` with none parked).
+    pub(crate) fn parked_heap_stack_bytes(&self) -> usize {
+        self.exec_slot.heap_stack_bytes()
+    }
+
     pub(crate) fn latch_internal_error(&mut self, error: crate::error::InternalError) {
         if self.internal_error.is_none() {
             self.internal_error = Some(error);

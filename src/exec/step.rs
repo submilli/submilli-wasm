@@ -21,14 +21,18 @@ impl Execution {
     // call site (the `run` loop), and inlining it there removes the per-op call/return and the
     // `Result<StepOutcome>` stack round-trip, keeping `ip`/`base` in registers across ops —
     // measured ~1.8× on CoreMark. The op arrives already fetched (`run` gets it via `ops.get`, so
-    // there is exactly one bounds check per op); `next` is the fall-through ip.
+    // there is exactly one bounds check per op); `next` is the fall-through ip. Unoptimized builds
+    // keep it out of line: there every arm's temporaries get their own stack slot (~43 KB), which
+    // inlined would stay live under each host call, so each host re-entry would cost ~4× the
+    // native stack (charged against `max_wasm_stack`, see `exec::native`).
     #[allow(
         clippy::too_many_lines,
         clippy::inline_always,
         clippy::too_many_arguments
     )]
     #[allow(clippy::cognitive_complexity)] // flat bytecode dispatch; arms delegate by category
-    #[inline(always)]
+    #[cfg_attr(not(submilli_unoptimized), inline(always))]
+    #[cfg_attr(submilli_unoptimized, inline(never))]
     pub(super) fn step(
         &mut self,
         inner: &mut StoreInner,
