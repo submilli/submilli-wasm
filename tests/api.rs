@@ -284,7 +284,7 @@ fn epoch_callback_continue_resumes() {
     assert_eq!(out[0].unwrap_i32(), 7);
 }
 
-/// Counts to 100 in a loop (~500 executed ops).
+/// Counts to 100 in a loop (hundreds of executed ops; at least one per iteration).
 const COUNT_TO_100: &str = "(module (func (export \"f\") (result i32) (local i32)
     (loop $l
         (local.set 0 (i32.add (local.get 0) (i32.const 1)))
@@ -316,8 +316,8 @@ fn epoch_callback_continue_zero_makes_progress() {
     assert!(*store.data() > 100, "the callback refires at every op");
 }
 
-/// An epoch suspension doesn't charge the interrupted op's fuel twice: exactly the fuel the
-/// function needs still suffices with a deadline firing before every op.
+/// An epoch suspension charges the interrupted op's fuel exactly once: with a deadline firing
+/// mid-call, the function still runs on exactly the fuel it needs — and on one less, runs out.
 #[test]
 fn epoch_suspension_charges_fuel_once() {
     let mut config = Config::new();
@@ -333,11 +333,17 @@ fn epoch_suspension_charges_fuel_once() {
     f.call(&mut store, &[], &mut out).unwrap();
     let needed = 1_000_000 - store.get_fuel().unwrap();
 
-    store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Continue(0)));
-    store.set_epoch_deadline(0);
+    store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Continue(1_000_000)));
+    store.set_epoch_deadline(0); // fires once, before the first op
     store.set_fuel(needed).unwrap();
     f.call(&mut store, &[], &mut out).unwrap();
     assert_eq!(out[0].unwrap_i32(), 100);
+    assert_eq!(store.get_fuel().unwrap(), 0);
+
+    store.set_epoch_deadline(0);
+    store.set_fuel(needed - 1).unwrap();
+    let err = f.call(&mut store, &[], &mut out).unwrap_err();
+    assert_eq!(*err.downcast_ref::<Trap>().unwrap(), Trap::OutOfFuel);
 }
 
 // --- limits ---------------------------------------------------------------

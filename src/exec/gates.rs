@@ -8,7 +8,7 @@ use crate::trap::Trap;
 use crate::Result;
 
 impl Execution {
-    /// Services the rare per-op gates — `(fuel, epoch, gc_pressure)` per the engine config:
+    /// Services the rare per-op gates — `(fuel, epoch)` per the engine config:
     /// `Ok(Some(_))` suspends the loop (yield/deadline), `Err` traps (fuel exhausted), `Ok(None)`
     /// continues. Off the hot path: `run` calls this only when at least one gate is enabled.
     #[inline]

@@ -133,7 +133,7 @@ pub(super) fn enter<T>(
     }
     let mut exec = store.inner.take_exec();
     exec.stack_limit = store.inner.engine().max_wasm_stack();
-    exec.gates_passed = false; // never carried over from an earlier call that trapped
+    exec.gates_passed = false; // defensive: a recycled execution never carries it over
     let value_base = exec.values.len();
     let stop_depth = exec.frames.len();
     let delim = if stop_depth == 0 {
