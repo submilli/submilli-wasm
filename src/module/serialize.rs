@@ -23,7 +23,8 @@ const MAGIC: &[u8; 8] = b"submwc01";
 /// v11: relaxed SIMD — 20 `SimdOp::*Relaxed*` variants (#38).
 /// v12: `CompiledFunc.ops` stored as `Vec<Op>` (write-once, pre-sized) instead of `Box<[Op]>`.
 /// v13: `v128.const`/`i8x16.shuffle` immediates pooled in `CodeArenas::v128s` (16-byte `Op`).
-const ARTIFACT_VERSION: u32 = 13;
+/// v14: slot-addressed `Op`s (static-height frame slots, step 2a) + pooled `br_on_cast` heaps.
+const ARTIFACT_VERSION: u32 = 14;
 
 /// Encodes a compiled module into the binary artifact format.
 pub(crate) fn encode(inner: &ModuleInner) -> Result<Vec<u8>> {

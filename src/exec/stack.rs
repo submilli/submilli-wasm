@@ -52,8 +52,20 @@ fn underflow_error() -> crate::Error {
 }
 
 #[cold]
+fn slot_error() -> crate::Error {
+    InternalError::OperandStack("operand slot out of range").into()
+}
+
+#[cold]
 fn scalar_tag_error() -> crate::Error {
     InternalError::OperandStack("numeric operation found a reference tag").into()
+}
+
+/// Clears the root-shadow tags of the dead slots `range` (an empty range is a no-op).
+fn clear_tags(shadow: &mut [RefTag], range: std::ops::Range<usize>) {
+    if let Some(dead) = shadow.get_mut(range) {
+        dead.fill(RefTag::NONE);
+    }
 }
 
 use super::Execution;
@@ -71,7 +83,8 @@ impl Execution {
         }
     }
 
-    /// Index of the lowest of the top `needed` operands, refusing to pop below the current frame's
+    /// Index of the lowest of the top `needed` operands of the current stack window (`sp`; see
+    /// [`enter_window`](Self::enter_window)), refusing to pop below the current frame's
     /// floor or to proceed with the value/shadow stacks out of lockstep (both impossible for
     /// validated code; corrupt bytecode must still fail closed, not read the caller's operands).
     /// Kept to two compares against cached state: walking the frame stack here on every op once
@@ -90,8 +103,8 @@ impl Execution {
         if len != self.shadow.len() {
             return Err(lockstep_error());
         }
-        match len.checked_sub(needed) {
-            Some(base) if base >= self.floor => Ok(base),
+        match self.sp.checked_sub(needed) {
+            Some(base) if base >= self.floor && self.sp <= len => Ok(base),
             _ => Err(underflow_error()),
         }
     }
@@ -135,133 +148,263 @@ impl Execution {
     fn pop_scalar(&mut self) -> Result<Cell> {
         let base = self.ensure_scalar_operands(1)?;
         let cell = self.values[base];
-        self.values.truncate(base);
-        self.shadow.truncate(base);
+        self.sp = base;
         Ok(cell)
     }
 
-    /// Pushes a scalar cell (shadow tag `NONE`) straight from its bytes — the arithmetic hot
-    /// path, skipping the `Val` round-trip through the GC slot codec that [`push`] pays.
+    /// Pushes onto the current stack window: writes slot `sp` and advances it. Infallible: a push
+    /// past the buffer's end (impossible for compiled code — every static height, including
+    /// block ends and catch payloads, counts toward the frame's size) extends it rather than
+    /// failing.
     #[inline]
-    fn push_scalar<const N: usize>(&mut self, bytes: [u8; N]) {
-        self.shadow.push(RefTag::NONE);
-        self.values.push(Cell::of_bytes(bytes));
-    }
-
-    #[inline]
-    pub(super) fn push_i32(&mut self, v: i32) {
-        self.push_scalar(v.to_le_bytes());
-    }
-
-    #[inline]
-    pub(super) fn push_i64(&mut self, v: i64) {
-        self.push_scalar(v.to_le_bytes());
-    }
-
-    #[inline]
-    pub(super) fn push_f32(&mut self, v: f32) {
-        self.push_scalar(v.to_bits().to_le_bytes());
-    }
-
-    #[inline]
-    pub(super) fn push_f64(&mut self, v: f64) {
-        self.push_scalar(v.to_bits().to_le_bytes());
-    }
-
-    /// Pushes a local's default value straight as a cell (locals init on every call): scalars and
-    /// `v128` default to all-zero bits, references to the null handle with their hierarchy tag —
-    /// exactly what `push(Val::default_for(ty))` produces, minus the `Val` round-trip.
-    #[inline]
-    pub(super) fn push_default(&mut self, ty: &IrVal) {
-        if let IrVal::Ref { heap, .. } = ty {
-            self.shadow
-                .push(RefTag::of_refkind(refkind_of_irheap(heap)));
-            self.values.push(Cell::of_bytes(NULL_REF.to_le_bytes()));
+    fn push_slot(&mut self, cell: Cell, tag: RefTag) {
+        let sp = self.sp;
+        if let (Some(slot), Some(slot_tag)) = (self.values.get_mut(sp), self.shadow.get_mut(sp)) {
+            *slot = cell;
+            *slot_tag = tag;
         } else {
-            self.push_scalar([0u8; SLOT_BYTES]);
+            self.values.push(cell);
+            self.shadow.push(tag);
+        }
+        self.sp = self.values.len().min(sp.saturating_add(1));
+    }
+
+    /// Writes a local's default value to slot `at` (locals init on every call): scalars and
+    /// `v128` default to all-zero bits, references to the null handle with their hierarchy tag —
+    /// exactly what `Val::default_for(ty)` encodes, minus the `Val` round-trip.
+    #[inline]
+    pub(super) fn set_default(&mut self, at: usize, ty: &IrVal) -> Result<()> {
+        if let IrVal::Ref { heap, .. } = ty {
+            let tag = RefTag::of_refkind(refkind_of_irheap(heap));
+            self.set_cell(at, Cell::of_bytes(NULL_REF.to_le_bytes()), tag)
+        } else {
+            self.set_scalar(at, Cell::of_bytes([0u8; SLOT_BYTES]))
         }
     }
 
-    /// Raw-bits pushes for `f32.const`/`f64.const`, whose `Op` immediates are already bit patterns.
-    #[inline]
-    pub(super) fn push_f32_bits(&mut self, bits: u32) {
-        self.push_scalar(bits.to_le_bytes());
+    /// The scalar cell at absolute slot `at`, refusing a reference-tagged slot (a numeric op on a
+    /// reference is impossible for validated code; corrupt bytecode must fail closed).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub(super) fn scalar_at(&self, at: usize) -> Result<Cell> {
+        match (self.values.get(at), self.shadow.get(at)) {
+            (Some(&cell), Some(&RefTag::NONE)) => Ok(cell),
+            (Some(_), Some(_)) => Err(scalar_tag_error()),
+            _ => Err(slot_error()),
+        }
     }
 
-    #[inline]
-    pub(super) fn push_f64_bits(&mut self, bits: u64) {
-        self.push_scalar(bits.to_le_bytes());
+    /// Writes a scalar result (shadow tag `NONE`) to absolute slot `at`.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub(super) fn set_scalar(&mut self, at: usize, cell: Cell) -> Result<()> {
+        match (self.values.get_mut(at), self.shadow.get_mut(at)) {
+            (Some(slot), Some(tag)) => {
+                *slot = cell;
+                *tag = RefTag::NONE;
+                Ok(())
+            }
+            _ => Err(slot_error()),
+        }
     }
 
-    /// In-place binary op over the top two cells: the result overwrites the first operand's slot
-    /// and the stack shrinks by one — one bounds region, no pop/push round-trips. For scalar ops
-    /// only (operand and result shadow tags are all `NONE`, so the shadow just shrinks).
+    /// Enters a stack-window op whose operands end at absolute index `top`: its handler then
+    /// pops/pushes relative to `sp`. Also the frame's GC safepoint: everything up to `top` is live.
     #[inline]
-    pub(super) fn binop_cells(&mut self, f: impl FnOnce(Cell, Cell) -> Cell) -> Result<()> {
-        let base = self.ensure_scalar_operands(2)?;
-        let n = base + 2;
-        self.values[n - 2] = f(self.values[n - 2], self.values[n - 1]);
-        self.values.truncate(n - 1);
-        self.shadow.truncate(n - 1);
+    pub(super) fn enter_window(&mut self, top: usize) -> Result<()> {
+        if top > self.values.len() || top < self.floor {
+            return Err(slot_error());
+        }
+        self.sp = top;
+        self.set_live_end(top)
+    }
+
+    /// Records the top frame's exact live height (a safepoint; see `Frame::live_end`).
+    #[inline]
+    pub(super) fn set_live_end(&mut self, end: usize) -> Result<()> {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.live_end = u32::try_from(end).map_err(|_| slot_error())?;
+        }
         Ok(())
     }
 
-    /// Fallible [`binop_cells`](Self::binop_cells) (div/rem trap paths). The stack is adjusted
-    /// only on success — a trapping op leaves it to the unwinder.
+    /// Widens the top frame's live range to the buffer's end before host code runs at an
+    /// arbitrary op (the epoch callback), where its `live_end` may be stale: call results, catch
+    /// payloads and hot-op references can sit above it. Over-approximate but sound — every
+    /// collection clears the tags of the slots it does not scan (see `operand_roots`), so a
+    /// widened range only ever holds references to allocated objects.
+    pub(super) fn widen_top_live_range(&mut self) -> Result<()> {
+        self.set_live_end(self.values.len())
+    }
+
+    /// Reads the value at slot `at` as `ty`, refusing a tag that doesn't match the type.
     #[inline]
-    pub(super) fn binop_cells_try(
+    pub(super) fn take_typed(&self, at: usize, ty: &ValType) -> Result<Val> {
+        let (cell, tag) = self.cell_at(at)?;
+        if tag != Self::expected_tag(ty) {
+            return Err(
+                InternalError::OperandStack("operand tag does not match value type").into(),
+            );
+        }
+        Ok(decode_val(cell, ty))
+    }
+
+    /// `select` over slots `at` (val1), `at + 1` (val2), `at + 2` (i32 cond); result to `at`.
+    #[inline]
+    pub(super) fn select_at(&mut self, at: usize) -> Result<()> {
+        let (a, a_tag) = self.cell_at(at)?;
+        let (b, b_tag) = self.cell_at(at + 1)?;
+        let cond = self.scalar_at(at + 2)?;
+        if a_tag != b_tag {
+            return Err(InternalError::OperandStack("select operand tag mismatch").into());
+        }
+        let (cell, tag) = if cond.unwrap_i32() != 0 {
+            (a, a_tag)
+        } else {
+            (b, b_tag)
+        };
+        self.set_cell(at, cell, tag)
+    }
+
+    /// An index/length/address operand at slot `at`, widened to `u64`. `is_64` (from the target
+    /// memory/table's type) selects the width — there is no runtime tag to read (#42).
+    #[inline]
+    pub(super) fn index_at(&self, at: usize, is_64: bool) -> Result<u64> {
+        let cell = self.scalar_at(at)?;
+        Ok(if is_64 {
+            cell.unwrap_i64() as u64
+        } else {
+            u64::from(cell.unwrap_i32() as u32)
+        })
+    }
+
+    /// Writes a size/grow result to slot `at` (the new top): i64 for a 64-bit memory/table, else
+    /// i32 (#42).
+    #[inline]
+    pub(super) fn put_index(&mut self, at: usize, is_64: bool, v: u64) -> Result<()> {
+        let cell = if is_64 {
+            Cell::from_i64(v as i64)
+        } else {
+            Cell::from_i32(v as u32 as i32)
+        };
+        self.set_scalar(at, cell)
+    }
+
+    /// Consumes the i32 condition/index at slot `at` (the stack top).
+    #[inline]
+    pub(super) fn cond_at(&self, at: usize) -> Result<i32> {
+        let v = self.scalar_at(at)?.unwrap_i32();
+        Ok(v)
+    }
+
+    /// Consumes the two i32 operands at slots `at`, `at + 1` (a fused compare-and-branch).
+    #[inline]
+    pub(super) fn i32_pair_at(&self, at: usize) -> Result<(i32, i32)> {
+        let pair = (
+            self.scalar_at(at)?.unwrap_i32(),
+            self.scalar_at(at + 1)?.unwrap_i32(),
+        );
+        Ok(pair)
+    }
+
+    /// The reference at slot `at` with its hierarchy tag, refusing a scalar-tagged slot.
+    #[inline]
+    pub(super) fn ref_at(&self, at: usize) -> Result<(Cell, RefTag)> {
+        let (cell, tag) = self.cell_at(at)?;
+        if tag.refkind().is_none() {
+            return Err(
+                InternalError::OperandStack("reference operation found a scalar tag").into(),
+            );
+        }
+        Ok((cell, tag))
+    }
+
+    /// Consumes `tys.len()` values from slot `at` (a throw's args), each decoded against its type
+    /// after checking its shadow tag.
+    pub(super) fn take_params(&self, at: usize, tys: &[ValType]) -> Result<Vec<Val>> {
+        let end = at.checked_add(tys.len()).ok_or_else(slot_error)?;
+        let mut out = Vec::with_capacity(tys.len());
+        for (i, ty) in (at..end).zip(tys) {
+            let (cell, tag) = self.cell_at(i)?;
+            if tag != Self::expected_tag(ty) {
+                return Err(InternalError::OperandStack("parameter tag mismatch").into());
+            }
+            out.push(decode(cell, ty));
+        }
+        Ok(out)
+    }
+
+    /// The reference of a statically-known hierarchy at slot `at` (null → the typed null).
+    pub(super) fn take_ref(&self, at: usize, kind: RefKind) -> Result<Val> {
+        let (cell, tag) = self.cell_at(at)?;
+        if tag != RefTag::of_refkind(kind) {
+            return Err(
+                InternalError::OperandStack("reference tag does not match operand type").into(),
+            );
+        }
+        Ok(read_slot(Slot::Ref { offset: 0, kind }, cell.bytes()))
+    }
+
+    /// Overwrites slot `at` with a `Val` (encoded against its own hierarchy tag).
+    #[inline]
+    pub(super) fn set_val(&mut self, at: usize, v: Val) -> Result<()> {
+        self.set_cell(at, encode(v), RefTag::of_val(&v))
+    }
+
+    /// Binary scalar op over slots `at`, `at + 1`; the result lands in `at`.
+    #[inline]
+    pub(super) fn binop_at(&mut self, at: usize, f: impl FnOnce(Cell, Cell) -> Cell) -> Result<()> {
+        let (a, b) = (self.scalar_at(at)?, self.scalar_at(at + 1)?);
+        self.set_scalar(at, f(a, b))
+    }
+
+    /// Fallible [`binop_at`](Self::binop_at) (div/rem traps leave the slots untouched).
+    #[inline]
+    pub(super) fn binop_try_at(
         &mut self,
-        f: impl FnOnce(Cell, Cell) -> crate::Result<Cell>,
-    ) -> crate::Result<()> {
-        let base = self.ensure_scalar_operands(2)?;
-        let n = base + 2;
-        self.values[n - 2] = f(self.values[n - 2], self.values[n - 1])?;
-        self.values.truncate(n - 1);
-        self.shadow.truncate(n - 1);
-        Ok(())
+        at: usize,
+        f: impl FnOnce(Cell, Cell) -> Result<Cell>,
+    ) -> Result<()> {
+        let r = f(self.scalar_at(at)?, self.scalar_at(at + 1)?)?;
+        self.set_scalar(at, r)
     }
 
-    /// In-place unary op over the top cell — no stack movement at all. Scalar ops only.
+    /// Unary scalar op on slot `at`, in place.
     #[inline]
-    pub(super) fn unop_cell(&mut self, f: impl FnOnce(Cell) -> Cell) -> Result<()> {
-        let base = self.ensure_scalar_operands(1)?;
-        let n = base + 1;
-        self.values[n - 1] = f(self.values[n - 1]);
-        Ok(())
+    pub(super) fn unop_at(&mut self, at: usize, f: impl FnOnce(Cell) -> Cell) -> Result<()> {
+        let a = self.scalar_at(at)?;
+        self.set_scalar(at, f(a))
+    }
+
+    /// Fallible [`unop_at`](Self::unop_at) (trapping float-to-int truncations).
+    #[inline]
+    pub(super) fn unop_try_at(
+        &mut self,
+        at: usize,
+        f: impl FnOnce(Cell) -> Result<Cell>,
+    ) -> Result<()> {
+        let r = f(self.scalar_at(at)?)?;
+        self.set_scalar(at, r)
     }
 
     #[inline]
     pub(super) fn pop(&mut self) -> Result<Cell> {
         let base = self.ensure_operands(1)?;
         let cell = self.values[base];
-        self.values.truncate(base);
-        self.shadow.truncate(base);
+        self.sp = base;
         Ok(cell)
-    }
-
-    /// Pops a cell together with its root-shadow tag (for type-agnostic moves that must carry the
-    /// reference hierarchy: `select`, `br_on_null`/`br_on_non_null`).
-    #[inline]
-    pub(super) fn pop_tagged(&mut self) -> Result<(Cell, RefTag)> {
-        let base = self.ensure_operands(1)?;
-        let pair = (self.values[base], self.tag_at(base)?);
-        self.values.truncate(base);
-        self.shadow.truncate(base);
-        Ok(pair)
     }
 
     #[inline]
     pub(super) fn push(&mut self, v: Val) {
-        self.shadow.push(RefTag::of_val(&v));
-        self.values.push(encode(v));
+        self.push_slot(encode(v), RefTag::of_val(&v));
     }
 
     /// Pushes an already-encoded cell with its known shadow tag (type-agnostic moves:
     /// `local.get`, `select`, `br_on_null`).
     #[inline]
     pub(super) fn push_cell(&mut self, cell: Cell, tag: RefTag) {
-        self.shadow.push(tag);
-        self.values.push(cell);
+        self.push_slot(cell, tag);
     }
 
     /// The cell + shadow tag at operand index `i` (a `local.get` source).
@@ -295,13 +438,6 @@ impl Execution {
         Ok(self.values[base].unwrap_i32())
     }
 
-    /// The top cell + shadow tag without popping (a `local.tee` source).
-    #[inline]
-    pub(super) fn top_cell(&self) -> Result<(Cell, RefTag)> {
-        let base = self.ensure_operands(1)?;
-        Ok((self.values[base], self.tag_at(base)?))
-    }
-
     #[inline]
     pub(super) fn pop_i32(&mut self) -> Result<i32> {
         Ok(self.pop_scalar()?.unwrap_i32())
@@ -328,41 +464,6 @@ impl Execution {
         self.pop_scalar()
     }
 
-    /// Pops two scalar `i32` operands transactionally for the fused compare-and-branch op.
-    #[inline]
-    pub(super) fn pop_i32_pair(&mut self) -> Result<(i32, i32)> {
-        let base = self.ensure_scalar_operands(2)?;
-        let pair = (
-            self.values[base].unwrap_i32(),
-            self.values[base + 1].unwrap_i32(),
-        );
-        self.values.truncate(base);
-        self.shadow.truncate(base);
-        Ok(pair)
-    }
-
-    /// Pops an index/length/address operand, widening to `u64`. `is_64` (from the target
-    /// memory/table's type) selects the width â there is no runtime tag to read (#42).
-    #[inline]
-    pub(super) fn pop_index(&mut self, is_64: bool) -> Result<u64> {
-        let cell = self.pop_scalar()?;
-        Ok(if is_64 {
-            cell.unwrap_i64() as u64
-        } else {
-            u64::from(cell.unwrap_i32() as u32)
-        })
-    }
-
-    /// Pushes a size/grow result as i64 for a 64-bit memory/table, else i32 (#42).
-    #[inline]
-    pub(super) fn push_index(&mut self, is_64: bool, v: u64) {
-        self.push(if is_64 {
-            Val::I64(v as i64)
-        } else {
-            Val::I32(v as u32 as i32)
-        });
-    }
-
     /// Pops a reference operand of a statically-known hierarchy (null â the typed null `Val`).
     #[inline]
     pub(super) fn pop_ref(&mut self, kind: RefKind) -> Result<Val> {
@@ -374,22 +475,6 @@ impl Execution {
         }
         let cell = self.pop()?;
         Ok(read_slot(Slot::Ref { offset: 0, kind }, cell.bytes()))
-    }
-
-    /// Pops a reference when the precise hierarchy is carried only by the shadow tag.
-    #[inline]
-    pub(super) fn pop_tagged_ref(&mut self) -> Result<(Cell, RefTag)> {
-        let base = self.ensure_operands(1)?;
-        let tag = self.tag_at(base)?;
-        if tag.refkind().is_none() {
-            return Err(
-                InternalError::OperandStack("reference operation found a scalar tag").into(),
-            );
-        }
-        let pair = (self.values[base], tag);
-        self.values.truncate(base);
-        self.shadow.truncate(base);
-        Ok(pair)
     }
 
     #[inline]
@@ -416,47 +501,6 @@ impl Execution {
         Ok(read_slot(stack_slot, cell.bytes()))
     }
 
-    /// Pops one value using its declared type, validating the shadow before mutation.
-    #[inline]
-    pub(super) fn pop_typed(&mut self, ty: &ValType) -> Result<Val> {
-        let base = self.ensure_operands(1)?;
-        if self.tag_at(base)? != Self::expected_tag(ty) {
-            return Err(
-                InternalError::OperandStack("operand tag does not match value type").into(),
-            );
-        }
-        let value = decode_val(self.values[base], ty);
-        self.values.truncate(base);
-        self.shadow.truncate(base);
-        Ok(value)
-    }
-
-    /// Pops `select`'s two same-typed values and scalar condition as one transaction.
-    #[inline]
-    pub(super) fn pop_select(&mut self) -> Result<(Cell, RefTag)> {
-        let base = self.ensure_operands(3)?;
-        let (a_tag, b_tag) = (self.tag_at(base)?, self.tag_at(base + 1)?);
-        if a_tag != b_tag || self.tag_at(base + 2)? != RefTag::NONE {
-            return Err(InternalError::OperandStack("select operand tag mismatch").into());
-        }
-        let selected = if self.values[base + 2].unwrap_i32() != 0 {
-            (self.values[base], a_tag)
-        } else {
-            (self.values[base + 1], b_tag)
-        };
-        self.values.truncate(base);
-        self.shadow.truncate(base);
-        Ok(selected)
-    }
-
-    /// Splits off the top `tys.len()` operand cells and decodes them to `Val`s (host-call args).
-    #[inline]
-    pub(super) fn pop_params(&mut self, tys: &[ValType]) -> Result<Vec<Val>> {
-        let mut out = Vec::with_capacity(tys.len());
-        self.pop_params_into(tys, &mut out)?;
-        Ok(out)
-    }
-
     /// Alloc-free [`pop_params`](Self::pop_params): decodes the top `tys.len()` operands into
     /// `out` (the reused host-call scratch buffer) and pops them.
     #[inline]
@@ -473,8 +517,7 @@ impl Execution {
                 .zip(tys)
                 .map(|(&c, t)| decode(c, t)),
         );
-        self.values.truncate(base);
-        self.shadow.truncate(base);
+        self.sp = base;
         Ok(())
     }
 
@@ -498,42 +541,52 @@ impl Execution {
         Ok(())
     }
 
-    /// Encodes and pushes host-call results back onto the operand stack.
-    #[inline]
-    pub(super) fn push_results(&mut self, results: Vec<Val>) {
-        self.push_results_slice(&results);
-    }
-
     /// Borrowing [`push_results`](Self::push_results) (the reused scratch buffer survives).
     /// Indexed loops for the same reason as [`pop_params_into`](Self::pop_params_into).
     #[inline]
     pub(super) fn push_results_slice(&mut self, results: &[Val]) {
-        self.shadow.reserve(results.len());
-        self.values.reserve(results.len());
         for v in results {
-            self.shadow.push(RefTag::of_val(v));
-            self.values.push(encode_val(*v));
+            self.push_slot(encode_val(*v), RefTag::of_val(v));
         }
     }
 
-    /// Iterates the live operand/local roots: each `(handle, RefKind)` for a non-null reference
-    /// slot, recovered from the root shadow. Drives the tracing collector's stack-root scan (#27g).
-    #[inline]
-    pub(crate) fn operand_roots(&self) -> Result<Vec<(u32, RefKind)>> {
+    /// The live operand/local roots for a collection: each `(handle, RefKind)` for a non-null
+    /// reference slot in a frame's live range (`[locals_base, live_end)`), recovered from the root
+    /// shadow (#27g). Every slot outside those ranges is dead and has its tag cleared: the
+    /// collection may free its referent, and no later scan — notably a widened one
+    /// (`widen_top_live_range`) — may trace a freed handle.
+    pub(crate) fn operand_roots(&mut self) -> Result<Vec<(u32, RefKind)>> {
         if self.values.len() != self.shadow.len() {
             return Err(InternalError::OperandStack(
                 "value/shadow length mismatch during root scan",
             )
             .into());
         }
-        Ok(self
-            .values
-            .iter()
-            .zip(&self.shadow)
-            .filter_map(|(cell, tag)| {
+        let mut roots = Vec::new();
+        let (mut prev_base, mut dead_from) = (0, 0);
+        for frame in &self.frames {
+            let (base, end) = (frame.locals_base as usize, frame.live_end as usize);
+            // Frames stack upward; out of order, a dead gap could overlap a later live range.
+            if base < prev_base {
+                return Err(
+                    InternalError::FrameStack("frames out of order during root scan").into(),
+                );
+            }
+            prev_base = base;
+            let (Some(cells), Some(tags)) =
+                (self.values.get(base..end), self.shadow.get(base..end))
+            else {
+                return Err(InternalError::OperandStack("frame live range out of bounds").into());
+            };
+            roots.extend(cells.iter().zip(tags).filter_map(|(cell, tag)| {
                 let kind = tag.refkind()?;
                 (!cell.is_null()).then(|| (cell.handle(), kind))
-            })
-            .collect())
+            }));
+            clear_tags(&mut self.shadow, dead_from..base);
+            dead_from = dead_from.max(end);
+        }
+        let len = self.shadow.len();
+        clear_tags(&mut self.shadow, dead_from..len);
+        Ok(roots)
     }
 }

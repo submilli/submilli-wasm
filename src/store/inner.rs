@@ -197,8 +197,9 @@ impl StoreInner {
 
     /// The operand/local GC roots of the parked execution (empty when none is parked). Seeds a
     /// collection triggered from a host call (`gc_reserve_host`/`Store::gc`), where the guest's
-    /// operands live on the parked execution rather than a running one.
-    pub(crate) fn exec_roots(&self) -> crate::Result<Vec<(u32, crate::canon::RefKind)>> {
+    /// operands live on the parked execution rather than a running one. Clears the tags of its
+    /// dead slots (see `Execution::operand_roots`).
+    pub(crate) fn exec_roots(&mut self) -> crate::Result<Vec<(u32, crate::canon::RefKind)>> {
         self.exec_slot.operand_roots()
     }
 

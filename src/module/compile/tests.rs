@@ -105,7 +105,7 @@ fn straight_line_add() {
     .unwrap();
     assert!(matches!(
         ops.as_slice(),
-        [Op::LocalGet(0), Op::LocalGet(1), Op::I32Add]
+        [Op::LocalGet(2, 0), Op::LocalGet(3, 1), Op::I32Add(2)]
     ));
 }
 
@@ -121,7 +121,7 @@ fn memory_load_store() {
     .unwrap();
     assert!(matches!(
         ops.as_slice(),
-        [Op::I32Const(0), Op::LocalGet(0), Op::I32Store(_)]
+        [Op::I32Const(1, 0), Op::LocalGet(2, 0), Op::I32Store(_, 1)]
     ));
 }
 
@@ -137,8 +137,8 @@ fn block_forward_branch() {
     .unwrap();
     // I32Const(1), Br -> end (ip == ops.len()), transferring the 1 result.
     assert_eq!(ops.len(), 2);
-    assert!(matches!(ops[0], Op::I32Const(1)));
-    let Op::Br(BranchTarget { ip, keep, pop }) = ops[1] else {
+    assert!(matches!(ops[0], Op::I32Const(0, 1)));
+    let Op::Br(BranchTarget { ip, keep, pop }, _) = ops[1] else {
         panic!("expected Br")
     };
     assert_eq!((ip, keep, pop), (2, 1, 0));
@@ -155,7 +155,7 @@ fn loop_label_uses_param_arity() {
     )
     .unwrap();
     // LocalGet, Br backward to loop start (ip == 1) with keep == param_count == 1.
-    let Op::Br(BranchTarget { ip, keep, .. }) = ops[1] else {
+    let Op::Br(BranchTarget { ip, keep, .. }, _) = ops[1] else {
         panic!("expected Br")
     };
     assert_eq!((ip, keep), (1, 1));
@@ -173,11 +173,11 @@ fn if_else_targets() {
     )
     .unwrap();
     // LocalGet, BrIfNot->else-start, I32Const(1), Br->end, I32Const(2)
-    let Op::BrIfNot(else_t) = ops[1] else {
+    let Op::BrIfNot(else_t, _) = ops[1] else {
         panic!("expected BrIfNot")
     };
     assert_eq!(else_t.ip, 4); // else body starts at index 4
-    let Op::Br(end_t) = ops[3] else {
+    let Op::Br(end_t, _) = ops[3] else {
         panic!("expected Br")
     };
     assert_eq!(end_t.ip, 5); // end is past the last op
@@ -195,7 +195,7 @@ fn br_table_uniform_keep() {
     )
     .unwrap();
     let ops = &code.ops[func.ops.range()];
-    let Op::BrTable(range) = ops.last().unwrap() else {
+    let Op::BrTable(range, _) = ops.last().unwrap() else {
         panic!("expected BrTable")
     };
     // Side-table layout: `len` case targets then the default. Every edge keeps the 1 block result.
@@ -220,7 +220,7 @@ fn call_stack_effect() {
     .unwrap();
     assert!(matches!(
         ops.as_slice(),
-        [Op::LocalGet(0), Op::LocalGet(1), Op::Call(1)]
+        [Op::LocalGet(2, 0), Op::LocalGet(3, 1), Op::Call(1, 2)]
     ));
 }
 
@@ -234,7 +234,7 @@ fn return_branches_to_function_end() {
         0,
     )
     .unwrap();
-    let Op::Br(BranchTarget { ip, keep, .. }) = ops[1] else {
+    let Op::Br(BranchTarget { ip, keep, .. }, _) = ops[1] else {
         panic!("expected Br for return")
     };
     assert_eq!(ip as usize, ops.len()); // function end
@@ -253,8 +253,8 @@ fn dead_code_after_branch_is_elided() {
     .unwrap();
     // The `i32.const 99` / `drop` after `br 0` are not emitted.
     assert_eq!(ops.len(), 2);
-    assert!(matches!(ops[0], Op::I32Const(1)));
-    assert!(matches!(ops[1], Op::Br(_)));
+    assert!(matches!(ops[0], Op::I32Const(0, 1)));
+    assert!(matches!(ops[1], Op::Br(..)));
 }
 
 #[test]
@@ -267,4 +267,20 @@ fn block_now_compiles() {
         0,
     );
     assert!(ops.is_ok());
+}
+
+#[test]
+fn dropped_relop_does_not_fuse_into_br_if() {
+    let (sigs, ft) = one((&[ValType::I32, ValType::I32, ValType::I32], &[]));
+    let ops = compile_one(
+        "(module (func (param i32 i32 i32)
+            (block local.get 0 local.get 1 local.get 2 i32.lt_s drop br_if 0)))",
+        &sigs,
+        &ft,
+        0,
+    )
+    .unwrap();
+    // `br_if` tests local 0, not the dropped comparison.
+    assert!(ops.iter().any(|op| matches!(op, Op::BrIf(..))));
+    assert!(!ops.iter().any(|op| matches!(op, Op::BrIfCmp { .. })));
 }

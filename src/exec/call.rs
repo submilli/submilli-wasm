@@ -45,14 +45,14 @@ impl Execution {
         &mut self,
         inner: &StoreInner,
         instance: Instance,
-        type_idx: u32,
-        table: u32,
+        (type_idx, table): (u32, u32),
         kind: CallKind,
+        at: usize,
     ) -> Result<StepOutcome> {
         // `table` is a wasmparser-validated table index for this instance (#33 carve-out).
         #[allow(clippy::indexing_slicing)]
         let handle = inner.instance(instance).tables[table as usize];
-        let idx = self.pop_index(inner.table(handle).ty.is_64())?;
+        let idx = self.index_at(at, inner.table(handle).ty.is_64())?;
         let f = match inner.table(handle).get(idx) {
             Some(Ref::Func(Some(f))) => f,
             Some(Ref::Func(None)) => return Err(Trap::IndirectCallToNull.into()),
@@ -81,7 +81,8 @@ impl Execution {
             #[cfg(feature = "async")]
             ResolvedCall::HostAsync(func) => host_sig_ok(inner, *func, expected_id)?,
         }
-        Ok(call_outcome(inner, resolved, instance, kind))
+        let args_at = args_below(inner, &resolved, at)?;
+        Ok(call_outcome(inner, resolved, instance, kind, args_at))
     }
 
     /// `call_ref` / `return_call_ref` (`tail`, #39): pop a funcref operand and dispatch. Null traps;
@@ -92,13 +93,16 @@ impl Execution {
         inner: &StoreInner,
         instance: Instance,
         kind: CallKind,
+        at: usize,
     ) -> Result<StepOutcome> {
-        let f = match self.pop_ref(RefKind::Func)?.to_ref() {
+        let f = match self.take_ref(at, RefKind::Func)?.to_ref() {
             Ref::Func(Some(f)) => f,
             Ref::Func(None) => return Err(Trap::NullReference.into()),
             _ => return Err(Trap::BadSignature.into()),
         };
-        Ok(call_outcome(inner, resolve(inner, f), instance, kind))
+        let resolved = resolve(inner, f);
+        let args_at = args_below(inner, &resolved, at)?;
+        Ok(call_outcome(inner, resolved, instance, kind, args_at))
     }
 }
 
@@ -110,8 +114,8 @@ pub(super) fn call_outcome(
     resolved: ResolvedCall,
     instance: Instance,
     kind: CallKind,
+    args_at: usize,
 ) -> StepOutcome {
-    let n_params = |func| host_ty(inner, func).params().len() as u32;
     match resolved {
         ResolvedCall::Wasm(def_inst, func_index, code) => {
             let return_ip = match kind {
@@ -120,6 +124,7 @@ pub(super) fn call_outcome(
             };
             let req = CallReq {
                 return_ip,
+                args_at,
                 instance: def_inst,
                 func_index,
                 code,
@@ -133,11 +138,13 @@ pub(super) fn call_outcome(
             CallKind::Tail => StepOutcome::TailHostCall {
                 func,
                 instance,
-                n_params: n_params(func),
+                args_at,
+                n_params: host_n_params(inner, func),
             },
             CallKind::Nested(return_ip) => StepOutcome::HostCall {
                 func,
                 instance,
+                top: args_at.saturating_add(host_n_params(inner, func)),
                 return_ip,
             },
         },
@@ -146,11 +153,13 @@ pub(super) fn call_outcome(
             CallKind::Tail => StepOutcome::TailHostAsyncCall {
                 func,
                 instance,
-                n_params: n_params(func),
+                args_at,
+                n_params: host_n_params(inner, func),
             },
             CallKind::Nested(return_ip) => StepOutcome::HostAsyncCall {
                 func,
                 instance,
+                top: args_at.saturating_add(host_n_params(inner, func)),
                 return_ip,
             },
         },
@@ -167,6 +176,30 @@ fn host_sig_ok(inner: &StoreInner, func: Func, expected_id: CanonicalTypeId) -> 
         Ok(())
     } else {
         Err(Trap::BadSignature.into())
+    }
+}
+
+/// The first argument's absolute operand index for a callee whose table-index/funcref operand
+/// sits at `operand_at` (the arguments sit just below it).
+fn args_below(inner: &StoreInner, resolved: &ResolvedCall, operand_at: usize) -> Result<usize> {
+    let n_params = match resolved {
+        ResolvedCall::Wasm(_, _, code) => code.n_params() as usize,
+        ResolvedCall::Host(f) => host_n_params(inner, *f),
+        #[cfg(feature = "async")]
+        ResolvedCall::HostAsync(f) => host_n_params(inner, *f),
+    };
+    operand_at.checked_sub(n_params).ok_or_else(|| {
+        crate::error::InternalError::OperandStack("call arguments below the frame").into()
+    })
+}
+
+/// A host callee's parameter count, from its cached signature.
+fn host_n_params(inner: &StoreInner, f: Func) -> usize {
+    match inner.func(f) {
+        FuncEntity::Host { sig, .. } => sig.params.len(),
+        #[cfg(feature = "async")]
+        FuncEntity::HostAsync { sig, .. } => sig.params.len(),
+        FuncEntity::Wasm { .. } => 0,
     }
 }
 

@@ -16,10 +16,10 @@ impl Translator<'_> {
         table: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::TableInit {
+            self.consume(3, |s| Op::TableInit {
                 elem: elem_index,
                 table,
+                s,
             });
         }
         Ok(())
@@ -31,10 +31,10 @@ impl Translator<'_> {
         src_table: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::TableCopy {
+            self.consume(3, |s| Op::TableCopy {
                 dst_table,
                 src_table,
+                s,
             });
         }
         Ok(())
@@ -49,39 +49,35 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_table_get(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.unop(Op::TableGet(table));
+            self.unop(|s| Op::TableGet(table, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_table_set(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.emit(Op::TableSet(table));
+            self.consume(2, |s| Op::TableSet(table, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_table_size(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::TableSize(table));
+            self.constop(|s| Op::TableSize(table, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_table_grow(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.push(1);
-            self.emit(Op::TableGrow(table));
+            self.binop(|s| Op::TableGrow(table, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_table_fill(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::TableFill(table));
+            self.consume(3, |s| Op::TableFill(table, s));
         }
         Ok(())
     }

@@ -50,7 +50,7 @@ macro_rules! lower_memarg {
             ) -> $crate::Result<()> {
                 if self.reachable {
                     let m = self.memarg(memarg);
-                    self.$helper($crate::module::op::Op::$variant(m));
+                    self.$helper(move |s| $crate::module::op::Op::$variant(m, s));
                 }
                 Ok(())
             }

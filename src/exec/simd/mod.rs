@@ -1,4 +1,4 @@
-//! Fixed-width SIMD (`v128`, #37) execution. `Op::Simd(s)` routes here; memory ops need the store,
+//! Fixed-width SIMD (`v128`, #37) execution. `Op::Simd(s, top)` routes here (a stack-window op); memory ops need the store,
 //! everything else is pure operand-stack compute dispatched through a handler chain (mirroring the
 //! gc chain). Lane math is portable scalar code (see [`lanes`]); SIMD never traps except on a
 //! memory-op out-of-bounds.
@@ -7,6 +7,9 @@
 // fixed-size lane arrays (`[T; N]`, statically in-bounds — lane indices are validated immediates) or
 // the bounds-checked `load_n`/`store_n` memory helpers — never unchecked guest input.
 #![allow(clippy::indexing_slicing)]
+// `SimdOp` is 8 bytes (its memargs are pooled), so clippy would pass it by value; the category
+// handlers keep `&SimdOp` so the whole chain forwards one borrowed op.
+#![allow(clippy::trivially_copy_pass_by_ref)]
 
 mod bit;
 mod cvt;

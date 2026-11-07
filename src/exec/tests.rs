@@ -134,7 +134,7 @@ fn operand_underflow_bypasses_guest_catch_all() {
         .iter_mut()
         .find(|op| matches!(op, crate::module::op::Op::Nop))
         .unwrap();
-    *op = crate::module::op::Op::Drop;
+    *op = crate::module::op::Op::LocalSet(0, 0);
 
     let mut store = Store::new(&engine, ());
     let error = host::execute(

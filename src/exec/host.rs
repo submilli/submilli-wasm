@@ -31,6 +31,9 @@ pub(super) struct HostCallState {
     pub(super) pending_generation: u64,
     pub(super) host_index: u32,
     pub(super) sig: std::sync::Arc<crate::store::HostSig>,
+    /// Where the results go (the popped args' slot): pinned here because a host re-entering wasm
+    /// runs on the same execution and moves its stack window.
+    pub(super) results_at: usize,
 }
 
 /// Roots every reference param for the host call's duration. `pop_params_into` removed them
@@ -129,6 +132,7 @@ pub(super) fn enter<T>(
         return Err(error);
     }
     let mut exec = store.inner.take_exec();
+    exec.stack_limit = store.inner.engine().max_wasm_stack();
     let value_base = exec.values.len();
     let stop_depth = exec.frames.len();
     let delim = if stop_depth == 0 {
@@ -137,6 +141,8 @@ pub(super) fn enter<T>(
         Delimiter::HostReentry
     };
     if let Err(error) = exec.enter_call(delim, instance, func_index, code, args) {
+        // An entry-frame `StackOverflow`: trace the parked outer frames (none at top level).
+        let error = exec.attach_suspension_backtrace(&store.inner, error);
         if stop_depth != 0 {
             store.inner.park_exec(exec);
         }
@@ -226,9 +232,14 @@ fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Resu
                     return Err(exec.attach_suspension_backtrace(&store.inner, e));
                 }
             }
-            Outcome::Grow { memory, delta } => exec.do_grow(store, memory, delta)?,
-            Outcome::TableGrow { table, delta, init } => {
-                exec.do_grow_table(store, table, delta, init)?;
+            Outcome::Grow { memory, delta, at } => exec.do_grow(store, memory, delta, at)?,
+            Outcome::TableGrow {
+                table,
+                delta,
+                init,
+                at,
+            } => {
+                exec.do_grow_table(store, table, (delta, init), at)?;
             }
             Outcome::GcGrow {
                 reserved_target,
@@ -282,6 +293,7 @@ impl Execution {
             pending_generation,
             host_index,
             sig,
+            results_at: self.sp,
         })
     }
 
@@ -334,9 +346,18 @@ impl Execution {
             Self::discard_host_call(store, state);
             return Err(error);
         }
+        self.sp = state.results_at;
         self.push_results_slice(&state.results);
+        // A host tail-called from the call's bottom frame returns straight to the boundary: its
+        // results are the call's, so nothing may remain above them.
+        if self.frames.len() == stop_depth {
+            self.values.truncate(self.sp);
+            self.shadow.truncate(self.sp);
+        }
+        // A safepoint: the results are live (e.g. for the async driver's GC-pressure check).
+        let live = self.set_live_end(self.sp);
         Self::discard_host_call(store, state);
-        Ok(())
+        live
     }
 
     /// Invokes a suspended host function: pops its args off the operand stack,
@@ -392,30 +413,34 @@ impl Execution {
         self.finish_host_call(store, state, result, stop_depth)
     }
 
-    /// Services a suspended `memory.grow`: consults the limiter and pushes the new
-    /// page count, or `-1` on a soft failure (a trap propagates from `grow_memory`).
-    fn do_grow<T>(&mut self, store: &mut Store<T>, memory: Memory, delta: u64) -> Result<()> {
+    /// Services a suspended `memory.grow`: consults the limiter and writes the old page count,
+    /// or `-1` on a soft failure, to slot `at` (a trap propagates from `grow_memory`).
+    fn do_grow<T>(
+        &mut self,
+        store: &mut Store<T>,
+        memory: Memory,
+        delta: u64,
+        at: usize,
+    ) -> Result<()> {
         let is_64 = store.inner.memory(memory).ty.is_64();
         let old =
             self.with_parked_host_operation(store, |store| store.grow_memory(memory, delta))?;
-        self.push_index(is_64, old.unwrap_or(u64::MAX)); // soft-fail → -1 in either width
-        Ok(())
+        self.put_index(at, is_64, old.unwrap_or(u64::MAX)) // soft-fail → -1 in either width
     }
 
-    /// Services a suspended `table.grow`: consults the limiter and pushes the old size,
-    /// or `-1` on a soft failure (a trap propagates from `grow_table`).
+    /// Services a suspended `table.grow`: consults the limiter and writes the old size, or `-1`
+    /// on a soft failure, to slot `at` (a trap propagates from `grow_table`).
     fn do_grow_table<T>(
         &mut self,
         store: &mut Store<T>,
         table: Table,
-        delta: u64,
-        init: Ref,
+        (delta, init): (u64, Ref),
+        at: usize,
     ) -> Result<()> {
         let is_64 = store.inner.table(table).ty.is_64();
         let old =
             self.with_parked_host_operation(store, |store| store.grow_table(table, delta, init))?;
-        self.push_index(is_64, old.unwrap_or(u64::MAX));
-        Ok(())
+        self.put_index(at, is_64, old.unwrap_or(u64::MAX))
     }
 
     pub(super) fn do_grow_gc<T>(

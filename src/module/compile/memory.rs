@@ -37,14 +37,14 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_memory_size(&mut self, mem: u32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::MemorySize(mem));
+            self.constop(|s| Op::MemorySize(mem, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_memory_grow(&mut self, mem: u32) -> Result<()> {
         if self.reachable {
-            self.unop(Op::MemoryGrow(mem));
+            self.unop(|s| Op::MemoryGrow(mem, s));
         }
         Ok(())
     }
@@ -55,8 +55,7 @@ impl Translator<'_> {
         mem: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::MemoryInit(data_index, mem));
+            self.consume(3, |s| Op::MemoryInit(data_index, mem, s));
         }
         Ok(())
     }
@@ -74,16 +73,14 @@ impl Translator<'_> {
         src_mem: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::MemoryCopy(dst_mem, src_mem));
+            self.consume(3, |s| Op::MemoryCopy(dst_mem, src_mem, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_memory_fill(&mut self, mem: u32) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::MemoryFill(mem));
+            self.consume(3, |s| Op::MemoryFill(mem, s));
         }
         Ok(())
     }

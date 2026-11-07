@@ -252,3 +252,33 @@ fn host_pingpong_async_traps() {
     let err = block_on(pong.call_async(&mut store, &[], &mut [])).unwrap_err();
     assert_eq!(trap_of(&err), Trap::StackOverflow);
 }
+
+/// A frame's statically-sized operand area is charged against `max_wasm_stack` *before* it is
+/// allocated: one call into a function with a 10k-slot operand stack traps under a 64 KiB budget.
+#[test]
+fn oversized_callee_frame_traps_before_allocation() {
+    let engine = engine_with_stack(64 << 10);
+    let pushes = "(i32.const 0)".repeat(10_000);
+    let drops = "(drop)".repeat(10_000);
+    let wat = format!("(module (func $big {pushes} {drops}) (func (export \"run\") (call $big)))");
+    let m = module(&engine, &wat);
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    assert_eq!(
+        trap_of(&call_export(&mut store, inst, "run").unwrap_err()),
+        Trap::StackOverflow
+    );
+}
+
+/// The flip side (wasmtime parity): slots are charged at a value's 8 bytes, not the interpreter's
+/// cell width, so a function near wasmparser's 50k-locals limit runs under the default budget.
+#[test]
+fn many_locals_fit_the_default_budget() {
+    let engine = Engine::default();
+    let locals = " i32".repeat(49_000);
+    let wat = format!("(module (func $f (local{locals})) (func (export \"run\") (call $f)))");
+    let m = module(&engine, &wat);
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &m, &[]).unwrap();
+    call_export(&mut store, inst, "run").unwrap();
+}

@@ -88,21 +88,26 @@ async fn drive_async<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: us
                     return Err(exec.attach_suspension_backtrace(&store.inner, e));
                 }
             }
-            Outcome::Grow { memory, delta } => {
+            Outcome::Grow { memory, delta, at } => {
                 let is_64 = store.inner.memory(memory).ty.is_64();
                 store.inner.swap_exec(exec);
                 let old = store.grow_memory_async(memory, delta).await;
                 store.inner.recover_cancelled_async_calls();
                 store.inner.swap_exec(exec);
-                exec.push_index(is_64, old?.unwrap_or(u64::MAX));
+                exec.put_index(at, is_64, old?.unwrap_or(u64::MAX))?;
             }
-            Outcome::TableGrow { table, delta, init } => {
+            Outcome::TableGrow {
+                table,
+                delta,
+                init,
+                at,
+            } => {
                 let is_64 = store.inner.table(table).ty.is_64();
                 store.inner.swap_exec(exec);
                 let old = store.grow_table_async(table, delta, init).await;
                 store.inner.recover_cancelled_async_calls();
                 store.inner.swap_exec(exec);
-                exec.push_index(is_64, old?.unwrap_or(u64::MAX));
+                exec.put_index(at, is_64, old?.unwrap_or(u64::MAX))?;
             }
             // GC reservation growth uses the sync limiter path (errors if an async limiter is
             // installed — combining an async limiter with the GC heap is unsupported for now).

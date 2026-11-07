@@ -5,56 +5,58 @@
 //! Variant names mirror `wasmparser::Operator` 1:1 so translation is mechanical. Immediates: a
 //! memory arg, a lane index `u8`, the shuffle's 16 byte indices, or the raw `v128.const` bits.
 
-use crate::module::op::MemArg;
+/// A SIMD memory op's memarg, as an index into the function's `big_memargs` pool: inline, the
+/// 8-byte `MemArg` would leave no room for the op's `top` slot within the 16-byte `Op`.
+pub(crate) type MemIdx = u32;
 
 /// One SIMD instruction (`v128`). All immediates are `Copy`, so the whole enum is.
 #[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum SimdOp {
     // --- loads / stores (reuse the generic byte-width helpers) ---
-    V128Load(MemArg),
-    V128Load8x8S(MemArg),
-    V128Load8x8U(MemArg),
-    V128Load16x4S(MemArg),
-    V128Load16x4U(MemArg),
-    V128Load32x2S(MemArg),
-    V128Load32x2U(MemArg),
-    V128Load8Splat(MemArg),
-    V128Load16Splat(MemArg),
-    V128Load32Splat(MemArg),
-    V128Load64Splat(MemArg),
-    V128Load32Zero(MemArg),
-    V128Load64Zero(MemArg),
-    V128Store(MemArg),
+    V128Load(MemIdx),
+    V128Load8x8S(MemIdx),
+    V128Load8x8U(MemIdx),
+    V128Load16x4S(MemIdx),
+    V128Load16x4U(MemIdx),
+    V128Load32x2S(MemIdx),
+    V128Load32x2U(MemIdx),
+    V128Load8Splat(MemIdx),
+    V128Load16Splat(MemIdx),
+    V128Load32Splat(MemIdx),
+    V128Load64Splat(MemIdx),
+    V128Load32Zero(MemIdx),
+    V128Load64Zero(MemIdx),
+    V128Store(MemIdx),
     V128Load8Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Load16Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Load32Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Load64Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Store8Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Store16Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Store32Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
     V128Store64Lane {
-        mem: MemArg,
+        mem: MemIdx,
         lane: u8,
     },
 

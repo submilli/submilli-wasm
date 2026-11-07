@@ -23,13 +23,13 @@ impl Translator<'_> {
 /// are branches — see `control`.)
 impl Translator<'_> {
     super::visit::lower_nullary! {
-        visit_ref_eq => binop RefEq;
-        visit_array_len => unop ArrayLen;
-        visit_ref_i31 => unop RefI31;
-        visit_i31_get_s => unop I31GetS;
-        visit_i31_get_u => unop I31GetU;
-        visit_any_convert_extern => unop AnyConvertExtern;
-        visit_extern_convert_any => unop ExternConvertAny;
+        visit_ref_eq => window_binop RefEq;
+        visit_array_len => window_unop ArrayLen;
+        visit_ref_i31 => window_unop RefI31;
+        visit_i31_get_s => window_unop I31GetS;
+        visit_i31_get_u => window_unop I31GetU;
+        visit_any_convert_extern => window_unop AnyConvertExtern;
+        visit_extern_convert_any => window_unop ExternConvertAny;
     }
 
     pub(in crate::module::compile) fn visit_struct_new(
@@ -37,8 +37,8 @@ impl Translator<'_> {
         struct_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(self.struct_field_count(struct_type_index)?);
-            self.constop(Op::StructNew(struct_type_index));
+            let n = self.struct_field_count(struct_type_index)?;
+            self.window(n, 1, |top| Op::StructNew(struct_type_index, top));
         }
         Ok(())
     }
@@ -48,7 +48,7 @@ impl Translator<'_> {
         struct_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.constop(Op::StructNewDefault(struct_type_index));
+            self.window(0, 1, |top| Op::StructNewDefault(struct_type_index, top));
         }
         Ok(())
     }
@@ -59,9 +59,10 @@ impl Translator<'_> {
         field_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.unop(Op::StructGet {
+            self.window_unop(|top| Op::StructGet {
                 ty: struct_type_index,
                 field: field_index,
+                top,
             });
         }
         Ok(())
@@ -73,9 +74,10 @@ impl Translator<'_> {
         field_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.unop(Op::StructGetS {
+            self.window_unop(|top| Op::StructGetS {
                 ty: struct_type_index,
                 field: field_index,
+                top,
             });
         }
         Ok(())
@@ -87,9 +89,10 @@ impl Translator<'_> {
         field_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.unop(Op::StructGetU {
+            self.window_unop(|top| Op::StructGetU {
                 ty: struct_type_index,
                 field: field_index,
+                top,
             });
         }
         Ok(())
@@ -101,9 +104,10 @@ impl Translator<'_> {
         field_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.store(Op::StructSet {
+            self.window(2, 0, |top| Op::StructSet {
                 ty: struct_type_index,
                 field: field_index,
+                top,
             });
         }
         Ok(())
@@ -114,8 +118,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.constop(Op::ArrayNew(array_type_index));
+            self.window(2, 1, |top| Op::ArrayNew(array_type_index, top));
         }
         Ok(())
     }
@@ -125,7 +128,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.unop(Op::ArrayNewDefault(array_type_index));
+            self.window(1, 1, |top| Op::ArrayNewDefault(array_type_index, top));
         }
         Ok(())
     }
@@ -136,10 +139,10 @@ impl Translator<'_> {
         array_size: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(array_size);
-            self.constop(Op::ArrayNewFixed {
+            self.window(array_size, 1, |top| Op::ArrayNewFixed {
                 ty: array_type_index,
                 n: array_size,
+                top,
             });
         }
         Ok(())
@@ -151,10 +154,10 @@ impl Translator<'_> {
         array_data_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.constop(Op::ArrayNewData {
+            self.window(2, 1, |top| Op::ArrayNewData {
                 ty: array_type_index,
                 data: array_data_index,
+                top,
             });
         }
         Ok(())
@@ -166,10 +169,10 @@ impl Translator<'_> {
         array_elem_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.constop(Op::ArrayNewElem {
+            self.window(2, 1, |top| Op::ArrayNewElem {
                 ty: array_type_index,
                 elem: array_elem_index,
+                top,
             });
         }
         Ok(())
@@ -180,8 +183,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.constop(Op::ArrayGet(array_type_index));
+            self.window(2, 1, |top| Op::ArrayGet(array_type_index, top));
         }
         Ok(())
     }
@@ -191,8 +193,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.constop(Op::ArrayGetS(array_type_index));
+            self.window(2, 1, |top| Op::ArrayGetS(array_type_index, top));
         }
         Ok(())
     }
@@ -202,8 +203,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(2);
-            self.constop(Op::ArrayGetU(array_type_index));
+            self.window(2, 1, |top| Op::ArrayGetU(array_type_index, top));
         }
         Ok(())
     }
@@ -213,8 +213,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(3);
-            self.emit(Op::ArraySet(array_type_index));
+            self.window(3, 0, |top| Op::ArraySet(array_type_index, top));
         }
         Ok(())
     }
@@ -224,8 +223,7 @@ impl Translator<'_> {
         array_type_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(4);
-            self.emit(Op::ArrayFill(array_type_index));
+            self.window(4, 0, |top| Op::ArrayFill(array_type_index, top));
         }
         Ok(())
     }
@@ -236,10 +234,10 @@ impl Translator<'_> {
         array_type_index_src: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(5);
-            self.emit(Op::ArrayCopy {
+            self.window(5, 0, |top| Op::ArrayCopy {
                 dst: array_type_index_dst,
                 src: array_type_index_src,
+                top,
             });
         }
         Ok(())
@@ -251,10 +249,10 @@ impl Translator<'_> {
         array_data_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(4);
-            self.emit(Op::ArrayInitData {
+            self.window(4, 0, |top| Op::ArrayInitData {
                 ty: array_type_index,
                 data: array_data_index,
+                top,
             });
         }
         Ok(())
@@ -266,10 +264,10 @@ impl Translator<'_> {
         array_elem_index: u32,
     ) -> Result<()> {
         if self.reachable {
-            self.pop(4);
-            self.emit(Op::ArrayInitElem {
+            self.window(4, 0, |top| Op::ArrayInitElem {
                 ty: array_type_index,
                 elem: array_elem_index,
+                top,
             });
         }
         Ok(())
@@ -281,9 +279,10 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let ty = conv_heaptype(self.ctx.kinds, hty)?;
-            self.unop(Op::RefTest {
+            self.window_unop(|top| Op::RefTest {
                 ty,
                 nullable: false,
+                top,
             });
         }
         Ok(())
@@ -295,7 +294,11 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let ty = conv_heaptype(self.ctx.kinds, hty)?;
-            self.unop(Op::RefTest { ty, nullable: true });
+            self.window_unop(|top| Op::RefTest {
+                ty,
+                nullable: true,
+                top,
+            });
         }
         Ok(())
     }
@@ -306,9 +309,10 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let ty = conv_heaptype(self.ctx.kinds, hty)?;
-            self.unop(Op::RefCast {
+            self.window_unop(|top| Op::RefCast {
                 ty,
                 nullable: false,
+                top,
             });
         }
         Ok(())
@@ -320,7 +324,11 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let ty = conv_heaptype(self.ctx.kinds, hty)?;
-            self.unop(Op::RefCast { ty, nullable: true });
+            self.window_unop(|top| Op::RefCast {
+                ty,
+                nullable: true,
+                top,
+            });
         }
         Ok(())
     }

@@ -126,26 +126,25 @@ impl Translator<'_> {
         let mut else_patch = None;
         if self.reachable {
             self.pop(1); // condition
-                         // Fuse `relop; if` into one negated compare-and-branch (see `br_if`).
+            let s = self.slot_below(0);
+            let target = BranchTarget {
+                ip: 0,
+                keep: 0,
+                pop: 0,
+            };
+            // Fuse `relop; if` into one negated compare-and-branch (see `br_if`).
             if let Some(kind) = self.fusable_cmp.take() {
                 let idx = self.next_ip() - 1;
                 *self.op_mut(idx) = Op::BrIfCmp {
                     kind,
                     negate: true,
-                    target: BranchTarget {
-                        ip: 0,
-                        keep: 0,
-                        pop: 0,
-                    },
+                    target,
+                    s,
                 };
                 else_patch = Some(idx);
             } else {
                 else_patch = Some(self.next_ip());
-                self.emit(Op::BrIfNot(BranchTarget {
-                    ip: 0,
-                    keep: 0,
-                    pop: 0,
-                }));
+                self.emit(Op::BrIfNot(target, s));
             }
         }
         self.fusable_cmp = None;
@@ -177,11 +176,15 @@ impl Translator<'_> {
         if self.reachable {
             let idx = self.next_ip();
             let (keep, _) = branch::fixup(result_count, 0)?;
-            self.emit(Op::Br(BranchTarget {
-                ip: 0,
-                keep,
-                pop: 0,
-            }));
+            let top = self.slot_below(0);
+            self.emit(Op::Br(
+                BranchTarget {
+                    ip: 0,
+                    keep,
+                    pop: 0,
+                },
+                top,
+            ));
             let frame = self.ctrl.last_mut().expect("if frame");
             frame.end_patches.push(Patch {
                 op: idx,
@@ -195,7 +198,7 @@ impl Translator<'_> {
         }
         self.ctrl.last_mut().expect("if frame").else_patch = None;
         self.reachable = roe;
-        self.height = base + param_count;
+        self.set_height(base + param_count);
         Ok(())
     }
 
@@ -221,7 +224,7 @@ impl Translator<'_> {
         } else {
             self.reachable || frame.end_targeted || frame.else_patch.is_some()
         };
-        self.height = frame.base_height + frame.result_count;
+        self.set_height(frame.base_height + frame.result_count);
         Ok(())
     }
 
@@ -229,12 +232,15 @@ impl Translator<'_> {
     /// compile-time pop — the rest of the block is dead and `do_end` resets height absolutely; the
     /// interpreter pops the tag args / `exnref` at runtime.
     pub(super) fn throw(&mut self, tag_index: u32) {
-        self.emit(Op::Throw(tag_index));
+        let (params, _) = self.signature(self.ctx.tag_types[tag_index as usize]);
+        let s = self.slot_below(params);
+        self.emit(Op::Throw(tag_index, s));
         self.reachable = false;
     }
 
     pub(super) fn throw_ref(&mut self) {
-        self.emit(Op::ThrowRef);
+        let s = self.slot_below(1);
+        self.emit(Op::ThrowRef(s));
         self.reachable = false;
     }
 
@@ -243,9 +249,10 @@ impl Translator<'_> {
     /// So the branch target is computed with the reference already popped.
     pub(super) fn br_on_null(&mut self, depth: u32) -> Result<()> {
         self.pop(1); // reference (excluded from the branch target's operands)
+        let s = self.slot_below(0);
         let (target, patch_frame) = self.branch_target(depth)?;
         let idx = self.next_ip();
-        self.emit(Op::BrOnNull(target));
+        self.emit(Op::BrOnNull(target, s));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.push(1); // fall-through keeps the (non-null) reference
         Ok(())
@@ -255,9 +262,10 @@ impl Translator<'_> {
     /// label arity includes it; on fall-through (null) the reference is dropped. So the
     /// branch target is computed with the reference still on the stack.
     pub(super) fn br_on_non_null(&mut self, depth: u32) -> Result<()> {
+        let s = self.slot_below(1); // the reference
         let (target, patch_frame) = self.branch_target(depth)?;
         let idx = self.next_ip();
-        self.emit(Op::BrOnNonNull(target));
+        self.emit(Op::BrOnNonNull(target, s));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.pop(1); // fall-through drops the reference
         Ok(())
@@ -277,11 +285,15 @@ impl Translator<'_> {
         // The edge is pooled (shared with `br_table` cases); the op carries the packed index.
         let pool = self.push_edge(bt);
         let target = pool | if nullable { NULLABLE_BIT } else { 0 };
+        let heap = u32::try_from(self.code.cast_heaps.len())
+            .map_err(|_| crate::Error::msg("too many br_on_cast instructions in module"))?;
+        self.code.cast_heaps.push(ty);
+        let top = self.slot_below(0);
         let idx = self.next_ip();
         self.emit(if on_fail {
-            Op::BrOnCastFail { ty, target }
+            Op::BrOnCastFail { heap, target, top }
         } else {
-            Op::BrOnCast { ty, target }
+            Op::BrOnCast { heap, target, top }
         });
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         Ok(())

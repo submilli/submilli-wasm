@@ -820,3 +820,51 @@ the instruction cuts above not moving cycles). The lever left is *executing fewe
 50–58% of executed ops are `local.get/set/tee` + `i32.const` (CoreMark, memory_tree, fib).
 That is the register-IR step (static-height slots, operand providers, `local.set` fusion) —
 also where `v128`-as-two-cells removes the remaining ~18% `simd` cost (16-byte `Cell`).
+
+## 16. Session 7 — step 2a: static-slot operands (no runtime stack pointer)
+
+The first stage of the register-IR step (owner decisions: static slots, not wasmi-2.0
+accumulators — they only pay off with tail-call threading and cost compile time; GC roots stay
+on the runtime shadow; fuel stays 1 per executed op — SUB-2136; compile budget +15%).
+
+**Design.** wasm's operand height is static at every op, so the compiler gives each operand a
+fixed frame slot (`n_locals + height`) and every op carries its slot (`Op` stays 16 bytes):
+- *Hot* ops (numeric, locals/consts/globals, loads/stores, branches, calls, tables/refs) read and
+  write slots directly — no push/pop, no `Vec`-length dependency chain through memory.
+- *Cold* ops (GC aggregates/casts, SIMD, host-call args) are **stack windows**: they carry `top`
+  and keep their pop/push handlers over a virtual `sp` set on entry — ~270 handlers unchanged.
+  Two payloads moved to pools to fit `top`: `br_on_cast` heap types (`cast_heaps`) and SIMD
+  memargs (the function's `big_memargs`).
+- Frames own `[base, base + n_locals + max_operands)`; the buffer grows (zeroed) on call and shrinks
+  on return; branch fixups are static slot copies; returns copy results from the operand base to
+  the frame base. `drop` emits nothing.
+- GC roots stay precise: each frame records `live_end` at safepoints (calls, windows, `throw`,
+  host returns, caught exceptions); the collector scans only live ranges and clears the tags of
+  the dead slots. The epoch callback (an arbitrary op, where the top frame's `live_end` is stale)
+  widens the top frame to the buffer end — sound because of that clearing.
+- Frame pushes are charged against `max_wasm_stack` before allocating (a statically-sized frame
+  could otherwise claim a huge extent in one call); `local.tee` reuses `LocalSet`.
+
+**Migration that stayed green.** During the transition `values.len()` still equaled frame base +
+static height, so migrated ops wrote their slots and re-synced the length for the unmigrated ones,
+with a check that each op's slot ended at the live stack top (it caught slot-math errors as test
+failures). The spec suite ran after each category: numeric → core → memory → branches → calls →
+refs/tables → GC → SIMD → final (remove the length bookkeeping). Two bugs surfaced only in the final
+step: a re-entrant host call moved the shared `sp` under the outer host call (results now pinned to
+`HostCallState::results_at`), and a host tail-called from the boundary frame left stale cells above
+its results.
+
+**Review fixes** (code review, no-panic review): `drop` must clear the pending `br_if` compare
+fusion (it no longer emits an op, so `i32.lt_s; drop; br_if` fused the dropped compare); the
+stale-`live_end` GC roots above; absolute heights (block ends, landing pads) now count toward
+`max_operands`. None moved the benchmarks (all within ±3%).
+
+**Measured** (cycles, M4 Pro) vs step 1: loops +6–12% (default) / +7–19% (simd); calls −12% (fib)
+/ −7% (per call) — the frame push/pop does more (geometry, extent/live bookkeeping), to revisit in
+2b. Cumulative vs `main`: CoreMark **2.0×** (simd 1.74×), loops 2.17–2.26× (simd 1.68–1.81×), fib
+1.16×, per-call 3.8×. `Module::new`: **+4% instructions** (spidermonkey, pulldown-cmark, CoreMark) —
+within budget.
+
+**Why only this much:** 2a removes per-op stack bookkeeping but not ops — the loop is still
+dispatch-bound (§15). 2b (operand providers: free `local.get`/consts, `local.set` fusion) cuts the
+50–58% of executed ops that are pure data movement; it builds on these slot operands.

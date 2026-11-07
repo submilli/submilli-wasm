@@ -84,6 +84,12 @@ pub(crate) struct Execution {
     /// A run-loop request left by the op `step` just executed (see [`outcome::CONTROL`]); `None`
     /// everywhere outside the dispatch loop.
     control: Option<StepOutcome>,
+    /// The current stack window's top: where a stack-window op (GC, SIMD, a host call's args)
+    /// pops/pushes. Set by `enter_window`; slot-addressed ops never touch it.
+    sp: usize,
+    /// The engine's `max_wasm_stack` (bytes), cached at entry so every frame push is charged
+    /// against it; `0` (fail closed) until an entry sets it.
+    stack_limit: usize,
 }
 
 /// Guest calls between amortized GC-pressure mailbox checks (see `run`): pressure is
@@ -101,6 +107,12 @@ const GC_CHECK_INTERVAL: u32 = 1024;
 /// default) without a separate knob, so unbounded host↔wasm ping-pong traps `StackOverflow` instead
 /// of aborting the process.
 const HOST_REENTRY_RESERVE: usize = 4096;
+
+/// Bytes charged per operand slot against `max_wasm_stack`: a wasm value's native spill slot, as
+/// wasmtime would spend — not our cell width (16 B under `simd`) plus shadow byte, which would cap
+/// a single frame well below wasmparser's 50k-locals limit at the default budget. Real heap use is
+/// thus at most ~2× the configured bytes: still a linear bound.
+const SLOT_CHARGE: usize = 8;
 
 // Parkability: keep `Execution` `Send` so async can await with it at rest. Compile-time check —
 // a future non-`Send` field (e.g. an `Rc`) fails here rather than at an `.await`.
@@ -120,6 +132,8 @@ impl Default for Execution {
             host_reentry_depth: 0,
             floor: usize::MAX,
             control: None,
+            sp: 0,
+            stack_limit: 0,
         }
     }
 }
@@ -176,7 +190,7 @@ impl Execution {
         }
         self.shadow.extend(args.iter().map(cell::RefTag::of_val));
         self.values.extend(args.into_iter().map(cell::encode));
-        if let Err(error) = self.push_call(instance, func_index, code) {
+        if let Err(error) = self.push_call(instance, func_index, code, value_base) {
             self.values.truncate(value_base);
             self.shadow.truncate(value_base);
             self.frames.truncate(frame_base);
@@ -270,20 +284,23 @@ impl Execution {
     }
 
     /// Estimated byte footprint of the wasm execution stacks, checked against
-    /// `Config::max_wasm_stack` at each call to bound runaway recursion. An operand slot is now a
-    /// fixed-width untyped [`cell::Cell`] (8 or 16 bytes; see `cell`), not the ~32-byte `Val`.
+    /// `Config::max_wasm_stack` at each frame push to bound runaway recursion (slots charged at
+    /// [`SLOT_CHARGE`]).
     #[inline]
     fn stack_bytes(&self) -> Result<usize> {
-        let values = self
-            .values
-            .len()
-            .checked_mul(std::mem::size_of::<cell::Cell>())
+        self.stack_bytes_for(self.values.len(), self.frames.len())
+    }
+
+    /// [`stack_bytes`](Self::stack_bytes) for a prospective `values`-slot buffer and `frames`
+    /// frames.
+    #[inline]
+    fn stack_bytes_for(&self, values: usize, frames: usize) -> Result<usize> {
+        let values = values
+            .checked_mul(SLOT_CHARGE)
             .ok_or(InternalError::FrameStack(
                 "operand stack byte size overflow",
             ))?;
-        let frames = self
-            .frames
-            .len()
+        let frames = frames
             .checked_mul(std::mem::size_of::<Frame>())
             .ok_or(InternalError::FrameStack("frame stack byte size overflow"))?;
         let reentry = self
@@ -293,8 +310,7 @@ impl Execution {
                 "host re-entry byte size overflow",
             ))?;
         values
-            .checked_add(self.shadow.len())
-            .and_then(|n| n.checked_add(frames))
+            .checked_add(frames)
             .and_then(|n| n.checked_add(reentry))
             .ok_or_else(|| InternalError::FrameStack("execution stack byte size overflow").into())
     }
@@ -314,7 +330,7 @@ impl Execution {
         // (just a host call) would never be checked. With the host-crossing reserve folded into
         // `stack_bytes`, this entry check makes even pure host↔wasm ping-pong trap here rather
         // than abort the native stack (#30).
-        if self.stack_bytes()? >= store.inner.engine().max_wasm_stack() {
+        if self.stack_bytes()? >= self.stack_limit {
             let ip = self.frames.last().map_or(0, |f| f.ip);
             return Err(self.attach_trap_backtrace(&store.inner, Trap::StackOverflow.into(), ip));
         }
@@ -341,7 +357,6 @@ impl Execution {
         stop_depth: usize,
         gates: (bool, bool),
     ) -> Result<Outcome> {
-        let stack_limit = store.inner.engine().max_wasm_stack();
         // Amortized GC-pressure safepoint: armed only when the engine-wide axis exists, and
         // anchored to guest *calls* (zero per-op cost; call sites are already heavyweight).
         let gc_watch =
@@ -356,7 +371,7 @@ impl Execution {
             let ops = code.ops_in(func.ops);
             loop {
                 let Some(op) = ops.get(ip as usize) else {
-                    if self.do_return(func.n_results, stop_depth, false)? {
+                    if self.do_return(func.n_results, stop_depth)? {
                         return Ok(Outcome::Finished);
                     }
                     (func, ip, base, instance) = self.top_into(&mut code)?;
@@ -387,18 +402,21 @@ impl Execution {
                 ))?;
                 match outcome {
                     StepOutcome::Call(req) => {
-                        if self.stack_bytes()? >= stack_limit {
-                            return Err(self.attach_trap_backtrace(
-                                &store.inner,
-                                Trap::StackOverflow.into(),
-                                ip,
-                            ));
-                        }
-                        self.frames
+                        let caller = self
+                            .frames
                             .last_mut()
-                            .ok_or(InternalError::FrameStack("missing caller frame"))?
-                            .ip = req.return_ip;
-                        self.push_call(req.instance, req.func_index, req.code)?;
+                            .ok_or(InternalError::FrameStack("missing caller frame"))?;
+                        caller.ip = req.return_ip;
+                        // The arguments become the callee's locals; the caller's live temporaries
+                        // end below them.
+                        caller.live_end = u32::try_from(req.args_at)
+                            .map_err(|_| InternalError::FrameStack("operand index exceeds u32"))?;
+                        // A frame push past `max_wasm_stack` traps (`StackOverflow`) at this call.
+                        if let Err(e) =
+                            self.push_call(req.instance, req.func_index, req.code, req.args_at)
+                        {
+                            return Err(self.attach_trap_backtrace(&store.inner, e, ip));
+                        }
                         (func, ip, base, instance) = self.top_into(&mut code)?;
                         if gc_watch {
                             gc_countdown -= 1;
@@ -409,12 +427,16 @@ impl Execution {
                         }
                         continue 'frame;
                     }
-                    // Tail call (#39): replace the current frame — `do_return(n_params)` repositions
-                    // the args to the frame's base and pops it, then `push_call` lays the callee
-                    // there.
+                    // Tail call (#39): replace the current frame — `return_from` moves the args to
+                    // the frame's base and pops it, then `push_call` lays the callee there.
                     StepOutcome::TailCall(req) => {
-                        self.do_return(req.code.n_params(), stop_depth, true)?;
-                        self.push_call(req.instance, req.func_index, req.code)?;
+                        let dst = self.frame_base()?;
+                        let n_params = req.code.n_params() as usize;
+                        self.return_from(req.args_at, n_params, stop_depth)?;
+                        if let Err(e) = self.push_call(req.instance, req.func_index, req.code, dst)
+                        {
+                            return Err(self.attach_suspension_backtrace(&store.inner, e));
+                        }
                         (func, ip, base, instance) = self.top_into(&mut code)?;
                         if gc_watch {
                             gc_countdown -= 1;
@@ -430,9 +452,12 @@ impl Execution {
                     StepOutcome::TailHostCall {
                         func: host_fn,
                         instance: host_inst,
+                        args_at,
                         n_params,
                     } => {
-                        self.do_return(n_params, stop_depth, true)?;
+                        let dst = self.frame_base()?;
+                        self.return_from(args_at, n_params, stop_depth)?;
+                        self.enter_window(dst.saturating_add(n_params))?;
                         self.invoke_host(store, host_fn, host_inst, stop_depth)?;
                         if self.frames.len() == stop_depth {
                             return Ok(Outcome::Finished);
@@ -444,9 +469,12 @@ impl Execution {
                     StepOutcome::TailHostAsyncCall {
                         func,
                         instance,
+                        args_at,
                         n_params,
                     } => {
-                        self.do_return(n_params, stop_depth, true)?;
+                        let dst = self.frame_base()?;
+                        self.return_from(args_at, n_params, stop_depth)?;
+                        self.enter_window(dst.saturating_add(n_params))?;
                         return Ok(Outcome::HostAsync { func, instance });
                     }
                     // Sync host call, loop-resident: the callback runs right here (the execution
@@ -457,12 +485,14 @@ impl Execution {
                     StepOutcome::HostCall {
                         func: host_fn,
                         instance: host_inst,
+                        top,
                         return_ip,
                     } => {
                         self.frames
                             .last_mut()
                             .ok_or(InternalError::FrameStack("missing caller frame"))?
                             .ip = return_ip;
+                        self.enter_window(top)?; // the host pops its args from here
                         self.invoke_host(store, host_fn, host_inst, stop_depth)?;
                         if self.frames.len() == stop_depth {
                             return Ok(Outcome::Finished);
@@ -474,36 +504,45 @@ impl Execution {
                     StepOutcome::HostAsyncCall {
                         func,
                         instance,
+                        top,
                         return_ip,
                     } => {
                         self.frames
                             .last_mut()
                             .ok_or(InternalError::FrameStack("missing caller frame"))?
                             .ip = return_ip;
+                        self.enter_window(top)?; // the host pops its args from here
                         return Ok(Outcome::HostAsync { func, instance });
                     }
                     StepOutcome::Grow {
                         memory,
                         delta,
+                        at,
                         return_ip,
                     } => {
                         self.frames
                             .last_mut()
                             .ok_or(InternalError::FrameStack("missing caller frame"))?
                             .ip = return_ip;
-                        return Ok(Outcome::Grow { memory, delta });
+                        return Ok(Outcome::Grow { memory, delta, at });
                     }
                     StepOutcome::TableGrow {
                         table,
                         delta,
                         init,
+                        at,
                         return_ip,
                     } => {
                         self.frames
                             .last_mut()
                             .ok_or(InternalError::FrameStack("missing caller frame"))?
                             .ip = return_ip;
-                        return Ok(Outcome::TableGrow { table, delta, init });
+                        return Ok(Outcome::TableGrow {
+                            table,
+                            delta,
+                            init,
+                            at,
+                        });
                     }
                     StepOutcome::GcGrow {
                         reserved_target,

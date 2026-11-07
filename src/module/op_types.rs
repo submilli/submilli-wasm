@@ -7,6 +7,10 @@ pub(crate) type GlobalIdx = u32;
 pub(crate) type LocalIdx = u32;
 pub(crate) type DataIdx = u32;
 pub(crate) type ElemIdx = u32;
+/// A frame-relative operand slot: locals occupy `[0, n_locals)`, operand-stack position `k` lives
+/// at `n_locals + k` (its height is static per op, so no runtime stack pointer is needed). An op's
+/// operands sit contiguously from its slot, and its result is written back there.
+pub(crate) type Slot = u32;
 
 /// A memory-access immediate: target memory index (#41) + static offset (`align` is
 /// validation-only). The inline offset is `u32`; a `u64` offset (reachable only with a

@@ -79,15 +79,17 @@ impl Execution {
     ) -> Result<Option<usize>> {
         let module = inner.instance(instance).module.clone();
         let data_len = match op {
-            Op::StructNew(ty) | Op::StructNewDefault(ty) => {
+            Op::StructNew(ty, _) | Op::StructNewDefault(ty, _) => {
                 module.inner().struct_layout(*ty)?.size()
             }
-            Op::ArrayNew(ty) | Op::ArrayNewDefault(ty) => {
+            Op::ArrayNew(ty, _) | Op::ArrayNewDefault(ty, _) => {
                 let stride = module.inner().array_layout(*ty)?.stride();
                 array_bytes(self.peek_count()?, stride)?
             }
-            Op::ArrayNewFixed { ty, n } => module.inner().array_layout(*ty)?.body_size(*n as usize),
-            Op::ArrayNewData { ty, data } => {
+            Op::ArrayNewFixed { ty, n, .. } => {
+                module.inner().array_layout(*ty)?.body_size(*n as usize)
+            }
+            Op::ArrayNewData { ty, data, .. } => {
                 let stride = module.inner().array_layout(*ty)?.stride();
                 let dropped = inner.instance(instance).dropped_data[*data as usize];
                 let seg = if dropped {
@@ -97,7 +99,7 @@ impl Execution {
                 };
                 seg_clamped_charge(self.peek_count()?, stride, seg)
             }
-            Op::ArrayNewElem { ty, elem } => {
+            Op::ArrayNewElem { ty, elem, .. } => {
                 let stride = module.inner().array_layout(*ty)?.stride();
                 let seg = inner.instance(instance).elems[*elem as usize]
                     .len()

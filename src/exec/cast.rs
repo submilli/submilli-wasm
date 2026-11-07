@@ -24,13 +24,13 @@ impl Execution {
         instance: Instance,
     ) -> Result<()> {
         match op {
-            Op::RefTest { ty, nullable } => {
+            Op::RefTest { ty, nullable, .. } => {
                 let r = self.pop_ref(cell::refkind_of_irheap(ty))?;
                 let hit = matches_heaptype(inner, instance, &r, ty, *nullable)?;
                 self.push(Val::I32(i32::from(hit)));
                 Ok(())
             }
-            Op::RefCast { ty, nullable } => {
+            Op::RefCast { ty, nullable, .. } => {
                 let r = self.pop_ref(cell::refkind_of_irheap(ty))?;
                 if matches_heaptype(inner, instance, &r, ty, *nullable)? {
                     self.push(r);
@@ -39,19 +39,19 @@ impl Execution {
                     Err(Trap::CastFailure.into())
                 }
             }
-            Op::RefEq => {
+            Op::RefEq(_) => {
                 let b = self.pop_anyref()?;
                 let a = self.pop_anyref()?;
                 self.push(Val::I32(i32::from(ref_eq(&a, &b))));
                 Ok(())
             }
-            Op::AnyConvertExtern => {
+            Op::AnyConvertExtern(_) => {
                 let e = self.pop_ref(RefKind::Extern)?;
                 let a = inner.any_convert_extern(e)?;
                 self.push(a);
                 Ok(())
             }
-            Op::ExternConvertAny => {
+            Op::ExternConvertAny(_) => {
                 let a = self.pop_anyref()?;
                 let e = inner.extern_convert_any(a)?;
                 self.push(e);
@@ -76,10 +76,13 @@ impl Execution {
         op: &Op,
         on_fail: bool,
     ) -> Result<Option<u32>> {
-        let (ty, packed) = match op {
-            Op::BrOnCast { ty, target } | Op::BrOnCastFail { ty, target } => (ty, *target),
+        let (heap, packed) = match op {
+            Op::BrOnCast { heap, target, .. } | Op::BrOnCastFail { heap, target, .. } => {
+                (*heap, *target)
+            }
             _ => unreachable!("not a br_on_cast op"),
         };
+        let ty = code.cast_heap(heap)?;
         // The edge is pooled (bit 31 of the packed index is the cast's nullable flag). The
         // index is emitted by our own compile pass, in-bounds by construction (#33 carve-out).
         let nullable = packed & NULLABLE_BIT != 0;
@@ -89,7 +92,7 @@ impl Execution {
         let matched = matches_heaptype(inner, instance, &r, ty, nullable)?;
         self.push(r);
         if matched ^ on_fail {
-            self.take_branch(target)?;
+            self.take_branch(target, self.sp)?; // the reference stays on both edges
             Ok(Some(target.ip))
         } else {
             Ok(None)

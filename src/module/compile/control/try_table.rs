@@ -59,19 +59,24 @@ impl Translator<'_> {
 
         let skip_idx = self.next_ip();
         let (keep, _) = super::branch::fixup(frame.result_count, 0)?;
-        self.emit(Op::Br(BranchTarget {
-            ip: 0,
-            keep,
-            pop: 0,
-        }));
+        let top = self.slot_below(0);
+        self.emit(Op::Br(
+            BranchTarget {
+                ip: 0,
+                keep,
+                pop: 0,
+            },
+            top,
+        ));
 
         let mut recs = Vec::with_capacity(frame.clauses.len());
         for c in &frame.clauses {
             // The landing pad branches with the operand stack at restore-height + payload.
-            self.height = base_height + self.payload_count(c);
+            self.set_height(base_height + self.payload_count(c));
             let (target, patch_frame) = self.branch_target(c.label)?;
             let landing_ip = self.next_ip();
-            self.emit(Op::Br(target));
+            let top = self.slot_below(0);
+            self.emit(Op::Br(target, top));
             self.register_branch(patch_frame, landing_ip, PatchSlot::Single);
             recs.push(HandlerRec {
                 tag: c.tag,
@@ -92,7 +97,7 @@ impl Translator<'_> {
             clauses: recs.into_boxed_slice(),
         });
         self.reachable = self.reachable || frame.end_targeted;
-        self.height = base_height + frame.result_count;
+        self.set_height(base_height + frame.result_count);
         Ok(())
     }
 

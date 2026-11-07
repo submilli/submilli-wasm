@@ -25,7 +25,9 @@ use wasmparser::{BinaryReaderError, FuncValidator, FunctionBody, ValidatorResour
 use crate::canon::{AggKind, IrVal, ModuleType};
 use crate::error::InternalError;
 use crate::module::code::{CodeArenas, Span};
-use crate::module::op::{BigMemArg, BranchTarget, CmpKind, CompiledFunc, MemArg, Op, BIG_MEMARG};
+use crate::module::op::{
+    BigMemArg, BranchTarget, CmpKind, CompiledFunc, MemArg, Op, Slot, BIG_MEMARG,
+};
 use crate::{Error, Result};
 
 use self::control::CtrlFrame;
@@ -82,11 +84,16 @@ pub(crate) fn translate_function(
     fv.read_locals(&mut body.get_binary_reader())
         .map_err(wp_err)?;
     let locals_start = expand_locals(ctx, code, body)?;
+    let n_locals = u32::try_from(code.local_types.len().saturating_sub(locals_start as usize))
+        .ok()
+        .and_then(|n| n.checked_add(n_params))
+        .ok_or(InternalError::Compiler("local count overflow"))?;
 
     // The function's streams append to the module-wide arenas (pre-reserved once in
     // `compile_bodies` — each `Op` is written exactly once, no regrowth, no per-function
     // allocation). `ctrl` is handed the recycled buffer (empty, capacity preserved).
     let mut t = Translator::new(ctx, code, retain_offsets, std::mem::take(&mut scratch.ctrl));
+    t.n_locals = n_locals;
     t.push_func_frame(n_results);
     // Drive `BinaryReader::visit_operator` directly (the same pattern `FuncValidator::validate`
     // uses): `ValidateThenLower` doubles as the reader's `FrameStack`, so no `OperatorsReader` —
@@ -182,6 +189,8 @@ struct Translator<'a> {
     code: &'a mut CodeArenas,
     base: Bases,
     retain_offsets: bool,
+    /// Params + declared locals: the frame slot where operand-stack position 0 lives.
+    n_locals: u32,
     height: u32,
     max_operands: u32,
     ctrl: Vec<CtrlFrame>,
@@ -219,6 +228,7 @@ impl<'a> Translator<'a> {
             code,
             base,
             retain_offsets,
+            n_locals: 0,
             height: 0,
             max_operands: 0,
             ctrl,
@@ -263,16 +273,27 @@ impl<'a> Translator<'a> {
                 offset: m.offset as u32,
             }
         } else {
-            let idx = self.code.big_memargs.len() as u32 - self.base.big_memargs;
-            self.code.big_memargs.push(BigMemArg {
-                memory: m.memory,
-                offset: m.offset,
-            });
             MemArg {
-                memory: idx,
+                memory: self.pool_memarg(m),
                 offset: BIG_MEMARG,
             }
         }
+    }
+
+    /// Pools a memarg in the function's `big_memargs`, returning its function-relative index.
+    fn pool_memarg(&mut self, m: wasmparser::MemArg) -> u32 {
+        let idx = u32::try_from(self.code.big_memargs.len())
+            .ok()
+            .and_then(|len| len.checked_sub(self.base.big_memargs));
+        self.code.big_memargs.push(BigMemArg {
+            memory: m.memory,
+            offset: m.offset,
+        });
+        idx.unwrap_or_else(|| {
+            self.error
+                .get_or_insert(InternalError::Compiler("memarg pool overflow"));
+            0
+        })
     }
 
     fn emit(&mut self, op: Op) {
@@ -289,8 +310,14 @@ impl<'a> Translator<'a> {
                 .get_or_insert(InternalError::Compiler("operand height overflow"));
             return;
         };
+        self.set_height(height);
+    }
+
+    /// Resets the height absolutely (a block end, an `else`, a landing pad), still counting it
+    /// toward the frame size: such a height can exceed any the body pushed (a catch payload).
+    fn set_height(&mut self, height: u32) {
         self.height = height;
-        self.max_operands = self.max_operands.max(self.height);
+        self.max_operands = self.max_operands.max(height);
     }
 
     fn pop(&mut self, n: u32) {
@@ -312,54 +339,118 @@ impl<'a> Translator<'a> {
         }
     }
 
-    /// pop 2, push 1 (binary numeric / comparison).
-    fn binop(&mut self, op: Op) {
-        self.pop(2);
-        self.push(1);
-        self.emit(op);
+    /// The frame slot of the operand `n` entries below the stack top — where an op consuming the
+    /// top `n` operands finds its first one (and writes its result).
+    fn slot_below(&mut self, n: u32) -> Slot {
+        let height = self.height_below(n);
+        self.n_locals.checked_add(height).unwrap_or_else(|| {
+            self.error
+                .get_or_insert(InternalError::Compiler("operand slot overflow"));
+            0
+        })
     }
 
-    /// pop 1, push 1 (unary numeric / conversion / test / load).
-    fn unop(&mut self, op: Op) {
+    /// pop 2, push 1 (binary numeric / comparison), slot-addressed.
+    fn binop(&mut self, op: impl FnOnce(Slot) -> Op) {
+        let s = self.slot_below(2);
+        self.pop(2);
+        self.push(1);
+        self.emit(op(s));
+    }
+
+    /// pop 1, push 1 (unary numeric / conversion / test / load), slot-addressed.
+    fn unop(&mut self, op: impl FnOnce(Slot) -> Op) {
+        let s = self.slot_below(1);
         self.pop(1);
         self.push(1);
-        self.emit(op);
+        self.emit(op(s));
     }
 
-    /// pop 2, push 0 (store).
-    fn store(&mut self, op: Op) {
+    /// A *stack-window* op consuming `n_in` operands and pushing `n_out`, addressed by the stack
+    /// top before it (`top`, one past its last operand): its handler pops/pushes relative to it.
+    fn window(&mut self, n_in: u32, n_out: u32, op: impl FnOnce(Slot) -> Op) {
+        let top = self.slot_below(0);
+        self.pop(n_in);
+        self.push(n_out);
+        self.emit(op(top));
+    }
+
+    fn window_unop(&mut self, op: impl FnOnce(Slot) -> Op) {
+        self.window(1, 1, op);
+    }
+
+    fn window_binop(&mut self, op: impl FnOnce(Slot) -> Op) {
+        self.window(2, 1, op);
+    }
+
+    /// pop 2, push 0 (store), slot-addressed at its first operand.
+    fn store(&mut self, op: impl FnOnce(Slot) -> Op) {
+        let s = self.slot_below(2);
         self.pop(2);
-        self.emit(op);
+        self.emit(op(s));
     }
 
-    /// push 1 (constant / size / get).
-    fn constop(&mut self, op: Op) {
+    /// pop `n`, push 0, slot-addressed at the first popped operand (bulk memory/table ops).
+    fn consume(&mut self, n: u32, op: impl FnOnce(Slot) -> Op) {
+        let s = self.slot_below(n);
+        self.pop(n);
+        self.emit(op(s));
+    }
+
+    /// push 1 (constant / get), slot-addressed: the result lands at the new top.
+    fn constop(&mut self, op: impl FnOnce(Slot) -> Op) {
+        let s = self.slot_below(0);
         self.push(1);
-        self.emit(op);
+        self.emit(op(s));
     }
 
-    /// pop 3, push 1 (`v128.bitselect`).
+    /// pop 1, push 0 (`local.set` / `global.set` / `drop`), slot-addressed at the popped value.
+    fn sink(&mut self, op: impl FnOnce(Slot) -> Op) {
+        let s = self.slot_below(1);
+        self.pop(1);
+        self.emit(op(s));
+    }
+
+    /// A SIMD op as a stack window (`n_in` operands, `n_out` results; see `Op::Simd`).
     #[cfg(feature = "simd")]
-    fn ternary(&mut self, op: Op) {
-        self.pop(3);
-        self.push(1);
-        self.emit(op);
+    fn simd(&mut self, n_in: u32, n_out: u32, op: crate::module::op_simd::SimdOp) {
+        self.window(n_in, n_out, |top| Op::Simd(op, top));
+    }
+
+    #[cfg(feature = "simd")]
+    fn simd_unop(&mut self, op: crate::module::op_simd::SimdOp) {
+        self.simd(1, 1, op);
+    }
+
+    #[cfg(feature = "simd")]
+    fn simd_binop(&mut self, op: crate::module::op_simd::SimdOp) {
+        self.simd(2, 1, op);
+    }
+
+    #[cfg(feature = "simd")]
+    fn simd_ternary(&mut self, op: crate::module::op_simd::SimdOp) {
+        self.simd(3, 1, op);
+    }
+
+    #[cfg(feature = "simd")]
+    fn simd_store(&mut self, op: crate::module::op_simd::SimdOp) {
+        self.simd(2, 0, op);
     }
 }
 
 /// The comparison kind if `op` is a fusable i32 relop (the [`Op::BrIfCmp`] candidates).
 fn fusable_cmp_of(op: &Op) -> Option<CmpKind> {
     Some(match op {
-        Op::I32Eq => CmpKind::Eq,
-        Op::I32Ne => CmpKind::Ne,
-        Op::I32LtS => CmpKind::LtS,
-        Op::I32LtU => CmpKind::LtU,
-        Op::I32GtS => CmpKind::GtS,
-        Op::I32GtU => CmpKind::GtU,
-        Op::I32LeS => CmpKind::LeS,
-        Op::I32LeU => CmpKind::LeU,
-        Op::I32GeS => CmpKind::GeS,
-        Op::I32GeU => CmpKind::GeU,
+        Op::I32Eq(_) => CmpKind::Eq,
+        Op::I32Ne(_) => CmpKind::Ne,
+        Op::I32LtS(_) => CmpKind::LtS,
+        Op::I32LtU(_) => CmpKind::LtU,
+        Op::I32GtS(_) => CmpKind::GtS,
+        Op::I32GtU(_) => CmpKind::GtU,
+        Op::I32LeS(_) => CmpKind::LeS,
+        Op::I32LeU(_) => CmpKind::LeU,
+        Op::I32GeS(_) => CmpKind::GeS,
+        Op::I32GeU(_) => CmpKind::GeU,
         _ => return None,
     })
 }

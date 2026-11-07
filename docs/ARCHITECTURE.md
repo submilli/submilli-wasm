@@ -107,13 +107,13 @@ Compilation does **no** register allocation and **no** second pass beyond back-p
 ## 5. Internal bytecode & control flow
 
 ### Instruction set (`Op`)
-A flat enum with inline immediates, one variant per logical operation (locals, globals, memory load/store with offset, numeric ops, calls, branches, ref/gc/eh ops added in later phases). Example shape:
+A flat enum with inline immediates, one variant per logical operation (locals, globals, memory load/store with offset, numeric ops, calls, branches, ref/gc/eh ops added in later phases). **Ops are slot-addressed (step 2a):** wasm's operand-stack height is static at every instruction, so the compiler assigns each operand a fixed frame slot (`n_locals + height`) and every op carries its operand slot (`Slot`, a `u32` frame offset) — there is no runtime stack pointer. Hot ops read/write their slots directly; cold ops (GC, SIMD, host calls) are *stack windows*: they carry `top` (one past their last operand) and their handlers pop/push relative to it. The example shape below predates the slot operands:
 
 ```rust
 enum Op {
     // values / locals / globals
     I32Const(i32), I64Const(i64), F32Const(u32), F64Const(u64),
-    LocalGet(u32), LocalSet(u32), LocalTee(u32),
+    LocalGet(u32), LocalSet(u32),
     GlobalGet(GlobalIdx), GlobalSet(GlobalIdx),
     // memory
     I32Load { offset: u32, align: u8 }, /* … all load/store variants … */
@@ -212,9 +212,9 @@ A later optimization (NaN-boxing / tagged `u64` cells) is possible but deferred;
 ## 7. Runtime: execution engine
 
 ### Stacks
-- **Operand stack** — one flat `Vec<Cell>` per `Execution`, where `Cell` is a **fixed-width untyped byte slot** (`src/exec/cell.rs`): `cfg`-sized **8 bytes with the `simd` feature off, 16 with it on** (only `v128` needs 16; every other value, incl. the `u32` `Func`/`Rooted` reference handles, fits in 8). wasm is statically typed post-validation, so the slot carries **no tag** — a ~4× shrink from the 32-byte `Val` and no per-pop match. Per Wizard, **locals and operands are contiguous**: a call reserves `n_locals` slots (params copied/aliased in, the rest default-initialized or marked unset for non-defaultable locals), then operands grow above. `local.get i` ⇒ `operands[frame.locals_base + i]`; uniform-stride cells keep `base+i` indexing and the `copy_within` branch/return fixups unchanged. Scalars (de)serialize little-endian, references as a 4-byte handle with the `NULL_REF` sentinel — reusing the GC-body codec (§14), **no `unsafe`**, no alignment requirement. Typed ops decode via `Cell::unwrap_i32`/… (mirroring `Val`); the type-agnostic ops (`drop`/`select`/`local.*`) are raw cell moves; only the boundaries that genuinely need a typed `Val` — the host call/return boundary (signature types), globals/tables (entity types), and the GC/cast ops — decode against the statically-known type. **Soundness of the 8-byte cell:** validation rejects the `v128` value type when `simd` is off (wasmparser, via `WasmFeatures`), so no `v128` ever reaches the stack there.
-  - **GC roots:** the untyped slot drops the on-stack `Val` tag that §14 relies on for *free* precise root enumeration, so a tracing collector (#27g) must recover operand-stack roots another way — **stack maps vs. a runtime ref-shadow, an open decision (#27j)**. Inert today (the null collector never scans stack roots), which is why the cell change lands now without it.
-  - **Host cross-hierarchy refs:** the lenient `val_matches` admits a host externref into an `anyref` parameter; the tagged stack used to preserve that variant, the untyped one can't, so such args are **internalized at the call boundary** (`extern_::coerce_args`, mirroring the conversion ops' tolerance — §6).
+- **Frame slots (step 2a)** — one flat `Vec<Cell>` per `Execution` (plus the parallel root shadow), where `Cell` is a **fixed-width untyped byte slot** (`src/exec/cell.rs`): `cfg`-sized **8 bytes with the `simd` feature off, 16 with it on** (only `v128` needs 16; splitting `v128` into two 8-byte slots is a planned follow-up). Each frame owns `[locals_base, locals_base + n_locals + max_operands)`: params, then declared locals (default-initialized on entry), then the operand-stack slots, whose height is static per op — so ops address slots directly (`frame_base + slot`) and there is no push/pop. The buffer is sized to the top frame's extent on call (new cells zeroed) and shrunk back on return; operand slots aren't cleared on entry because validation guarantees each is written before it is read. Scalars (de)serialize little-endian, references as a 4-byte handle with the `NULL_REF` sentinel — reusing the GC-body codec (§14), **no `unsafe`**, no alignment requirement. Typed ops decode via `Cell::unwrap_i32`/… (mirroring `Val`); only the boundaries that genuinely need a typed `Val` — the host call/return boundary (signature types), globals/tables (entity types), and the GC/cast ops — decode against the statically-known type. **Soundness of the 8-byte cell:** validation rejects the `v128` value type when `simd` is off (wasmparser, via `WasmFeatures`), so no `v128` ever reaches a slot there.
+  - **Stack windows:** the cold ops keep pop/push handlers over a virtual stack pointer (`Execution::sp`) that the dispatcher sets from the op's `top` (`enter_window`); hot ops never touch it.
+  - **Host cross-hierarchy refs:** the lenient `val_matches` admits a host externref into an `anyref` parameter; the untyped slot can't preserve that variant, so such args are **internalized at the call boundary** (`extern_::coerce_args`, mirroring the conversion ops' tolerance — §6).
 - **Frame stack** — `Vec<Frame>`; wasm calls push a frame instead of recursing natively.
 
 ```rust
@@ -228,22 +228,26 @@ struct Frame {
 `Frame` keeps **no** exception-handler state: `try_table` handlers live in a per-`CompiledFunc`
 ip-range table consulted only on throw (see §15), so the normal path is unaffected.
 
-### Operand-slot GC-root location — **resolved (#27g): runtime byte-shadow**
-The untyped `Cell` operand stack (above) **landed** (#27j): ~4× smaller, no per-pop tag match,
-tighter `max_wasm_stack` accounting. The one thing it gave up is the on-stack `Val` tag that §14
-relies on for *free* precise root enumeration. The tracing collector (#27g) recovers operand-stack
-roots via a **runtime byte-shadow** — a parallel `Vec<cell::RefTag>` on `Execution`, one tag per
-slot (`None`/`Func`/`Extern`/`Any`/`Exn`), moved in lockstep with the cell stack's `copy_within`
-(***not* a bitmap** — relocating bit-ranges on every branch/return is error-prone in a no-panic hot
-path). Chosen over compile-time `(func, ip)` stack maps because it adds **zero compile-time cost**,
-matching the project's primary "fast compile/startup ≫ runtime" priority — the ~1 B/slot + per-push
-tag write is runtime cost, which is explicitly secondary. The other roots (globals/tables/locals-as-
-typed/`exnref` args/host `Rooted`s) stay enumerable directly. (The 8-byte-cell soundness prerequisite
-— no `v128` value type without the `simd` feature — needed **no** code change: wasmparser validation
-already rejects it, locked by a regression test.)
+### Operand-slot GC-root location — **resolved (#27g): runtime byte-shadow, precise per frame**
+The untyped `Cell` slots give up the on-stack `Val` tag that §14 relies on for root enumeration.
+The tracing collector (#27g) recovers roots via a **runtime byte-shadow** — a parallel
+`Vec<cell::RefTag>` on `Execution`, one tag per slot (`None`/`Func`/`Extern`/`Any`/`Exn`), written
+on every slot write and moved in lockstep with branch/return copies. Chosen over compile-time
+`(func, ip)` stack maps because it adds **zero compile-time cost**. With static slots, a frame's
+dead operand slots can keep stale tags, so the scan is **precise per frame**: each frame records
+`live_end` at its safepoints (calls, stack-window ops, `throw`, host returns, caught exceptions)
+and the collector traces only `[locals_base, live_end)` (`Execution::operand_roots`), **clearing
+the tags of every slot it does not scan** — their referents may be freed. Between safepoints the
+top frame's `live_end` goes stale (hot ops write references above it), so host code entered at an
+arbitrary op — the epoch-deadline callback, which may collect — first widens that frame's range to
+the buffer's end. Over-approximate but sound: thanks to the clearing, every tagged slot references
+an allocated object. The other roots (globals/tables/
+`exnref` args/host `Rooted`s) stay enumerable directly. (The 8-byte-cell soundness prerequisite
+— no `v128` value type without the `simd` feature — needed **no** code change: wasmparser
+validation already rejects it, locked by a regression test.)
 
 ### Calls (zero-copy args)
-On `Call`, callee args are already the top `n_params` operands; the callee's `locals_base = caller_top − n_params`, so arguments become the callee's first locals with no copy (the long-promised "JVM trick", per Wizard). On `Return`, the top `n_results` operands are moved down to `locals_base`, the frame is popped, and execution continues in the caller. Tail calls (`return_call`) reuse the caller's frame slot.
+On `Call`, the callee's args already sit in the caller's operand slots `[args, args + n_params)` — the call op carries `args` — and the callee's frame starts there, so arguments become its first locals with no copy (the long-promised "JVM trick", per Wizard). On return, its `n_results` results (at its operand base: static heights put them there) are copied to its frame base — i.e. the caller's `args` slot, where the caller's static height expects them — the frame is popped, and the buffer shrinks to the caller's extent. Tail calls (`return_call`) copy the args to the current frame's base and lay the callee there.
 
 ### Host re-entry on the shared stacks, and `max_wasm_stack` (#30)
 A host function can re-enter wasm (`Func::call` from inside the closure). Rather than spin up a
@@ -253,7 +257,11 @@ stacks**, pushing a `Delimiter::HostReentry` boundary frame and running with a `
 above it (`run`/`do_return`/`unwind` stop there, so the parked outer call stays untouched — and an
 inner trap/exception surfaces to the host's `Func::call`, never leaking into the outer call). One
 unified stack means **`max_wasm_stack` is enforced across the host boundary** by the same
-`stack_bytes()` check (the parked outer frames count). Because each host crossing still nests
+`stack_bytes()` check (the parked outer frames count). Every frame push is charged *before* it
+allocates — its operand area is sized statically (`max_operands`), so a single call can claim a
+large extent — and an allocation failure traps rather than aborting. Slots are charged 8 bytes each
+(a wasm value's native spill slot, as wasmtime spends), not our 16-byte `simd` cell, so a function
+at wasmparser's 50k-locals limit still fits the default budget. Because each host crossing still nests
 native Rust frames (a sync closure runs on the native stack) that the ~24-byte wasm frame can't
 bound, each `HostReentry` crossing is charged a fixed `HOST_REENTRY_RESERVE` (≈4 KiB) folded into
 `stack_bytes()`, so the budget caps re-entry depth (~128 at the 512 KiB default) below native

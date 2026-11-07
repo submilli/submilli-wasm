@@ -24,7 +24,8 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn br(&mut self, depth: u32) -> Result<()> {
         let (target, patch_frame) = self.branch_target(depth)?;
         let idx = self.next_ip();
-        self.emit(Op::Br(target));
+        let top = self.slot_below(0);
+        self.emit(Op::Br(target, top));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         self.reachable = false;
         Ok(())
@@ -32,6 +33,7 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn br_if(&mut self, depth: u32) -> Result<()> {
         self.pop(1); // condition
+        let s = self.slot_below(0); // the condition's slot (a fused relop's operand pair starts here)
         let (target, patch_frame) = self.branch_target(depth)?;
         // Fuse with an immediately preceding i32 relop: replace it in place (offsets stay
         // aligned — nothing is pushed) so compare-and-branch is one dispatch at runtime.
@@ -41,12 +43,13 @@ impl Translator<'_> {
                 kind,
                 negate: false,
                 target,
+                s,
             };
             self.register_branch(patch_frame, idx, PatchSlot::Single);
             return Ok(());
         }
         let idx = self.next_ip();
-        self.emit(Op::BrIf(target));
+        self.emit(Op::BrIf(target, s));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
         // conditional: fall-through stays reachable with the operands intact
         Ok(())
@@ -54,6 +57,7 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn br_table(&mut self, table: &BrTable<'_>) -> Result<()> {
         self.pop(1); // index
+        let s = self.slot_below(0);
         let cases: Vec<u32> = table.targets().collect::<Result<_, _>>().map_err(wp_err)?;
         // Append this table's targets (cases then default) contiguously to the side-table; the
         // `Op` carries only the `{base, len}` range into it.
@@ -73,7 +77,7 @@ impl Translator<'_> {
             patches.push((i, PatchSlot::TableDefault));
         }
         let idx = self.next_ip();
-        self.emit(Op::BrTable(BrTableRange { base, len }));
+        self.emit(Op::BrTable(BrTableRange { base, len }, s));
         for (i, slot) in patches {
             let frame = &mut self.ctrl[i];
             frame.end_patches.push(Patch { op: idx, slot });
@@ -91,7 +95,8 @@ impl Translator<'_> {
             .ok_or(InternalError::Compiler("return operand height underflow"))?;
         let (keep, pop) = fixup(arity, pop)?;
         let idx = self.next_ip();
-        self.emit(Op::Br(BranchTarget { ip: 0, keep, pop }));
+        let top = self.slot_below(0);
+        self.emit(Op::Br(BranchTarget { ip: 0, keep, pop }, top));
         self.ctrl[0].end_patches.push(Patch {
             op: idx,
             slot: PatchSlot::Single,
@@ -149,7 +154,7 @@ impl Translator<'_> {
     pub(super) fn patch_ip(&mut self, op: u32, slot: PatchSlot, ip: u32) {
         // `br_table` targets are out-of-line: resolve the flat side-table index, then patch there
         // (kept separate to avoid aliasing `self.ops` and `self.br_table_targets`).
-        if let Op::BrTable(range) = self.op_ref(op) {
+        if let Op::BrTable(range, _) = self.op_ref(op) {
             let range = *range;
             let flat = match slot {
                 PatchSlot::TableCase(k) => range.base + k,
@@ -167,12 +172,12 @@ impl Translator<'_> {
             return;
         }
         match self.op_mut(op) {
-            Op::Br(t)
-            | Op::BrIf(t)
-            | Op::BrIfNot(t)
+            Op::Br(t, _)
+            | Op::BrIf(t, _)
+            | Op::BrIfNot(t, _)
             | Op::BrIfCmp { target: t, .. }
-            | Op::BrOnNull(t)
-            | Op::BrOnNonNull(t) => {
+            | Op::BrOnNull(t, _)
+            | Op::BrOnNonNull(t, _) => {
                 t.ip = ip;
             }
             _ => unreachable!("patch on non-branch op"),

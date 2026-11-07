@@ -1,5 +1,6 @@
-//! Memory instructions: bounds-checked loads/stores plus size/grow/copy/fill, each on an explicit
-//! memory index (#41). `memory.init`/`data.drop` operate on passive data segments.
+//! Memory instructions: bounds-checked loads/stores plus size/copy/fill, each on an explicit memory
+//! index (#41) and slot-addressed operands. `memory.init`/`data.drop` operate on passive data
+//! segments.
 
 // `&MemArg` arrives naturally from matching `&Op`; passing it by ref is fine. Indexing is into the
 // wasmparser-validated memory/data index space or guarded by a just-checked `checked_range` bound —
@@ -10,7 +11,7 @@ use super::Execution;
 use crate::extern_::Memory;
 use crate::instance::Instance;
 use crate::module::code::Code;
-use crate::module::op::{MemArg, Op, BIG_MEMARG};
+use crate::module::op::{MemArg, Op, Slot, BIG_MEMARG};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::{Error, Result};
@@ -24,13 +25,25 @@ fn oob() -> Error {
 /// function's out-of-line pool instead.
 #[inline(always)]
 #[allow(clippy::inline_always)] // one hot caller per load/store inside the fused dispatch
-fn resolve(code: &Code, m: &MemArg) -> (u32, u64) {
+pub(super) fn resolve(code: &Code, m: &MemArg) -> Result<(u32, u64)> {
     if m.offset == BIG_MEMARG {
-        let big = &code.big_memargs()[m.memory as usize];
-        (big.memory, big.offset)
+        pooled(code, m.memory)
     } else {
-        (m.memory, u64::from(m.offset))
+        Ok((m.memory, u64::from(m.offset)))
     }
+}
+
+/// A memarg pooled in the function's `big_memargs` (a demoted wide one, or any SIMD memory op's
+/// `op_simd::MemIdx`) as `(memory index, byte offset)`.
+#[cold]
+fn pooled(code: &Code, idx: u32) -> Result<(u32, u64)> {
+    let big = code
+        .big_memargs()
+        .get(idx as usize)
+        .ok_or(crate::error::InternalError::Compiler(
+            "memarg pool index out of range",
+        ))?;
+    Ok((big.memory, big.offset))
 }
 
 /// The instance's memory at index `idx` (imported memories first, then defined â the wasm index
@@ -41,62 +54,72 @@ fn mem(inner: &StoreInner, instance: Instance, idx: u32) -> Memory {
 }
 
 impl Execution {
-    /// Executes a memory op (loads/stores/size/copy/fill/init/data.drop). `step` routes
-    /// only these ops here (`memory.grow` excepted â see the run loop).
-    // Single call site inside the fused dispatch: inlining threads this secondary match into
-    // the primary one (measured +19% CoreMark with numeric+memory inlined).
-    #[allow(clippy::too_many_lines, clippy::inline_always)] // flat per-width load/store dispatch
-    #[inline(always)]
+    /// Executes the cold memory ops (size/copy/fill/init/data.drop). Loads/stores dispatch flat in
+    /// `step`; `memory.grow` suspends through the run loop (for the limiter).
     pub(super) fn exec_memory(
         &mut self,
         inner: &mut StoreInner,
-        code: &Code,
         op: &Op,
         instance: Instance,
+        base: u32,
     ) -> Result<()> {
+        let at = |s: Slot| super::step::slot(base, s);
         match op {
-            // `data.drop` needs no memory (a module may carry passive data segments without one â
+            // `data.drop` needs no memory (a module may carry passive data segments without one —
             // common in GC modules using `array.new_data`).
             Op::DataDrop(seg) => inner.instance_mut(instance).dropped_data[*seg as usize] = true,
-            Op::MemorySize(i) => {
-                let memory = mem(inner, instance, *i);
-                let pages = inner.memory(memory).size_pages();
-                self.push_index(inner.memory(memory).ty.is_64(), pages);
+            Op::MemorySize(i, s) => {
+                let entity = inner.memory(mem(inner, instance, *i));
+                let (is_64, pages) = (entity.ty.is_64(), entity.size_pages());
+                self.put_index(at(*s), is_64, pages)?;
             }
-            Op::MemoryFill(i) => {
-                let is_64 = inner.memory(mem(inner, instance, *i)).ty.is_64();
-                let len = self.pop_index(is_64)?;
-                let val = self.pop_i32()? as u8;
-                let dst = self.pop_index(is_64)?;
-                let bytes = &mut inner.memory_mut(mem(inner, instance, *i)).bytes;
-                let end = checked_range(dst, len, bytes.len() as u64)?;
-                bytes[dst as usize..end as usize].fill(val);
+            Op::MemoryFill(i, s) => self.memory_fill(inner, instance, *i, at(*s))?,
+            Op::MemoryCopy(dst_i, src_i, s) => {
+                self.memory_copy(inner, instance, (*dst_i, *src_i), at(*s))?;
             }
-            Op::MemoryCopy(dst_i, src_i) => self.memory_copy(inner, instance, *dst_i, *src_i)?,
-            Op::MemoryInit(seg, i) => self.memory_init(inner, instance, *seg, *i)?,
+            Op::MemoryInit(seg, i, s) => self.memory_init(inner, instance, (*seg, *i), at(*s))?,
             _ => return Err(Error::msg(format!("not a memory op: {op:?}"))),
         }
         Ok(())
     }
 
-    /// `memory.copy dst_mem src_mem`: the two memories may differ. Same index uses overlap-safe
-    /// `copy_within`; different indices copy via a temporary (no aliasing concern).
+    /// `memory.fill`: operands `dst, val, len` from slot `at`.
+    fn memory_fill(
+        &mut self,
+        inner: &mut StoreInner,
+        instance: Instance,
+        mem_i: u32,
+        at: usize,
+    ) -> Result<()> {
+        let memory = mem(inner, instance, mem_i);
+        let is_64 = inner.memory(memory).ty.is_64();
+        let dst = self.index_at(at, is_64)?;
+        let val = self.scalar_at(at + 1)?.unwrap_i32() as u8;
+        let len = self.index_at(at + 2, is_64)?;
+        let bytes = &mut inner.memory_mut(memory).bytes;
+        let end = checked_range(dst, len, bytes.len() as u64)?;
+        bytes[dst as usize..end as usize].fill(val);
+        Ok(())
+    }
+
+    /// `memory.copy dst_mem src_mem` (operands `dst, src, len` from slot `at`): the two memories may
+    /// differ. Same index uses overlap-safe `copy_within`; different indices copy via a temporary.
     fn memory_copy(
         &mut self,
         inner: &mut StoreInner,
         instance: Instance,
-        dst_i: u32,
-        src_i: u32,
+        (dst_i, src_i): (u32, u32),
+        at: usize,
     ) -> Result<()> {
         let (dst_mem, src_mem) = (mem(inner, instance, dst_i), mem(inner, instance, src_i));
         let (dst_64, src_64) = (
             inner.memory(dst_mem).ty.is_64(),
             inner.memory(src_mem).ty.is_64(),
         );
+        let dst = self.index_at(at, dst_64)?;
+        let src = self.index_at(at + 1, src_64)?;
         // The length is typed as the narrower of the two memories (#42).
-        let len = self.pop_index(dst_64 && src_64)?;
-        let src = self.pop_index(src_64)?;
-        let dst = self.pop_index(dst_64)?;
+        let len = self.index_at(at + 2, dst_64 && src_64)?;
         checked_range(src, len, inner.memory(src_mem).bytes.len() as u64)?;
         checked_range(dst, len, inner.memory(dst_mem).bytes.len() as u64)?;
         let (src, dst, len) = (src as usize, dst as usize, len as usize);
@@ -112,18 +135,19 @@ impl Execution {
         Ok(())
     }
 
-    /// `memory.init seg mem`: copy from passive data segment `seg` into memory `mem_i`.
+    /// `memory.init seg mem` (operands `dst, src, len` from slot `at`): copy from passive data
+    /// segment `seg` into memory `mem_i`.
     fn memory_init(
         &mut self,
         inner: &mut StoreInner,
         instance: Instance,
-        seg: u32,
-        mem_i: u32,
+        (seg, mem_i): (u32, u32),
+        at: usize,
     ) -> Result<()> {
         let is_64 = inner.memory(mem(inner, instance, mem_i)).ty.is_64();
-        let len = u64::from(self.pop_i32()? as u32);
-        let src = u64::from(self.pop_i32()? as u32);
-        let dst = self.pop_index(is_64)?;
+        let dst = self.index_at(at, is_64)?;
+        let src = u64::from(self.scalar_at(at + 1)?.unwrap_i32() as u32);
+        let len = u64::from(self.scalar_at(at + 2)?.unwrap_i32() as u32);
         let entity = inner.instance(instance);
         let module = entity.module.clone();
         let dropped = entity.dropped_data[seg as usize];
@@ -137,15 +161,15 @@ impl Execution {
         Ok(())
     }
 
-    /// Pops the address operand, resolves `m`'s memory, and bounds-checks `[ea, ea+N)`.
-    /// Pops the address operand and bounds-checks the `N`-byte access on an already-resolved
-    /// memory (one handle lookup per load/store, not one per field touched).
+    /// Bounds-checks the `N`-byte access whose address operand is at slot `at`, on an
+    /// already-resolved memory (one handle lookup per load/store).
     fn mem_ea<const N: usize>(
-        &mut self,
+        &self,
         entity: &crate::store::MemoryEntity,
         offset: u64,
+        at: usize,
     ) -> Result<usize> {
-        let addr = self.pop_index(entity.ty.is_64())?;
+        let addr = self.index_at(at, entity.ty.is_64())?;
         let ea = addr.checked_add(offset).ok_or_else(oob)?;
         let end = ea.checked_add(N as u64).ok_or_else(oob)?;
         if end > entity.bytes.len() as u64 {
@@ -154,33 +178,67 @@ impl Execution {
         Ok(ea as usize)
     }
 
-    pub(super) fn load_n<const N: usize>(
+    /// An `N`-byte load from the address at slot `at` (the caller writes the result over it).
+    pub(super) fn load_at<const N: usize>(
         &mut self,
         inner: &StoreInner,
-        code: &Code,
         instance: Instance,
-        m: &MemArg,
+        (memory, offset): (u32, u64),
+        at: usize,
     ) -> Result<[u8; N]> {
-        let (memory, offset) = resolve(code, m);
         let entity = inner.memory(mem(inner, instance, memory));
-        let ea = self.mem_ea::<N>(entity, offset)?;
+        let ea = self.mem_ea::<N>(entity, offset, at)?;
         let mut buf = [0u8; N];
         buf.copy_from_slice(&entity.bytes[ea..ea + N]);
         Ok(buf)
     }
 
+    /// Stack-window load for the SIMD memory ops (pops the address at `sp`; the caller pushes the
+    /// result).
+    #[cfg(feature = "simd")]
+    pub(super) fn load_n<const N: usize>(
+        &mut self,
+        inner: &StoreInner,
+        code: &Code,
+        instance: Instance,
+        m: &u32,
+    ) -> Result<[u8; N]> {
+        let at = self.ensure_operands(1)?;
+        let b = self.load_at::<N>(inner, instance, pooled(code, *m)?, at)?;
+        self.sp = at; // the address is consumed; the caller pushes the result
+        Ok(b)
+    }
+
+    /// Stack-window store for the SIMD memory ops (the value is already popped; pops the address).
+    #[cfg(feature = "simd")]
     pub(super) fn store_n<const N: usize>(
         &mut self,
         inner: &mut StoreInner,
         code: &Code,
         instance: Instance,
-        m: &MemArg,
+        m: &u32,
         data: [u8; N],
     ) -> Result<()> {
-        let (memory, offset) = resolve(code, m);
-        let memory = mem(inner, instance, memory);
-        let entity = inner.memory_mut(memory);
-        let ea = self.mem_ea::<N>(entity, offset)?;
+        let at = self.ensure_operands(1)?;
+        let (memory, offset) = pooled(code, *m)?;
+        let entity = inner.memory_mut(mem(inner, instance, memory));
+        let ea = self.mem_ea::<N>(entity, offset, at)?;
+        entity.bytes[ea..ea + N].copy_from_slice(&data);
+        self.sp = at;
+        Ok(())
+    }
+
+    /// An `N`-byte store of `data` (the value operand at `at + 1`) to the address at slot `at`.
+    pub(super) fn store_at<const N: usize>(
+        &mut self,
+        inner: &mut StoreInner,
+        instance: Instance,
+        (memory, offset): (u32, u64),
+        at: usize,
+        data: [u8; N],
+    ) -> Result<()> {
+        let entity = inner.memory_mut(mem(inner, instance, memory));
+        let ea = self.mem_ea::<N>(entity, offset, at)?;
         entity.bytes[ea..ea + N].copy_from_slice(&data);
         Ok(())
     }

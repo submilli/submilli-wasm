@@ -16,14 +16,14 @@ impl Translator<'_> {
     ) -> Result<()> {
         if self.reachable {
             let ty = conv_heaptype(self.ctx.kinds, hty)?;
-            self.constop(Op::RefNull(ty));
+            self.constop(|s| Op::RefNull(ty, s));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_ref_func(&mut self, function_index: u32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::RefFunc(function_index));
+            self.constop(|s| Op::RefFunc(function_index, s));
         }
         Ok(())
     }

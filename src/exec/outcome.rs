@@ -23,15 +23,18 @@ pub(crate) enum Outcome {
     #[cfg(feature = "async")]
     FuelYield,
     EpochDeadline,
+    /// `at`: the absolute slot the old size (or -1) is written to once serviced.
     Grow {
         memory: Memory,
         delta: u64,
+        at: usize,
     },
     /// In-wasm `table.grow`: routed through the (generic) driver so the limiter is consulted.
     TableGrow {
         table: Table,
         delta: u64,
         init: Ref,
+        at: usize,
     },
     /// A guest GC allocation outgrew the reservation: grow it to `reserved_target` bytes through the
     /// (generic) limiter, then re-execute the allocating op. `bytes_needed` is the allocation's
@@ -60,11 +63,15 @@ pub(super) enum StepOutcome {
     TailHostCall {
         func: Func,
         instance: Instance,
-        n_params: u32,
+        /// Absolute operand index of the first host argument.
+        args_at: usize,
+        n_params: usize,
     },
     HostCall {
         func: Func,
         instance: Instance,
+        /// One past the host arguments (absolute): the call's stack window.
+        top: usize,
         return_ip: u32,
     },
     /// Tail call to an async host fn (#39, async only).
@@ -72,23 +79,29 @@ pub(super) enum StepOutcome {
     TailHostAsyncCall {
         func: Func,
         instance: Instance,
-        n_params: u32,
+        /// Absolute operand index of the first host argument.
+        args_at: usize,
+        n_params: usize,
     },
     #[cfg(feature = "async")]
     HostAsyncCall {
         func: Func,
         instance: Instance,
+        /// One past the host arguments (absolute): the call's stack window.
+        top: usize,
         return_ip: u32,
     },
     Grow {
         memory: Memory,
         delta: u64,
+        at: usize,
         return_ip: u32,
     },
     TableGrow {
         table: Table,
         delta: u64,
         init: Ref,
+        at: usize,
         return_ip: u32,
     },
     /// Grow the GC reservation to `reserved_target` bytes (limiter-consulted), then re-execute the
@@ -113,6 +126,8 @@ pub(super) enum ResolvedCall {
 #[derive(Debug)]
 pub(super) struct CallReq {
     pub return_ip: u32,
+    /// Absolute operand index of the first argument (the callee's frame base).
+    pub args_at: usize,
     pub instance: Instance,
     pub func_index: u32,
     pub code: Code,

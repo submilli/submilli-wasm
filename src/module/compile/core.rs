@@ -14,45 +14,48 @@ impl Translator<'_> {
     // --- constants ---
     pub(in crate::module::compile) fn visit_i32_const(&mut self, value: i32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::I32Const(value));
+            self.constop(|s| Op::I32Const(s, value));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_i64_const(&mut self, value: i64) -> Result<()> {
         if self.reachable {
-            self.constop(Op::I64Const(value));
+            self.constop(|s| Op::I64Const(s, value));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_f32_const(&mut self, value: Ieee32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::F32Const(value.bits()));
+            self.constop(|s| Op::F32Const(s, value.bits()));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_f64_const(&mut self, value: Ieee64) -> Result<()> {
         if self.reachable {
-            self.constop(Op::F64Const(value.bits()));
+            self.constop(|s| Op::F64Const(s, value.bits()));
         }
         Ok(())
     }
 
     // --- parametric ---
+    /// `drop` emits nothing: with static operand heights, the dropped slot is simply dead.
     pub(in crate::module::compile) fn visit_drop(&mut self) -> Result<()> {
         if self.reachable {
             self.pop(1);
-            self.emit(Op::Drop);
+            // A dropped relop's result must not feed a following `br_if` fusion.
+            self.fusable_cmp = None;
         }
         Ok(())
     }
 
     fn lower_select(&mut self) {
+        let s = self.slot_below(3);
         self.pop(3);
         self.push(1);
-        self.emit(Op::Select);
+        self.emit(Op::Select(s));
     }
 
     pub(in crate::module::compile) fn visit_select(&mut self) -> Result<()> {
@@ -81,37 +84,37 @@ impl Translator<'_> {
     // --- variable ---
     pub(in crate::module::compile) fn visit_local_get(&mut self, local_index: u32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::LocalGet(local_index));
+            self.constop(|s| Op::LocalGet(s, local_index));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_local_set(&mut self, local_index: u32) -> Result<()> {
         if self.reachable {
-            self.pop(1);
-            self.emit(Op::LocalSet(local_index));
+            self.sink(|s| Op::LocalSet(s, local_index));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_local_tee(&mut self, local_index: u32) -> Result<()> {
         if self.reachable {
-            self.emit(Op::LocalTee(local_index)); // height-neutral
+            // Height-neutral; with static slots a tee is the same copy as a set.
+            let s = self.slot_below(1);
+            self.emit(Op::LocalSet(s, local_index));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_global_get(&mut self, global_index: u32) -> Result<()> {
         if self.reachable {
-            self.constop(Op::GlobalGet(global_index));
+            self.constop(|s| Op::GlobalGet(s, global_index));
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_global_set(&mut self, global_index: u32) -> Result<()> {
         if self.reachable {
-            self.pop(1);
-            self.emit(Op::GlobalSet(global_index));
+            self.sink(|s| Op::GlobalSet(s, global_index));
         }
         Ok(())
     }

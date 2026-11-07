@@ -568,6 +568,61 @@ fn operand_stack_survives_epoch_callback_collection() {
     assert_eq!(run.call(&mut store, ()).unwrap(), 42);
 }
 
+/// Like the test above, but the struct is a *wasm* callee's result: `$arm` is the callee's last
+/// op, so the deadline fires at the caller's next op — with the result in the caller's frame and
+/// no safepoint since, i.e. its recorded live height stale. The collection must still see it.
+#[test]
+fn call_result_survives_epoch_callback_collection() {
+    use submilli_wasm::{Caller, Collector, Config, Func, FuncType, UpdateDeadline};
+
+    let mut cfg = Config::new();
+    cfg.collector(Collector::Auto)
+        .gc_heap_reservation(64 << 10)
+        .epoch_interruption(true);
+    let engine = Engine::new(&cfg).unwrap();
+    let mut store = Store::new(&engine, ());
+
+    let churn_engine = engine.clone();
+    store.epoch_deadline_callback(move |mut ctx| {
+        let st = StructType::new(
+            &churn_engine,
+            [FieldType::new(
+                Mutability::Var,
+                StorageType::ValType(ValType::I64),
+            )],
+        )?;
+        let pre = StructRefPre::new(&mut ctx, st);
+        for _ in 0..20_000 {
+            StructRef::new(&mut ctx, &pre, &[Val::I64(0)])?;
+        }
+        Ok(UpdateDeadline::Continue(u64::MAX))
+    });
+    store.set_epoch_deadline(1);
+
+    let arm_engine = engine.clone();
+    let arm = Func::new(
+        &mut store,
+        FuncType::new(&engine, [], []),
+        move |_caller: Caller<'_, ()>, _params, _results| {
+            arm_engine.increment_epoch();
+            Ok(())
+        },
+    );
+
+    let wat = r#"(module
+        (type $s (struct (field i32)))
+        (import "h" "arm" (func $arm))
+        (func $mk (result (ref $s))
+            (struct.new $s (i32.const 42))
+            (call $arm))
+        (func (export "run") (result i32)
+            (struct.get $s 0 (call $mk))))"#;
+    let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
+    let inst = Instance::new(&mut store, &module, &[arm.into()]).unwrap();
+    let run = inst.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    assert_eq!(run.call(&mut store, ()).unwrap(), 42);
+}
+
 #[test]
 fn bulk_i64_preserves_bits_and_checks_shapes() {
     let engine = Engine::default();

@@ -39,6 +39,8 @@ pub(super) async fn yield_now() {
 /// live operands as roots — without parking they are invisible and would be freed), scope
 /// the GC roots it creates, and contain a panic (#33).
 fn take_epoch_action<T>(exec: &mut Execution, store: &mut Store<T>) -> Result<UpdateDeadline> {
+    // The deadline fires between arbitrary ops, where the top frame's live height isn't recorded.
+    exec.widen_top_live_range()?;
     let mut cb = store.epoch_callback.take();
     let Some(f) = cb.as_mut() else {
         return Ok(UpdateDeadline::Interrupt);

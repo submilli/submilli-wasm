@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::canon::IrVal;
+use crate::canon::{IrHeap, IrVal};
 use crate::module::handler::HandlerSpan;
 use crate::module::inner::ModuleInner;
 use crate::module::op::{BigMemArg, BranchTarget, Op, TypeIdx};
@@ -43,6 +43,8 @@ pub(crate) struct CodeArenas {
     /// Pooled 16-byte SIMD immediates (`v128.const` values, `i8x16.shuffle` lanes), indexed
     /// module-wide: inline they would widen every `Op` from 16 to 48 bytes.
     pub v128s: Vec<[u8; 16]>,
+    /// Pooled `br_on_cast` target heap types, indexed module-wide like `v128s`.
+    pub cast_heaps: Vec<IrHeap>,
 }
 
 /// A function compiled to internal bytecode: scalar facts plus [`Span`]s into the
@@ -137,6 +139,17 @@ impl Code {
     pub(crate) fn offsets(&self) -> Option<&[u32]> {
         let span = self.f().offsets;
         (span.len > 0).then(|| &self.module.code.offsets[span.range()])
+    }
+
+    /// A pooled `br_on_cast` heap type (see [`CodeArenas::cast_heaps`]).
+    pub(crate) fn cast_heap(&self, index: u32) -> crate::Result<&IrHeap> {
+        self.module
+            .code
+            .cast_heaps
+            .get(index as usize)
+            .ok_or_else(|| {
+                crate::error::InternalError::Compiler("cast heap index out of range").into()
+            })
     }
 
     /// A pooled SIMD immediate (see [`CodeArenas::v128s`]).

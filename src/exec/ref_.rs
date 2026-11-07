@@ -1,9 +1,10 @@
 //! Reference value operators: `ref.null`, `ref.func`, `ref.is_null`, `ref.as_non_null`.
 //! Pure operand-stack/reference manipulation — table access lives in [`super::table`].
 
+use super::cell::Cell;
 use super::Execution;
 use crate::instance::Instance;
-use crate::module::op::Op;
+use crate::module::op::{Op, Slot};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::value::Val;
@@ -15,31 +16,28 @@ impl Execution {
         inner: &StoreInner,
         op: &Op,
         instance: Instance,
+        base: u32,
     ) -> Result<()> {
+        let at = |s: Slot| super::step::slot(base, s);
         match op {
-            Op::RefNull(heap) => {
-                self.push(Val::null_for_heap(heap));
-                Ok(())
-            }
-            Op::RefFunc(f) => {
+            Op::RefNull(heap, s) => self.set_val(at(*s), Val::null_for_heap(heap)),
+            Op::RefFunc(f, s) => {
                 // `f` is a wasmparser-validated function index for this instance (#33 carve-out).
                 #[allow(clippy::indexing_slicing)]
                 let func = inner.instance(instance).funcs[*f as usize];
-                self.push(Val::FuncRef(Some(func)));
-                Ok(())
+                self.set_val(at(*s), Val::FuncRef(Some(func)))
             }
-            Op::RefIsNull => {
-                let (r, _) = self.pop_tagged_ref()?;
-                self.push(Val::I32(i32::from(r.is_null())));
-                Ok(())
+            Op::RefIsNull(s) => {
+                let at = at(*s);
+                let is_null = self.ref_at(at)?.0.is_null();
+                self.set_scalar(at, Cell::from_i32(i32::from(is_null)))
             }
-            Op::RefAsNonNull => {
-                let (r, tag) = self.pop_tagged_ref()?;
-                if r.is_null() {
+            Op::RefAsNonNull(s) => {
+                let at = at(*s);
+                if self.ref_at(at)?.0.is_null() {
                     return Err(Trap::NullReference.into());
                 }
-                self.push_cell(r, tag);
-                Ok(())
+                Ok(()) // non-null: stays in place
             }
             _ => Err(Error::msg(format!("not a ref op: {op:?}"))),
         }

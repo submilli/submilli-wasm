@@ -68,16 +68,19 @@ impl Execution {
         instance: Instance,
         tag_idx: u32,
         ip: u32,
+        at: usize,
     ) -> Result<StepOutcome> {
         let tag = inner.instance(instance).tags[tag_idx as usize];
         let params: Vec<ValType> = inner.tag(tag).ty.ty().params().collect();
+        // A GC safepoint: the args (at `at..`) stay live roots while the exception is reserved.
+        self.enter_window(at.saturating_add(params.len()))?;
         // Reserve the exception's GC-budget footprint *before* popping, so its args stay on the
         // operand stack as roots if a collection runs (#27g). A reservation grow suspends and
         // re-executes this throw — idempotent, since nothing has been popped yet.
         if let Some(out) = self.gc_reserve(inner, crate::store::exn_charge(params.len()), ip)? {
             return Ok(out);
         }
-        let args = self.pop_params(&params)?;
+        let args = self.take_params(at, &params)?;
         let backtrace = inner
             .engine()
             .wasm_backtrace_enabled()
@@ -91,8 +94,8 @@ impl Execution {
     }
 
     /// `throw_ref`: re-raise a caught `exnref` (null traps).
-    pub(super) fn throw_ref(&mut self) -> Result<StepOutcome> {
-        match self.pop_ref(RefKind::Exn)? {
+    pub(super) fn throw_ref(&mut self, at: usize) -> Result<StepOutcome> {
+        match self.take_ref(at, RefKind::Exn)? {
             Val::ExnRef(Some(exn)) => Err(PendingException { exn }.into()),
             Val::ExnRef(None) => Err(Trap::NullReference.into()),
             _ => unreachable!("throw_ref operand is an exnref (validated)"),
@@ -124,16 +127,11 @@ impl Execution {
             let frame = self.frames.last().ok_or(InternalError::FrameStack(
                 "missing frame during exception unwind",
             ))?;
-            let (code, base, floor, instance) = (
-                frame.code.clone(),
-                frame.locals_base,
-                frame.operand_base,
-                frame.instance,
-            );
+            let (code, floor, instance) = (frame.code.clone(), frame.operand_base, frame.instance);
             if let Some(rec) = find_clause(&code, fault_ip, inner, instance, thrown)? {
                 return self.enter_exception_handler(inner, exn, rec, floor);
             }
-            self.pop_unwound_frame(base)?;
+            self.pop_frame(0);
             // Stop at this call's boundary: an exception uncaught within these frames does not cross
             // the delimiter into a parked outer call (it surfaces to that call's `Func::call`).
             if self.frames.len() == stop_depth {
@@ -169,8 +167,8 @@ impl Execution {
             )
             .into());
         }
-        self.values.truncate(restore);
-        self.shadow.truncate(restore);
+        // The payload lands at the handler's static height: a stack window from `restore`.
+        self.sp = restore;
         if rec.payload_args {
             for arg in inner.exn(exn)?.args.clone() {
                 self.push(arg);
@@ -179,24 +177,11 @@ impl Execution {
         if rec.payload_ref {
             self.push(Val::ExnRef(Some(exn)));
         }
+        self.set_live_end(self.sp)?;
         self.frames
             .last_mut()
             .ok_or(InternalError::FrameStack("missing handler frame"))?
             .ip = rec.landing_ip;
-        Ok(())
-    }
-
-    fn pop_unwound_frame(&mut self, base: u32) -> Result<()> {
-        if self.values.len() != self.shadow.len() || base as usize > self.values.len() {
-            return Err(InternalError::OperandStack(
-                "frame base exceeds operand stack during unwind",
-            )
-            .into());
-        }
-        self.values.truncate(base as usize);
-        self.shadow.truncate(base as usize);
-        self.frames.pop();
-        self.sync_floor();
         Ok(())
     }
 

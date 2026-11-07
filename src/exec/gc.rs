@@ -27,23 +27,23 @@ impl Execution {
         instance: Instance,
     ) -> Result<()> {
         match op {
-            Op::StructNew(ty) => self.struct_new(inner, instance, *ty, false),
-            Op::StructNewDefault(ty) => self.struct_new(inner, instance, *ty, true),
-            Op::StructGet { ty, field } => self.struct_get(inner, instance, *ty, *field, None),
-            Op::StructGetS { ty, field } => {
+            Op::StructNew(ty, _) => self.struct_new(inner, instance, *ty, false),
+            Op::StructNewDefault(ty, _) => self.struct_new(inner, instance, *ty, true),
+            Op::StructGet { ty, field, .. } => self.struct_get(inner, instance, *ty, *field, None),
+            Op::StructGetS { ty, field, .. } => {
                 self.struct_get(inner, instance, *ty, *field, Some(true))
             }
-            Op::StructGetU { ty, field } => {
+            Op::StructGetU { ty, field, .. } => {
                 self.struct_get(inner, instance, *ty, *field, Some(false))
             }
-            Op::StructSet { ty, field } => self.struct_set(inner, instance, *ty, *field),
-            Op::RefI31 => {
+            Op::StructSet { ty, field, .. } => self.struct_set(inner, instance, *ty, *field),
+            Op::RefI31(_) => {
                 let v = self.pop_i32()?;
                 self.push(anyref_value(anyref_handle_i31(v)));
                 Ok(())
             }
-            Op::I31GetS => self.i31_get(true),
-            Op::I31GetU => self.i31_get(false),
+            Op::I31GetS(_) => self.i31_get(true),
+            Op::I31GetU(_) => self.i31_get(false),
             _ => self.exec_gc_array(inner, op, instance),
         }
     }
