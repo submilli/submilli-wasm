@@ -178,6 +178,11 @@ impl super::Execution {
     /// frame floor, so a miscompiled height fails closed.
     #[inline]
     pub(super) fn take_branch(&mut self, t: BranchTarget, top: usize) -> crate::Result<()> {
+        // A branch that keeps nothing moves nothing — and its condition/index operand may live in
+        // any slot (a local), so `top` is not a stack top to check.
+        if t.keep == 0 {
+            return Ok(());
+        }
         let src = top
             .checked_sub(usize::from(t.keep))
             .filter(|&src| src >= self.floor && top <= self.values.len())
@@ -326,7 +331,7 @@ fn frame_geometry(
 ) -> crate::Result<FrameGeometry> {
     let overflow = || InternalError::FrameStack("frame exceeds the operand index space");
     // Results return from the operand base, so they must fit the frame (always true for compiled
-    // code: the body's `end` reaches that height); a corrupt artifact fails closed here.
+    // code: the compiler sizes every frame for its results); a corrupt artifact fails closed here.
     if func.n_results > func.max_operands {
         return Err(InternalError::FrameStack("function results exceed its frame").into());
     }

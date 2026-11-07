@@ -30,14 +30,14 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_ref_is_null(&mut self) -> Result<()> {
         if self.reachable {
-            self.unop(Op::RefIsNull);
+            self.in_place(1, Op::RefIsNull);
         }
         Ok(())
     }
 
     pub(in crate::module::compile) fn visit_ref_as_non_null(&mut self) -> Result<()> {
         if self.reachable {
-            self.unop(Op::RefAsNonNull);
+            self.in_place(1, Op::RefAsNonNull);
         }
         Ok(())
     }

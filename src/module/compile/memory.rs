@@ -10,20 +10,20 @@ use crate::Result;
 /// management ops carry their own stack effect and are written out.
 impl Translator<'_> {
     super::visit::lower_memarg! {
-            visit_i32_load => unop I32Load;
-            visit_i64_load => unop I64Load;
-            visit_f32_load => unop F32Load;
-            visit_f64_load => unop F64Load;
-            visit_i32_load8_s => unop I32Load8S;
-            visit_i32_load8_u => unop I32Load8U;
-            visit_i32_load16_s => unop I32Load16S;
-            visit_i32_load16_u => unop I32Load16U;
-            visit_i64_load8_s => unop I64Load8S;
-            visit_i64_load8_u => unop I64Load8U;
-            visit_i64_load16_s => unop I64Load16S;
-            visit_i64_load16_u => unop I64Load16U;
-            visit_i64_load32_s => unop I64Load32S;
-            visit_i64_load32_u => unop I64Load32U;
+            visit_i32_load => load I32Load;
+            visit_i64_load => load I64Load;
+            visit_f32_load => load F32Load;
+            visit_f64_load => load F64Load;
+            visit_i32_load8_s => load I32Load8S;
+            visit_i32_load8_u => load I32Load8U;
+            visit_i32_load16_s => load I32Load16S;
+            visit_i32_load16_u => load I32Load16U;
+            visit_i64_load8_s => load I64Load8S;
+            visit_i64_load8_u => load I64Load8U;
+            visit_i64_load16_s => load I64Load16S;
+            visit_i64_load16_u => load I64Load16U;
+            visit_i64_load32_s => load I64Load32S;
+            visit_i64_load32_u => load I64Load32U;
             visit_i32_store => store I32Store;
             visit_i64_store => store I64Store;
             visit_f32_store => store F32Store;
@@ -44,7 +44,7 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_memory_grow(&mut self, mem: u32) -> Result<()> {
         if self.reachable {
-            self.unop(|s| Op::MemoryGrow(mem, s));
+            self.in_place(1, |s| Op::MemoryGrow(mem, s));
         }
         Ok(())
     }

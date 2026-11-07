@@ -6,7 +6,7 @@
 //! memory arg, a lane index `u8`, the shuffle's 16 byte indices, or the raw `v128.const` bits.
 
 /// A SIMD memory op's memarg, as an index into the function's `big_memargs` pool: inline, the
-/// 8-byte `MemArg` would leave no room for the op's `top` slot within the 16-byte `Op`.
+/// 8-byte memarg would leave no room for the op's `top` slot within the 16-byte `Op`.
 pub(crate) type MemIdx = u32;
 
 /// One SIMD instruction (`v128`). All immediates are `Copy`, so the whole enum is.

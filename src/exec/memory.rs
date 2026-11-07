@@ -2,7 +2,7 @@
 //! index (#41) and slot-addressed operands. `memory.init`/`data.drop` operate on passive data
 //! segments.
 
-// `&MemArg` arrives naturally from matching `&Op`; passing it by ref is fine. Indexing is into the
+// `&LoadArg`/`&StoreArg` arrive naturally from matching `&Op`; passing them by ref is fine. Indexing is into the
 // wasmparser-validated memory/data index space or guarded by a just-checked `checked_range` bound —
 // never unchecked guest input (#33 carve-out).
 #![allow(clippy::trivially_copy_pass_by_ref, clippy::indexing_slicing)]
@@ -11,7 +11,7 @@ use super::Execution;
 use crate::extern_::Memory;
 use crate::instance::Instance;
 use crate::module::code::Code;
-use crate::module::op::{MemArg, Op, Slot, BIG_MEMARG};
+use crate::module::op::{LoadArg, Op, Slot, StoreArg, BIG_MEMARG};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::{Error, Result};
@@ -20,16 +20,27 @@ fn oob() -> Error {
     Trap::MemoryOutOfBounds.into()
 }
 
-/// Resolves a compact memarg to `(memory index, byte offset)` — a demoted wide immediate (the
-/// [`BIG_MEMARG`] sentinel; memory64 offsets past `u32`, or the literal `u32::MAX`) reads the
-/// function's out-of-line pool instead.
+/// A load's address slot and `(memory index, byte offset)`: memory 0 with the inline offset, or
+/// — the [`BIG_MEMARG`] sentinel — the pooled memarg, with the address in place at `dst`.
 #[inline(always)]
-#[allow(clippy::inline_always)] // one hot caller per load/store inside the fused dispatch
-pub(super) fn resolve(code: &Code, m: &MemArg) -> Result<(u32, u64)> {
+#[allow(clippy::inline_always)] // one hot caller per load inside the fused dispatch
+pub(super) fn load_operands(code: &Code, m: &LoadArg) -> Result<(Slot, (u32, u64))> {
     if m.offset == BIG_MEMARG {
-        pooled(code, m.memory)
+        Ok((m.dst, pooled(code, m.addr)?))
     } else {
-        Ok((m.memory, u64::from(m.offset)))
+        Ok((m.addr, (0, u64::from(m.offset))))
+    }
+}
+
+/// A store's address and value slots and `(memory index, byte offset)` (see [`load_operands`]);
+/// the pooled form keeps the value at `addr + 1`.
+#[inline(always)]
+#[allow(clippy::inline_always)] // one hot caller per store inside the fused dispatch
+pub(super) fn store_operands(code: &Code, m: &StoreArg) -> Result<(Slot, Slot, (u32, u64))> {
+    if m.offset == BIG_MEMARG {
+        Ok((m.addr, m.addr.saturating_add(1), pooled(code, m.val)?))
+    } else {
+        Ok((m.addr, m.val, (0, u64::from(m.offset))))
     }
 }
 

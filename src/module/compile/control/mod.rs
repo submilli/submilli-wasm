@@ -102,11 +102,14 @@ impl Translator<'_> {
     }
 
     pub(super) fn push_block(&mut self, bt: BlockType, kind: BlockKind) {
+        if self.reachable {
+            self.materialize_locals();
+        }
         // A `loop` start is a back-edge target (and `block`/`try_table` starts delimit frames):
         // nothing emitted before this boundary may fuse with a branch after it.
-        self.fusable_cmp = None;
+        self.clear_fusion();
         let (param_count, result_count) = self.block_arity(bt);
-        let base_height = self.height_below(param_count);
+        let base_height = self.block_base(param_count);
         self.ctrl.push(CtrlFrame {
             kind,
             base_height,
@@ -125,21 +128,24 @@ impl Translator<'_> {
         let (param_count, result_count) = self.block_arity(bt);
         let mut else_patch = None;
         if self.reachable {
-            self.pop(1); // condition
-            let s = self.slot_below(0);
+            let s = self.operand(0); // the condition (the branch keeps nothing: any slot)
+            self.pop(1);
+            self.materialize_locals();
             let target = BranchTarget {
                 ip: 0,
                 keep: 0,
                 pop: 0,
             };
             // Fuse `relop; if` into one negated compare-and-branch (see `br_if`).
-            if let Some(kind) = self.fusable_cmp.take() {
+            let fused = self.fusable_cmp.take();
+            if let Some((kind, lhs, rhs, _)) = fused.filter(|f| f.3 == s) {
                 let idx = self.next_ip() - 1;
                 *self.op_mut(idx) = Op::BrIfCmp {
                     kind,
                     negate: true,
-                    target,
-                    s,
+                    ip: 0,
+                    lhs,
+                    rhs,
                 };
                 else_patch = Some(idx);
             } else {
@@ -147,8 +153,8 @@ impl Translator<'_> {
                 self.emit(Op::BrIfNot(target, s));
             }
         }
-        self.fusable_cmp = None;
-        let base_height = self.height_below(param_count);
+        self.clear_fusion();
+        let base_height = self.block_base(param_count);
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::If,
             base_height,
@@ -164,7 +170,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn do_else(&mut self) -> Result<()> {
-        self.fusable_cmp = None;
+        self.clear_fusion();
         let f = self.ctrl.last().expect("else without if");
         let (base, param_count, result_count, roe, else_patch) = (
             f.base_height,
@@ -174,9 +180,10 @@ impl Translator<'_> {
             f.else_patch,
         );
         if self.reachable {
-            let idx = self.next_ip();
             let (keep, _) = branch::fixup(result_count, 0)?;
-            let top = self.slot_below(0);
+            self.materialize(result_count);
+            let top = self.height_slot(0);
+            let idx = self.next_ip();
             self.emit(Op::Br(
                 BranchTarget {
                     ip: 0,
@@ -198,12 +205,12 @@ impl Translator<'_> {
         }
         self.ctrl.last_mut().expect("if frame").else_patch = None;
         self.reachable = roe;
-        self.set_height(base + param_count);
+        self.reset_after_label(base, param_count);
         Ok(())
     }
 
     pub(super) fn do_end(&mut self) -> Result<()> {
-        self.fusable_cmp = None;
+        self.clear_fusion();
         // A reachable `try_table` emits landing pads + an exception-table span; a dead one (and
         // every other block) falls through to the plain block path below.
         let top = self.ctrl.last().expect("end without frame");
@@ -211,6 +218,10 @@ impl Translator<'_> {
             return self.end_try_table();
         }
         let frame = self.ctrl.pop().expect("end without frame");
+        if self.reachable {
+            // The fall-through meets the branches here, which deliver into the result slots.
+            self.materialize(frame.result_count);
+        }
         let end_ip = self.next_ip();
         if let Some(idx) = frame.else_patch {
             // else-less `if`: the cond-false path falls through to end.
@@ -224,7 +235,7 @@ impl Translator<'_> {
         } else {
             self.reachable || frame.end_targeted || frame.else_patch.is_some()
         };
-        self.set_height(frame.base_height + frame.result_count);
+        self.reset_after_label(frame.base_height, frame.result_count);
         Ok(())
     }
 
@@ -248,13 +259,14 @@ impl Translator<'_> {
     /// receives only its label values; on fall-through the non-null reference stays.
     /// So the branch target is computed with the reference already popped.
     pub(super) fn br_on_null(&mut self, depth: u32) -> Result<()> {
-        self.pop(1); // reference (excluded from the branch target's operands)
-        let s = self.slot_below(0);
+        let reference = self.operand(0);
+        self.pop(1); // excluded from the branch target's operands
         let (target, patch_frame) = self.branch_target(depth)?;
+        let s = self.branch_operand(reference, target.keep);
         let idx = self.next_ip();
         self.emit(Op::BrOnNull(target, s));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
-        self.push(1); // fall-through keeps the (non-null) reference
+        self.push_entry(s); // fall-through keeps the (non-null) reference, where it now lives
         Ok(())
     }
 
@@ -262,8 +274,10 @@ impl Translator<'_> {
     /// label arity includes it; on fall-through (null) the reference is dropped. So the
     /// branch target is computed with the reference still on the stack.
     pub(super) fn br_on_non_null(&mut self, depth: u32) -> Result<()> {
-        let s = self.slot_below(1); // the reference
         let (target, patch_frame) = self.branch_target(depth)?;
+        // The kept values include the reference itself (keep >= 1).
+        self.materialize(u32::from(target.keep).max(1));
+        let s = self.height_slot(1); // the reference
         let idx = self.next_ip();
         self.emit(Op::BrOnNonNull(target, s));
         self.register_branch(patch_frame, idx, PatchSlot::Single);
@@ -288,7 +302,9 @@ impl Translator<'_> {
         let heap = u32::try_from(self.code.cast_heaps.len())
             .map_err(|_| crate::Error::msg("too many br_on_cast instructions in module"))?;
         self.code.cast_heaps.push(ty);
-        let top = self.slot_below(0);
+        // A stack window whose kept values include the reference (keep >= 1).
+        self.materialize(u32::from(bt.keep).max(1));
+        let top = self.height_slot(0);
         let idx = self.next_ip();
         self.emit(if on_fail {
             Op::BrOnCastFail { heap, target, top }

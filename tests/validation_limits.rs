@@ -163,3 +163,77 @@ fn deserialize_not_subject_to_size_cap() {
     let inst = Instance::new(&mut store, &restored, &[]).unwrap();
     assert_eq!(run_add(&mut store, inst), 42);
 }
+
+/// A function body from repeated pieces: `(func (export "f") (param i32 i32 i32) <body>)`.
+fn function_module(body: &str) -> Vec<u8> {
+    let wat = format!("(module (func (export \"f\") (param i32 i32 i32) {body}))");
+    wat::parse_str(wat).unwrap()
+}
+
+/// Step 2b's operand providers keep compile time linear on hostile stack shapes: a live
+/// `local.get` deep in the stack must not make later block entries or local writes rescan it.
+/// (Quadratic, each of these took seconds in a release build; linear, they take milliseconds.)
+#[test]
+fn hostile_operand_stacks_compile_in_linear_time() {
+    let (h, n) = (40_000, 40_000);
+    let bodies = [
+        // Block entries while one local entry is live above a deep stack of them.
+        format!(
+            "{}{}{}",
+            "local.get 0 ".repeat(h),
+            "local.get 0 block end drop ".repeat(n),
+            "drop ".repeat(h)
+        ),
+        // Local writes while a local entry sits under a deep stack.
+        format!(
+            "local.get 0 {}{}unreachable",
+            "i32.const 0 ".repeat(h),
+            "local.get 1 local.set 2 i32.const 0 local.set 1 ".repeat(n)
+        ),
+    ];
+    let engine = Engine::default();
+    for body in &bodies {
+        let start = std::time::Instant::now();
+        Module::new(&engine, function_module(body)).unwrap();
+        let took = start.elapsed();
+        assert!(took.as_secs() < 10, "compile took {took:?}");
+    }
+}
+
+/// Dead code holds no operand entries: a block ending in dead code must not grow the frame (or
+/// the compiler's memory) by its results. Each dead block below would have added 1000 slots.
+#[test]
+fn dead_code_does_not_inflate_the_frame() {
+    let results = " i32".repeat(1000);
+    let wat = format!(
+        "(module (type $t (func (result{results}))) (func (export \"f\") unreachable {}))",
+        "(block (type $t) unreachable) br 0 ".repeat(1000)
+    );
+    let mut config = Config::new();
+    config.max_wasm_stack(64 << 10);
+    let engine = Engine::new(&config).unwrap();
+    let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &module, &[]).unwrap();
+    let f = inst.get_func(&mut store, "f").unwrap();
+    let err = f.call(&mut store, &[], &mut []).unwrap_err();
+    assert_eq!(
+        *err.downcast_ref::<submilli_wasm::Trap>().unwrap(),
+        submilli_wasm::Trap::UnreachableCodeReached
+    );
+}
+
+/// A block in dead code may take params from the polymorphic stack, below anything pushed.
+#[test]
+fn dead_code_param_blocks_compile() {
+    let engine = Engine::default();
+    for body in [
+        "unreachable (block (param i32) drop) i32.const 0",
+        "unreachable (loop (param i32 i32) drop drop) i32.const 0",
+        "unreachable (if (param i32) (then drop) (else drop)) i32.const 0",
+    ] {
+        let wat = format!("(module (func (result i32) {body}))");
+        Module::new(&engine, wat::parse_str(&wat).unwrap())
+            .unwrap_or_else(|e| panic!("{body}: {e}"));
+    }
+}

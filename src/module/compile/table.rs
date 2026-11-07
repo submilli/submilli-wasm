@@ -49,7 +49,7 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_table_get(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.unop(|s| Op::TableGet(table, s));
+            self.in_place(1, |s| Op::TableGet(table, s));
         }
         Ok(())
     }
@@ -70,7 +70,7 @@ impl Translator<'_> {
 
     pub(in crate::module::compile) fn visit_table_grow(&mut self, table: u32) -> Result<()> {
         if self.reachable {
-            self.binop(|s| Op::TableGrow(table, s));
+            self.in_place(2, |s| Op::TableGrow(table, s));
         }
         Ok(())
     }

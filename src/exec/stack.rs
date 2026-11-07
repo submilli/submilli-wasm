@@ -68,6 +68,11 @@ fn clear_tags(shadow: &mut [RefTag], range: std::ops::Range<usize>) {
     }
 }
 
+/// A three-address op's absolute `(dst, lhs, rhs)` slots.
+pub(super) type Bin = (usize, usize, usize);
+/// A two-address op's absolute `(dst, src)` slots.
+pub(super) type Un = (usize, usize);
+
 use super::Execution;
 use crate::canon::{IrVal, RefKind, Slot};
 use crate::error::InternalError;
@@ -297,16 +302,6 @@ impl Execution {
         Ok(v)
     }
 
-    /// Consumes the two i32 operands at slots `at`, `at + 1` (a fused compare-and-branch).
-    #[inline]
-    pub(super) fn i32_pair_at(&self, at: usize) -> Result<(i32, i32)> {
-        let pair = (
-            self.scalar_at(at)?.unwrap_i32(),
-            self.scalar_at(at + 1)?.unwrap_i32(),
-        );
-        Ok(pair)
-    }
-
     /// The reference at slot `at` with its hierarchy tag, refusing a scalar-tagged slot.
     #[inline]
     pub(super) fn ref_at(&self, at: usize) -> Result<(Cell, RefTag)> {
@@ -351,40 +346,45 @@ impl Execution {
         self.set_cell(at, encode(v), RefTag::of_val(&v))
     }
 
-    /// Binary scalar op over slots `at`, `at + 1`; the result lands in `at`.
+    /// Binary scalar op: `dst` ← `f(lhs, rhs)` (operands read before the result is written, so
+    /// `dst` may alias either).
     #[inline]
-    pub(super) fn binop_at(&mut self, at: usize, f: impl FnOnce(Cell, Cell) -> Cell) -> Result<()> {
-        let (a, b) = (self.scalar_at(at)?, self.scalar_at(at + 1)?);
-        self.set_scalar(at, f(a, b))
+    pub(super) fn binop_at(
+        &mut self,
+        (dst, lhs, rhs): Bin,
+        f: impl FnOnce(Cell, Cell) -> Cell,
+    ) -> Result<()> {
+        let (a, b) = (self.scalar_at(lhs)?, self.scalar_at(rhs)?);
+        self.set_scalar(dst, f(a, b))
     }
 
     /// Fallible [`binop_at`](Self::binop_at) (div/rem traps leave the slots untouched).
     #[inline]
     pub(super) fn binop_try_at(
         &mut self,
-        at: usize,
+        (dst, lhs, rhs): Bin,
         f: impl FnOnce(Cell, Cell) -> Result<Cell>,
     ) -> Result<()> {
-        let r = f(self.scalar_at(at)?, self.scalar_at(at + 1)?)?;
-        self.set_scalar(at, r)
+        let r = f(self.scalar_at(lhs)?, self.scalar_at(rhs)?)?;
+        self.set_scalar(dst, r)
     }
 
-    /// Unary scalar op on slot `at`, in place.
+    /// Unary scalar op: `dst` ← `f(src)`.
     #[inline]
-    pub(super) fn unop_at(&mut self, at: usize, f: impl FnOnce(Cell) -> Cell) -> Result<()> {
-        let a = self.scalar_at(at)?;
-        self.set_scalar(at, f(a))
+    pub(super) fn unop_at(&mut self, (dst, src): Un, f: impl FnOnce(Cell) -> Cell) -> Result<()> {
+        let a = self.scalar_at(src)?;
+        self.set_scalar(dst, f(a))
     }
 
     /// Fallible [`unop_at`](Self::unop_at) (trapping float-to-int truncations).
     #[inline]
     pub(super) fn unop_try_at(
         &mut self,
-        at: usize,
+        (dst, src): Un,
         f: impl FnOnce(Cell) -> Result<Cell>,
     ) -> Result<()> {
-        let r = f(self.scalar_at(at)?)?;
-        self.set_scalar(at, r)
+        let r = f(self.scalar_at(src)?)?;
+        self.set_scalar(dst, r)
     }
 
     #[inline]

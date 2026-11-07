@@ -868,3 +868,45 @@ within budget.
 **Why only this much:** 2a removes per-op stack bookkeeping but not ops — the loop is still
 dispatch-bound (§15). 2b (operand providers: free `local.get`/consts, `local.set` fusion) cuts the
 50–58% of executed ops that are pure data movement; it builds on these slot operands.
+
+## 17. Session 7 — step 2b: operand providers + `local.set` fusion
+
+**Design.** Numeric ops, loads and stores became three-address (`I32Add(dst, lhs, rhs)`, still a
+16-byte `Op`); `local.get/set/tee` share `Copy(dst, src)`. The translator keeps, per stack entry,
+the slot its value lives in: `local.get` emits nothing, and entries are materialized into their
+own slot only where needed (positional ops, branch kept values, block ends and entries). Writing a
+local copies out entries still reading it; `local.set`/`tee` of the previous op's result retargets
+that op's `dst` (fusion). Constant providers are deferred to 2c: without immediate operand forms a
+consumed constant still needs its slot, so they would save almost nothing.
+
+**Staged, green at each stage** (spec suite + a new `tests/operand_providers.rs` oracle grid):
+encoding only (stage A, providers all in their own slots: 7–20% *slower* — three independent slot
+reads bounds-check separately where adjacent slots shared checks) → local providers → fusion.
+Two fusion bugs surfaced on the way: a pending compare survived a `local.get` (which emits
+nothing) and fused into a `br_if` testing that local; fusion now requires the branch's condition
+slot to *be* the compare's result slot (which also subsumes the `drop` fix from 2a).
+
+**Ops executed** (vs 2a): CoreMark 54.6M → 38.8M after providers (−29%), and fusion removes most
+remaining `local.set` copies; tiny/add 3 ops → 1.
+
+**Measured** (cycles, M4 Pro) vs 2a: loops 1.38–1.51×, CoreMark 1.16×, fib 1.05×, per call 0.96×.
+Cumulative vs `main`: CoreMark **2.29×** (simd 2.47×), loops 2.9–3.4× (simd 3.07–3.45×), fib
+1.23× (simd 1.10×), per call 3.6× (simd 3.3×). `Module::new`: +9–11% instructions vs 2a,
+**+13–16% vs `main`** cumulative — at the budget (spidermonkey 16.4%, pulldown-cmark 15.2%,
+CoreMark 13.3%); the per-emit fusion matches had to move into the helpers that produce fusable ops
+(+17–22% before), and the compile-time profiling pass should take it back down.
+
+**Review** (correctness: ~310k random functions differentially fuzzed against V8, no miscompile;
+hardening): two compiler DoS holes, both fixed with regression tests. (1) Provider scans walked the
+whole operand stack while any local entry was live — quadratic compile time (a 640 KB body took
+3.9 s vs 1.4 ms in 2a). Now at most 16 entries read locals at once (a further `local.get` is copied
+right away, as in 2a), so every scan is bounded; the per-local read counts tried first cost ~5%
+compile time. (2) Dead code pushed block results it never popped — compiler memory and
+`max_operands` grew per dead block (a 1.2 MB module reached 808 MB). A label followed only by dead
+code now pushes nothing; this also fixed a pre-existing rejection of valid modules (`unreachable` then a block
+taking params from the polymorphic stack).
+
+**Where the time goes now** (CoreMark profile): about half of `dispatch` is the dispatch itself
+(loop back-edge + `match` jump), about a quarter slot access (`scalar_at`: two vectors, two bounds
+checks, headers reloaded after each slot write). Next levers: 2c immediate/compare forms (constants
+are 17–30% of executed ops) and one combined value+tag slot vector (one bounds check per access).

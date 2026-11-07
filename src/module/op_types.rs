@@ -12,21 +12,31 @@ pub(crate) type ElemIdx = u32;
 /// operands sit contiguously from its slot, and its result is written back there.
 pub(crate) type Slot = u32;
 
-/// A memory-access immediate: target memory index (#41) + static offset (`align` is
-/// validation-only). The inline offset is `u32`; a `u64` offset (reachable only with a
-/// memory64 memarg — or the literal value `u32::MAX` in wasm32, which collides with the
-/// sentinel) is demoted to the function's [`BigMemArg`] pool: `offset == u32::MAX` marks
-/// the demoted form, and `memory` then holds the pool index instead of the memory index.
+/// A load's operands (memory 0): `dst` ← the bytes at the address in slot `addr`, plus `offset`.
+/// A pooled memarg (another memory, or an offset of at least [`BIG_MEMARG`]) sets `offset` to
+/// [`BIG_MEMARG`] and puts its pool index in `addr`; the address then sits in place at `dst`.
 #[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MemArg {
-    pub memory: u32,
+pub(crate) struct LoadArg {
+    pub dst: Slot,
+    pub addr: Slot,
     pub offset: u32,
 }
 
-/// The `u32::MAX`-offset sentinel of a [`MemArg`] whose real immediate lives out of line.
+/// A store's operands (memory 0): the value in slot `val` → the address in slot `addr`, plus
+/// `offset`. Pooled like [`LoadArg`]: `offset` is [`BIG_MEMARG`], the pool index is in `val`, and
+/// the value sits at `addr + 1`.
+#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoreArg {
+    pub addr: Slot,
+    pub val: Slot,
+    pub offset: u32,
+}
+
+/// The `u32::MAX`-offset sentinel of a [`LoadArg`]/[`StoreArg`] whose memarg lives out of line
+/// (`align` is validation-only, so a memarg is just its memory index and offset).
 pub(crate) const BIG_MEMARG: u32 = u32::MAX;
 
-/// A pooled wide memory immediate (see [`MemArg`]): the real memory index + full 64-bit offset.
+/// A pooled memory immediate (see [`LoadArg`]): the real memory index + full 64-bit offset.
 #[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BigMemArg {
     pub memory: u32,

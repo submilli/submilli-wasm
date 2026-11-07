@@ -4,7 +4,7 @@
 use super::{translate_function, wp_err, CompileCtx};
 use crate::canon::{AggKind, CompositeBody, IrVal, ModuleType};
 use crate::engine::Engine;
-use crate::module::op::{BranchTarget, Op};
+use crate::module::op::{BranchTarget, Op, StoreArg};
 use crate::value::{Finality, ValType};
 use crate::Result;
 use wasmparser::{FuncValidatorAllocations, Parser, ValidPayload, Validator};
@@ -103,10 +103,8 @@ fn straight_line_add() {
         0,
     )
     .unwrap();
-    assert!(matches!(
-        ops.as_slice(),
-        [Op::LocalGet(2, 0), Op::LocalGet(3, 1), Op::I32Add(2)]
-    ));
+    // `local.get`s emit nothing: the add reads both locals and writes the result slot.
+    assert!(matches!(ops.as_slice(), [Op::I32Add(2, 0, 1)]));
 }
 
 #[test]
@@ -121,7 +119,14 @@ fn memory_load_store() {
     .unwrap();
     assert!(matches!(
         ops.as_slice(),
-        [Op::I32Const(1, 0), Op::LocalGet(2, 0), Op::I32Store(_, 1)]
+        [
+            Op::I32Const(1, 0),
+            Op::I32Store(StoreArg {
+                addr: 1,
+                val: 0,
+                offset: 0
+            })
+        ]
     ));
 }
 
@@ -172,15 +177,15 @@ fn if_else_targets() {
         0,
     )
     .unwrap();
-    // LocalGet, BrIfNot->else-start, I32Const(1), Br->end, I32Const(2)
-    let Op::BrIfNot(else_t, _) = ops[1] else {
-        panic!("expected BrIfNot")
+    // BrIfNot(local 0)->else-start, I32Const(1), Br->end, I32Const(2)
+    let Op::BrIfNot(else_t, 0) = ops[0] else {
+        panic!("expected BrIfNot on local 0")
     };
-    assert_eq!(else_t.ip, 4); // else body starts at index 4
-    let Op::Br(end_t, _) = ops[3] else {
+    assert_eq!(else_t.ip, 3); // else body starts at index 3
+    let Op::Br(end_t, _) = ops[2] else {
         panic!("expected Br")
     };
-    assert_eq!(end_t.ip, 5); // end is past the last op
+    assert_eq!(end_t.ip, 4); // end is past the last op
 }
 
 #[test]
@@ -220,7 +225,7 @@ fn call_stack_effect() {
     .unwrap();
     assert!(matches!(
         ops.as_slice(),
-        [Op::LocalGet(2, 0), Op::LocalGet(3, 1), Op::Call(1, 2)]
+        [Op::Copy(3, 1), Op::Copy(2, 0), Op::Call(1, 2)]
     ));
 }
 

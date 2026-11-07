@@ -31,9 +31,12 @@ impl Translator<'_> {
     /// `try_table`: a `block` that also installs catch handlers. Pushes a control frame; the landing
     /// pads + exception-table span are emitted at the matching `end` ([`end_try_table`]).
     pub(in crate::module::compile) fn push_try_table(&mut self, tt: &TryTable) {
-        self.fusable_cmp = None;
+        if self.reachable {
+            self.materialize_locals();
+        }
+        self.clear_fusion();
         let (param_count, result_count) = self.block_arity(tt.ty);
-        let base_height = self.height_below(param_count);
+        let base_height = self.block_base(param_count);
         self.ctrl.push(CtrlFrame {
             kind: BlockKind::TryTable,
             base_height,
@@ -55,11 +58,15 @@ impl Translator<'_> {
     pub(in crate::module::compile) fn end_try_table(&mut self) -> Result<()> {
         let frame = self.ctrl.pop().expect("try_table frame");
         let base_height = frame.base_height;
+        if self.reachable {
+            // The normal completion meets the catch landings here, in the result slots.
+            self.materialize(frame.result_count);
+        }
         let body_end = self.next_ip();
 
         let skip_idx = self.next_ip();
         let (keep, _) = super::branch::fixup(frame.result_count, 0)?;
-        let top = self.slot_below(0);
+        let top = self.height_slot(0);
         self.emit(Op::Br(
             BranchTarget {
                 ip: 0,
@@ -72,7 +79,7 @@ impl Translator<'_> {
         let mut recs = Vec::with_capacity(frame.clauses.len());
         for c in &frame.clauses {
             // The landing pad branches with the operand stack at restore-height + payload.
-            self.set_height(base_height + self.payload_count(c));
+            self.reset_height(base_height, self.payload_count(c));
             let (target, patch_frame) = self.branch_target(c.label)?;
             let landing_ip = self.next_ip();
             let top = self.slot_below(0);
@@ -97,7 +104,7 @@ impl Translator<'_> {
             clauses: recs.into_boxed_slice(),
         });
         self.reachable = self.reachable || frame.end_targeted;
-        self.set_height(base_height + frame.result_count);
+        self.reset_after_label(base_height, frame.result_count);
         Ok(())
     }
 
