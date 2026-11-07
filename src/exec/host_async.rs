@@ -60,7 +60,9 @@ pub(crate) async fn execute_async<T>(
             Err(error)
         }
     };
-    finish(store, exec, &b, result_tys, outcome)
+    let mut out = vec![Val::I32(0); result_tys.len()];
+    finish(store, exec, &b, result_tys, outcome, &mut out)?;
+    Ok(out)
 }
 
 /// Async sibling of [`drive`].

@@ -1013,3 +1013,27 @@ memory_tree 3.3×, linked_list 3.5×, tiny 4.0× (per host→wasm call).
 **Tried and dropped:** merging `do_return` + `top_into` into one out-of-line return was neutral.
 After this stage the SIMD build is still ~6% slower than the default on fib, from the 17-byte slot
 record (copies and frame pushes). v128 as two 8-byte slots would remove that.
+
+## 22. Session 7 — the embedder→wasm call boundary (`Func::call`)
+
+tiny/add (one tiny export per `Func::call`) was the furthest from the target after §21 (4.0×
+wasmi 2.0).
+
+- **Results in place.** `take_results` collected a `Vec<Val>`, which `Func::call` copied into the
+  caller's buffer and freed: one malloc/free per call. Now results decode straight into the
+  caller's `results`. On a post-decode failure (an interpreter bug), `out` is reset to typed
+  defaults, so no unrooted reference escapes.
+- **Numeric results skip `check_results`.** A value decoded at a numeric type has that type and
+  nothing to root, so the validation pass and the GC-root mark/truncate are skipped. The result
+  slots' shadow tags are still checked first (`validate_result_tags`).
+- **Boundary codec.** Arguments and results use the existing numeric fast paths (`encode_val` /
+  `decode_val`) instead of the layered GC-slot codec. Putting the fast path into `cell::encode`
+  itself cost the SIMD build's loops +3% instructions, because it inlines into global get/set.
+
+**Measured** (cycles, M4 Pro) vs §21: tiny 1.42× (SIMD build) and 1.52× (default); others flat.
+
+**Left on this path** (by profile): `Execution` is 184 B and moves about four times per call
+(store slot → `enter` → `finish` → slot), plus a swap pair on every wasm→host call. Boxing it would
+make those pointer moves, but it touches the async/cancellation guards. Also: entry bookkeeping
+(delimiter frame, `Code` clone), and re-growing the truncated operand buffer (`extend_slots`) on
+every top-level call.

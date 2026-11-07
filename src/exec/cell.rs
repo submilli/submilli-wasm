@@ -130,6 +130,18 @@ impl Cell {
         f64::from_bits(u64::from_le_bytes(self.lo()))
     }
 
+    /// The low 4 bytes as raw bits (an `f32` without a float round-trip).
+    #[inline]
+    pub(super) fn bits32(self) -> u32 {
+        u32::from_le_bytes(self.lo())
+    }
+
+    /// The low 8 bytes as raw bits (an `f64` without a float round-trip).
+    #[inline]
+    pub(super) fn bits64(self) -> u64 {
+        u64::from_le_bytes(self.lo())
+    }
+
     #[cfg(feature = "simd")]
     #[inline]
     pub(super) fn unwrap_v128(self) -> V128 {

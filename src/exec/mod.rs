@@ -209,7 +209,7 @@ impl Execution {
             return Err(error);
         }
         self.slots.extend(args.iter().map(|&v| cell::TaggedCell {
-            cell: cell::encode(v),
+            cell: stack::encode_val(v),
             tag: cell::RefTag::of_val(&v),
         }));
         if let Err(error) = self.push_call(instance, func_index, &code, value_base) {
@@ -244,14 +244,20 @@ impl Execution {
     }
 
     /// On a finished (sub-)call: decodes its results (everything above `value_base`, against the
-    /// entry function's result types — the cells are untyped) and restores the shared stacks to
-    /// the parked outer state (frames back to `stop_depth`).
+    /// entry function's result types — the cells are untyped) into `out` and restores the shared
+    /// stacks to the parked outer state (frames back to `stop_depth`).
     fn take_results(
         &mut self,
         value_base: usize,
         stop_depth: usize,
         result_tys: &[ValType],
-    ) -> Result<Vec<Val>> {
+        out: &mut [Val],
+    ) -> Result<()> {
+        if out.len() != result_tys.len() {
+            return Err(
+                InternalError::ResultShape("results buffer does not match the call").into(),
+            );
+        }
         if value_base > self.slots.len() || stop_depth > self.frames.len() {
             return Err(InternalError::FrameStack("invalid completed call boundary").into());
         }
@@ -259,15 +265,13 @@ impl Execution {
         self.code = None;
         self.release_reentry(stop_depth)?;
         let cells = self.slots.get(value_base..).unwrap_or_default();
-        let results = cells
-            .iter()
-            .zip(result_tys)
-            .map(|(slot, ty)| cell::decode(slot.cell, ty))
-            .collect();
+        for ((slot, ty), out) in cells.iter().zip(result_tys).zip(out) {
+            *out = stack::decode_val(slot.cell, ty);
+        }
         self.slots.truncate(value_base);
         self.frames.truncate(stop_depth);
         self.sync_floor();
-        Ok(results)
+        Ok(())
     }
 
     /// On a trap / uncaught exception in a (sub-)call: discards its frames and operands, restoring

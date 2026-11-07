@@ -116,13 +116,10 @@ impl Func {
         // Copy out the entity's Copy fields, releasing the borrow before we
         // re-borrow the store mutably for the call.
         let out = match self.resolve_callee(store.as_context().inner()) {
-            Callee::Wasm(instance, func_index) => call_wasm(
-                store.as_context_mut().store_mut(),
-                instance,
-                func_index,
-                params,
-                results.len(),
-            )?,
+            Callee::Wasm(instance, func_index) => {
+                let mut ctx = store.as_context_mut();
+                return call_wasm(ctx.store_mut(), instance, func_index, params, results);
+            }
             Callee::Host(host_index) => {
                 let ty = self.ty(&store);
                 let result_tys = check_host_call(store.as_context().inner(), &ty, params, results)?;
@@ -214,15 +211,17 @@ fn call_wasm<T>(
     instance: Instance,
     func_index: u32,
     params: &[Val],
-    n_results: usize,
-) -> Result<Vec<Val>> {
+    results: &mut [Val],
+) -> Result<()> {
     let code = store.inner.instance(instance).module.code(func_index);
     let module = Arc::clone(&code.module);
     let (param_tys, result_tys) = module.func_sig(func_index)?;
-    check_call(&store.inner, params, n_results, param_tys, result_tys)?;
+    check_call(&store.inner, params, results.len(), param_tys, result_tys)?;
     let args = crate::extern_::coerce_args(&mut store.inner, params, param_tys)?;
-    // `execute` validates each result against its type (and roots references) as it decodes.
-    crate::exec::host::execute(store, instance, func_index, code, &args, result_tys)
+    // `execute` decodes into `results`, checking each result slot's tag and validating (and
+    // rooting) reference results.
+    let target = (instance, func_index, code);
+    crate::exec::host::execute(store, target, &args, result_tys, results)
 }
 
 /// [`check_call`] against a host callee's signature (materialized here; host signatures aren't

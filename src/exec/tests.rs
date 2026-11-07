@@ -92,14 +92,10 @@ fn compile_wat(
 fn run_wat(wat: &str, params: &[ValType], results: &[ValType], args: &[Val]) -> Result<Vec<Val>> {
     let (engine, code) = compile_wat(wat, params, results)?;
     let mut store = Store::new(&engine, ());
-    host::execute(
-        &mut store,
-        Instance { index: 0, store: 0 },
-        0,
-        code,
-        args,
-        results,
-    )
+    let mut out = vec![Val::I32(0); results.len()];
+    let target = (Instance { index: 0, store: 0 }, 0, code);
+    host::execute(&mut store, target, args, results, &mut out)?;
+    Ok(out)
 }
 
 #[test]
@@ -111,13 +107,11 @@ fn operand_underflow_is_internal_uncatchable_and_store_remains_usable() {
 
     let error = exec.pop().unwrap_err();
     assert!(error.is::<crate::error::InternalError>());
-    let error = host::finish(&mut store, exec, &boundary, &[], Err(error)).unwrap_err();
+    let error = host::finish(&mut store, exec, &boundary, &[], Err(error), &mut []).unwrap_err();
     assert!(error.is::<crate::error::InternalError>());
     assert!(!error.is::<super::exn::PendingException>());
 
-    assert!(host::execute(&mut store, instance, 0, code, &[], &[])
-        .unwrap()
-        .is_empty());
+    host::execute(&mut store, (instance, 0, code), &[], &[], &mut []).unwrap();
 }
 
 #[test]
@@ -138,15 +132,8 @@ fn operand_underflow_bypasses_guest_catch_all() {
     *op = crate::module::op::Op::Copy(0, 0);
 
     let mut store = Store::new(&engine, ());
-    let error = host::execute(
-        &mut store,
-        Instance { index: 0, store: 0 },
-        0,
-        code,
-        &[],
-        &[],
-    )
-    .unwrap_err();
+    let target = (Instance { index: 0, store: 0 }, 0, code);
+    let error = host::execute(&mut store, target, &[], &[], &mut []).unwrap_err();
     assert!(error.is::<crate::error::InternalError>());
     assert!(!error.is::<super::exn::PendingException>());
 }
@@ -174,14 +161,17 @@ fn corrupt_slot_tag_fails_closed() {
         (sp, len),
         "failed pop must be transactional"
     );
-    let error = host::finish(&mut store, exec, &boundary, &[], Err(error)).unwrap_err();
+    let error = host::finish(&mut store, exec, &boundary, &[], Err(error), &mut []).unwrap_err();
     assert!(error.is::<crate::error::InternalError>());
 
-    assert!(
-        host::execute(&mut store, instance, 0, code, &[Val::I32(9)], &[],)
-            .unwrap()
-            .is_empty()
-    );
+    host::execute(
+        &mut store,
+        (instance, 0, code),
+        &[Val::I32(9)],
+        &[],
+        &mut [],
+    )
+    .unwrap();
 }
 
 fn run_i32(wat: &str, params: &[ValType], args: &[Val]) -> i32 {

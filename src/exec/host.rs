@@ -53,16 +53,33 @@ pub(super) fn root_ref_params(inner: &mut StoreInner, params: &[Val]) {
     }
 }
 
-/// Validates the decoded results against the entry function's result types and roots the
-/// references among them for the host (the operand shadow stops rooting them at the boundary).
-fn check_results(
+/// Validates the decoded results in `out` against the entry function's result types and roots the
+/// references among them for the host (the operand shadow stops rooting them at the boundary). On
+/// failure — an interpreter bug — `out` is reset to defaults so no unrooted reference escapes.
+fn check_results(inner: &mut StoreInner, result_tys: &[ValType], out: &mut [Val]) -> Result<()> {
+    // A value decoded at a numeric type has that type and nothing to root.
+    if !result_tys.iter().any(ValType::is_ref) {
+        return Ok(());
+    }
+    let roots_mark = inner.gc_roots_mark();
+    let result = validate_and_root(inner, result_tys, out);
+    if result.is_err() {
+        inner.gc_roots_truncate(roots_mark);
+        for (out, ty) in out.iter_mut().zip(result_tys) {
+            *out = Val::default_for_valtype(ty);
+        }
+    }
+    result
+}
+
+fn validate_and_root(
     inner: &mut StoreInner,
     result_tys: &[ValType],
-    decoded: Vec<Val>,
-) -> Result<Vec<Val>> {
+    out: &mut [Val],
+) -> Result<()> {
     if let Err(error) = crate::extern_::ensure_values_match(
         inner,
-        &decoded,
+        out,
         result_tys,
         "execution attempted to return an incompatible value",
     ) {
@@ -74,26 +91,17 @@ fn check_results(
             ))
             .into());
     }
-
-    let roots_mark = inner.gc_roots_mark();
-    let result: Result<Vec<Val>> = decoded
-        .into_iter()
-        .map(|value| {
-            inner.root_host_result(value).map_err(|error| {
-                error
-                    .downcast_ref::<InternalError>()
-                    .copied()
-                    .unwrap_or(InternalError::GcMetadata(
-                        "execution result referenced invalid GC state",
-                    ))
-                    .into()
-            })
-        })
-        .collect();
-    if result.is_err() {
-        inner.gc_roots_truncate(roots_mark);
+    for value in out {
+        *value = inner.root_host_result(*value).map_err(|error| {
+            error
+                .downcast_ref::<InternalError>()
+                .copied()
+                .unwrap_or(InternalError::GcMetadata(
+                    "execution result referenced invalid GC state",
+                ))
+        })?;
     }
-    result
+    Ok(())
 }
 
 /// The boundary state of one (top-level or re-entrant) call on the shared execution: where its
@@ -153,18 +161,20 @@ pub(super) fn enter<T>(
     Ok((exec, b))
 }
 
-/// Closes out a (sub-)call: extracts results (or restores the stacks on error), re-parks the shared
-/// execution for the outer call to resume (top-level drops it), and surfaces any error.
+/// Closes out a (sub-)call: extracts results into `out` (or restores the stacks on error),
+/// re-parks the shared execution for the outer call to resume (top-level drops it), and surfaces
+/// any error.
 pub(super) fn finish<T>(
     store: &mut Store<T>,
     mut exec: Execution,
     b: &Boundary,
     result_tys: &[ValType],
     outcome: Result<()>,
-) -> Result<Vec<Val>> {
+    out: &mut [Val],
+) -> Result<()> {
     let result = match outcome {
-        Ok(()) => match exec.take_results(b.value_base, b.stop_depth, result_tys) {
-            Ok(decoded) => check_results(&mut store.inner, result_tys, decoded),
+        Ok(()) => match exec.take_results(b.value_base, b.stop_depth, result_tys, out) {
+            Ok(()) => check_results(&mut store.inner, result_tys, out),
             Err(error) => match exec.discard_to(b.value_base, b.stop_depth) {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
@@ -190,19 +200,19 @@ pub(super) fn finish<T>(
     result
 }
 
-/// Runs `code` (of `instance`) with `args`, servicing host calls, and returns the
-/// results. The wasm core runs on `&mut store.inner`; only host calls touch `T`.
+/// Runs `code` (of `instance`, its function `func_index`) with `args`, servicing host calls, and
+/// writes the results (typed `result_tys`) into `out`. The wasm core runs on `&mut store.inner`;
+/// only host calls touch `T`.
 pub(crate) fn execute<T>(
     store: &mut Store<T>,
-    instance: Instance,
-    func_index: u32,
-    code: Code,
+    (instance, func_index, code): (Instance, u32, Code),
     args: &[Val],
     result_tys: &[ValType],
-) -> Result<Vec<Val>> {
+    out: &mut [Val],
+) -> Result<()> {
     let (mut exec, b) = enter(store, instance, func_index, code, args)?;
     let outcome = drive(&mut exec, store, b.run_stop);
-    finish(store, exec, &b, result_tys, outcome)
+    finish(store, exec, &b, result_tys, outcome, out)
 }
 
 /// Drives the resumable core to completion (sync), servicing host calls and grow suspensions.

@@ -20,19 +20,19 @@ use super::cell::{
 /// GC-slot codec (three nested matches), which was measurable at per-call frequency.
 /// Non-scalars fall back to the generic [`decode`].
 #[inline]
-fn decode_val(c: Cell, t: &ValType) -> Val {
+pub(super) fn decode_val(c: Cell, t: &ValType) -> Val {
     match t {
         ValType::I32 => Val::I32(c.unwrap_i32()),
         ValType::I64 => Val::I64(c.unwrap_i64()),
-        ValType::F32 => Val::F32(c.unwrap_f32().to_bits()),
-        ValType::F64 => Val::F64(c.unwrap_f64().to_bits()),
+        ValType::F32 => Val::F32(c.bits32()),
+        ValType::F64 => Val::F64(c.bits64()),
         _ => decode(c, t),
     }
 }
 
 /// Direct `Val` → cell (see [`decode_val`]); non-scalars fall back to the generic [`encode`].
 #[inline]
-fn encode_val(v: Val) -> Cell {
+pub(super) fn encode_val(v: Val) -> Cell {
     match v {
         Val::I32(x) => Cell::from_i32(x),
         Val::I64(x) => Cell::from_i64(x),
