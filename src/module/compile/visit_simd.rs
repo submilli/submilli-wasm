@@ -330,9 +330,8 @@ impl Translator<'_> {
         value: wasmparser::V128,
     ) -> Result<()> {
         if self.reachable {
-            self.constop(Op::Simd(SimdOp::V128Const(u128::from_le_bytes(
-                *value.bytes(),
-            ))));
+            let index = self.pool_v128(*value.bytes())?;
+            self.constop(Op::Simd(SimdOp::V128Const(index)));
         }
         Ok(())
     }
@@ -342,9 +341,18 @@ impl Translator<'_> {
         lanes: [u8; 16],
     ) -> Result<()> {
         if self.reachable {
-            self.binop(Op::Simd(SimdOp::I8x16Shuffle(lanes)));
+            let index = self.pool_v128(lanes)?;
+            self.binop(Op::Simd(SimdOp::I8x16Shuffle(index)));
         }
         Ok(())
+    }
+
+    /// Appends a 16-byte immediate to the module-wide pool (see `CodeArenas::v128s`).
+    fn pool_v128(&mut self, bytes: [u8; 16]) -> Result<u32> {
+        let index = u32::try_from(self.code.v128s.len())
+            .map_err(|_| crate::Error::msg("too many SIMD immediates in module"))?;
+        self.code.v128s.push(bytes);
+        Ok(index)
     }
 }
 

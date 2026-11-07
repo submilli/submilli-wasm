@@ -41,6 +41,21 @@ fn encode_val(v: Val) -> Cell {
         _ => encode(v),
     }
 }
+#[cold]
+fn lockstep_error() -> crate::Error {
+    InternalError::OperandStack("value/shadow length mismatch").into()
+}
+
+#[cold]
+fn underflow_error() -> crate::Error {
+    InternalError::OperandStack("operand stack underflow").into()
+}
+
+#[cold]
+fn scalar_tag_error() -> crate::Error {
+    InternalError::OperandStack("numeric operation found a reference tag").into()
+}
+
 use super::Execution;
 use crate::canon::{IrVal, RefKind, Slot};
 use crate::error::InternalError;
@@ -56,40 +71,64 @@ impl Execution {
         }
     }
 
-    fn operand_floor(&self) -> Result<usize> {
-        let frame = self
-            .frames
-            .last()
-            .ok_or(InternalError::FrameStack("missing current frame"))?;
-        Ok(frame.operand_base as usize)
+    /// Index of the lowest of the top `needed` operands, refusing to pop below the current frame's
+    /// floor or to proceed with the value/shadow stacks out of lockstep (both impossible for
+    /// validated code; corrupt bytecode must still fail closed, not read the caller's operands).
+    /// Kept to two compares against cached state: walking the frame stack here on every op once
+    /// cost ~30% of CoreMark.
+    #[allow(clippy::inline_always)] // called by nearly every op; must not stay an out-of-line call
+    #[inline(always)]
+    pub(super) fn ensure_operands(&self, needed: usize) -> Result<usize> {
+        debug_assert_eq!(
+            self.floor,
+            self.frames
+                .last()
+                .map_or(usize::MAX, |frame| frame.operand_base as usize),
+            "stale cached frame floor (a frame push/pop skipped `sync_floor`)"
+        );
+        let len = self.values.len();
+        if len != self.shadow.len() {
+            return Err(lockstep_error());
+        }
+        match len.checked_sub(needed) {
+            Some(base) if base >= self.floor => Ok(base),
+            _ => Err(underflow_error()),
+        }
     }
 
-    fn ensure_operands(&self, needed: usize) -> Result<usize> {
-        if self.values.len() != self.shadow.len() {
-            return Err(InternalError::OperandStack("value/shadow length mismatch").into());
-        }
-        let floor = self.operand_floor()?;
-        let available = self
-            .values
-            .len()
-            .checked_sub(floor)
-            .ok_or(InternalError::OperandStack(
-                "stack is below the current frame floor",
-            ))?;
-        if available < needed {
-            return Err(InternalError::OperandStack("operand stack underflow").into());
-        }
-        Ok(self.values.len() - needed)
-    }
-
+    /// [`ensure_operands`](Self::ensure_operands) for numeric ops, also refusing reference-tagged
+    /// operands: the in-place helpers (`binop_cells`/`unop_cell`) keep the first operand's shadow
+    /// tag, so a reference reaching a numeric op would leave a scalar result tagged as a GC root.
+    /// Impossible for validated code; corrupt bytecode must fail closed.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn ensure_scalar_operands(&self, needed: usize) -> Result<usize> {
         let base = self.ensure_operands(needed)?;
-        if self.shadow[base..].iter().any(|tag| *tag != RefTag::NONE) {
-            return Err(
-                InternalError::OperandStack("numeric operation found a reference tag").into(),
-            );
+        // `needed` is a constant at every (inlined) call site: this unrolls to 1–2 byte compares.
+        for i in base..base + needed {
+            if self.tag_at(i)? != RefTag::NONE {
+                return Err(scalar_tag_error());
+            }
         }
         Ok(base)
+    }
+
+    /// The shadow tag at `i`. Fallible: a broken value/shadow invariant must surface as an error,
+    /// never a panic.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn tag_at(&self, i: usize) -> Result<RefTag> {
+        self.shadow
+            .get(i)
+            .copied()
+            .ok_or_else(|| InternalError::OperandStack("value/shadow length mismatch").into())
+    }
+
+    /// The shadow tags from `base` up (see [`tag_at`](Self::tag_at)).
+    fn tags_from(&self, base: usize) -> Result<&[RefTag]> {
+        self.shadow
+            .get(base..)
+            .ok_or_else(|| InternalError::OperandStack("value/shadow length mismatch").into())
     }
 
     #[inline]
@@ -205,7 +244,7 @@ impl Execution {
     #[inline]
     pub(super) fn pop_tagged(&mut self) -> Result<(Cell, RefTag)> {
         let base = self.ensure_operands(1)?;
-        let pair = (self.values[base], self.shadow[base]);
+        let pair = (self.values[base], self.tag_at(base)?);
         self.values.truncate(base);
         self.shadow.truncate(base);
         Ok(pair)
@@ -228,26 +267,25 @@ impl Execution {
     /// The cell + shadow tag at operand index `i` (a `local.get` source).
     #[inline]
     pub(super) fn cell_at(&self, i: usize) -> Result<(Cell, RefTag)> {
-        if self.values.len() != self.shadow.len() {
-            return Err(InternalError::OperandStack("value/shadow length mismatch").into());
-        }
         let cell = self
             .values
             .get(i)
             .copied()
             .ok_or(InternalError::OperandStack("local index out of bounds"))?;
-        Ok((cell, self.shadow[i]))
+        Ok((cell, self.tag_at(i)?))
     }
 
     /// Writes a cell + shadow tag at operand index `i` (a `local.set`/`local.tee` target).
     #[inline]
     pub(super) fn set_cell(&mut self, i: usize, cell: Cell, tag: RefTag) -> Result<()> {
-        if self.values.len() != self.shadow.len() || i >= self.values.len() {
-            return Err(InternalError::OperandStack("local index out of bounds").into());
+        match (self.values.get_mut(i), self.shadow.get_mut(i)) {
+            (Some(slot), Some(slot_tag)) => {
+                *slot = cell;
+                *slot_tag = tag;
+                Ok(())
+            }
+            _ => Err(InternalError::OperandStack("local index out of bounds").into()),
         }
-        self.values[i] = cell;
-        self.shadow[i] = tag;
-        Ok(())
     }
 
     /// The top operand as an `i32` without popping (an `array.new*` count peek).
@@ -261,7 +299,7 @@ impl Execution {
     #[inline]
     pub(super) fn top_cell(&self) -> Result<(Cell, RefTag)> {
         let base = self.ensure_operands(1)?;
-        Ok((self.values[base], self.shadow[base]))
+        Ok((self.values[base], self.tag_at(base)?))
     }
 
     #[inline]
@@ -329,7 +367,7 @@ impl Execution {
     #[inline]
     pub(super) fn pop_ref(&mut self, kind: RefKind) -> Result<Val> {
         let base = self.ensure_operands(1)?;
-        if self.shadow[base] != RefTag::of_refkind(kind) {
+        if self.tag_at(base)? != RefTag::of_refkind(kind) {
             return Err(
                 InternalError::OperandStack("reference tag does not match operand type").into(),
             );
@@ -342,12 +380,13 @@ impl Execution {
     #[inline]
     pub(super) fn pop_tagged_ref(&mut self) -> Result<(Cell, RefTag)> {
         let base = self.ensure_operands(1)?;
-        if self.shadow[base].refkind().is_none() {
+        let tag = self.tag_at(base)?;
+        if tag.refkind().is_none() {
             return Err(
                 InternalError::OperandStack("reference operation found a scalar tag").into(),
             );
         }
-        let pair = (self.values[base], self.shadow[base]);
+        let pair = (self.values[base], tag);
         self.values.truncate(base);
         self.shadow.truncate(base);
         Ok(pair)
@@ -368,7 +407,7 @@ impl Execution {
             Slot::Ref { kind, .. } => RefTag::of_refkind(kind),
             Slot::Scalar { .. } => RefTag::NONE,
         };
-        if self.shadow[base] != expected {
+        if self.tag_at(base)? != expected {
             return Err(
                 InternalError::OperandStack("operand tag does not match field type").into(),
             );
@@ -381,7 +420,7 @@ impl Execution {
     #[inline]
     pub(super) fn pop_typed(&mut self, ty: &ValType) -> Result<Val> {
         let base = self.ensure_operands(1)?;
-        if self.shadow[base] != Self::expected_tag(ty) {
+        if self.tag_at(base)? != Self::expected_tag(ty) {
             return Err(
                 InternalError::OperandStack("operand tag does not match value type").into(),
             );
@@ -396,9 +435,8 @@ impl Execution {
     #[inline]
     pub(super) fn pop_select(&mut self) -> Result<(Cell, RefTag)> {
         let base = self.ensure_operands(3)?;
-        let a_tag = self.shadow[base];
-        let b_tag = self.shadow[base + 1];
-        if a_tag != b_tag || self.shadow[base + 2] != RefTag::NONE {
+        let (a_tag, b_tag) = (self.tag_at(base)?, self.tag_at(base + 1)?);
+        if a_tag != b_tag || self.tag_at(base + 2)? != RefTag::NONE {
             return Err(InternalError::OperandStack("select operand tag mismatch").into());
         }
         let selected = if self.values[base + 2].unwrap_i32() != 0 {
@@ -424,7 +462,7 @@ impl Execution {
     #[inline]
     pub(super) fn pop_params_into(&mut self, tys: &[ValType], out: &mut Vec<Val>) -> Result<()> {
         let base = self.ensure_operands(tys.len())?;
-        for (tag, ty) in self.shadow[base..].iter().zip(tys) {
+        for (tag, ty) in self.tags_from(base)?.iter().zip(tys) {
             if *tag != Self::expected_tag(ty) {
                 return Err(InternalError::OperandStack("host parameter tag mismatch").into());
             }

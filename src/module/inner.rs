@@ -9,7 +9,10 @@ use crate::canon::{
 };
 use crate::engine::Engine;
 use crate::module::op::CompiledFunc;
-use crate::value::{ExternType, FuncType, GlobalType, MemoryType, TableType, TagType};
+use crate::value::{ExternType, FuncType, GlobalType, MemoryType, TableType, TagType, ValType};
+
+/// A function type's materialized `(params, results)`.
+pub(crate) type FuncSig = (Vec<ValType>, Vec<ValType>);
 
 /// A module decoded and compiled to internal bytecode. Immutable and shareable.
 ///
@@ -55,6 +58,10 @@ pub(crate) struct ModuleInner {
     /// The owning engine (for releasing `group_handles` on drop). `None` until `intern`.
     #[serde(skip)]
     pub engine: Option<Engine>,
+    /// Per-module-type materialized `(params, results)`, built on first use (see
+    /// [`func_sig`](Self::func_sig)). Engine-specific; reset by `intern`.
+    #[serde(skip)]
+    pub func_sigs: Vec<std::sync::OnceLock<FuncSig>>,
     /// Retained DWARF/`name` custom sections + lazily-built line index (#29a). Empty unless debug
     /// retention was on at parse. Module-intrinsic (not engine-specific), so it serializes with the
     /// artifact — backtraces survive `serialize`/`deserialize`.
@@ -68,6 +75,9 @@ impl ModuleInner {
         let (type_ids, group_handles) = engine.intern_types(&self.types);
         self.type_ids = type_ids;
         self.group_handles = group_handles;
+        self.func_sigs = std::iter::repeat_with(std::sync::OnceLock::new)
+            .take(self.types.len())
+            .collect();
         self.layouts = self
             .types
             .iter()
@@ -274,6 +284,17 @@ impl ModuleInner {
             self.engine(),
             self.canonical_type_id(self.func_types[module_func_idx as usize]),
         )
+    }
+
+    /// The materialized `(params, results)` of a function's type, built once and shared:
+    /// `Func::call` would otherwise re-materialize it (registry lock + allocations) per call.
+    pub(crate) fn func_sig(&self, module_func_idx: u32) -> crate::Result<&FuncSig> {
+        let slot = self
+            .func_types
+            .get(module_func_idx as usize)
+            .and_then(|&type_index| self.func_sigs.get(type_index as usize))
+            .ok_or_else(|| crate::Error::msg("function type index out of range"))?;
+        Ok(slot.get_or_init(|| self.func_type(module_func_idx).signature()))
     }
 
     /// The external type of an import (for [`Module::imports`](super::Module::imports)).

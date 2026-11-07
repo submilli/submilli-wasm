@@ -39,12 +39,13 @@ impl Execution {
         if self.exec_simd_mem(inner, code, s, instance)? {
             return Ok(());
         }
-        self.exec_simd_compute(s)
+        self.exec_simd_compute(code, s)
     }
 
-    /// Pure (non-memory) SIMD ops, dispatched through the category chain.
-    fn exec_simd_compute(&mut self, s: &SimdOp) -> Result<()> {
-        self.exec_simd_lane(s)
+    /// Pure (non-memory) SIMD ops, dispatched through the category chain. `code` resolves the
+    /// pooled 16-byte immediates (`v128.const`, `i8x16.shuffle`).
+    fn exec_simd_compute(&mut self, code: &crate::module::code::Code, s: &SimdOp) -> Result<()> {
+        self.exec_simd_lane(code, s)
     }
 
     #[inline]

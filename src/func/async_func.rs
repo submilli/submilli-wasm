@@ -11,7 +11,8 @@ use super::direct_call::{
     call_direct_host, finish_direct_host_call, preflight_direct_call, DirectCallBoundary,
 };
 use super::wasm_ty::valtypes_of;
-use super::{check_args, default_results, validate_results, Callee, Caller, Func, TypedFunc};
+use super::{check_call, check_host_call, default_results, validate_results};
+use super::{Callee, Caller, Func, TypedFunc};
 use super::{WasmParams, WasmResults, WasmRet};
 use crate::func::into_async_func;
 use crate::store::{AsContextMut, FuncEntity};
@@ -153,11 +154,6 @@ impl Func {
                 "cannot use `call_async` without `Config::async_support(true)`",
             ));
         }
-        let ty = self.ty(&store);
-        check_args(store.as_context().inner(), params, &ty)?;
-        if results.len() != ty.results().len() {
-            return Err(crate::Error::msg("wrong number of results"));
-        }
         // Bind the callee to a local first: if the `store.as_context()` borrow were taken in the
         // `match` scrutinee it would live through the whole match body — including the `.await`s
         // below — making this future hold a shared `&Store` across a suspension point. That would
@@ -166,35 +162,25 @@ impl Func {
         let callee = self.resolve_callee(store.as_context().inner());
         let out = match callee {
             Callee::Wasm(instance, func_index) => {
-                let code = store
-                    .as_context()
-                    .inner()
-                    .instance(instance)
-                    .module
-                    .code(func_index);
-                let result_tys: Vec<crate::value::ValType> = ty.results().collect();
-                let args = crate::extern_::coerce_args(
-                    &mut store.as_context_mut().store_mut().inner,
-                    params,
-                    &ty,
-                )?;
-                crate::exec::host_async::execute_async(
-                    store.as_context_mut().store_mut(),
-                    instance,
-                    func_index,
-                    code,
-                    args,
-                    &result_tys,
-                )
-                .await?
+                let n_results = results.len();
+                let mut ctx = store.as_context_mut();
+                call_wasm_async(ctx.store_mut(), instance, func_index, params, n_results).await?
             }
-            Callee::Host(host_index) => call_direct_host(&mut store, host_index, params, &ty)?,
+            Callee::Host(host_index) => {
+                let ty = self.ty(&store);
+                let result_tys = check_host_call(store.as_context().inner(), &ty, params, results)?;
+                let out = call_direct_host(&mut store, host_index, params, &ty)?;
+                validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
+                out
+            }
             Callee::HostAsync(host_index) => {
-                call_direct_host_async(&mut store, host_index, params, &ty).await?
+                let ty = self.ty(&store);
+                let result_tys = check_host_call(store.as_context().inner(), &ty, params, results)?;
+                let out = call_direct_host_async(&mut store, host_index, params, &ty).await?;
+                validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
+                out
             }
         };
-        let result_tys: Vec<_> = ty.results().collect();
-        validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
         results.clone_from_slice(&out);
         Ok(())
     }
@@ -219,4 +205,26 @@ where
             .await?;
         Ok(Results::from_vals(&results))
     }
+}
+
+/// The wasm-callee half of [`Func::call_async`], mirroring the sync `call_wasm`: the signature
+/// comes from the module's cache, and the cloned module `Arc` keeps it borrowable across the
+/// await.
+async fn call_wasm_async<T>(
+    store: &mut crate::store::Store<T>,
+    instance: crate::instance::Instance,
+    func_index: u32,
+    params: &[Val],
+    n_results: usize,
+) -> Result<Vec<Val>> {
+    let code = store.inner.instance(instance).module.code(func_index);
+    let module = Arc::clone(&code.module);
+    let (param_tys, result_tys) = module.func_sig(func_index)?;
+    check_call(&store.inner, params, n_results, param_tys, result_tys)?;
+    let args = crate::extern_::coerce_args(&mut store.inner, params, param_tys)?;
+    let out =
+        crate::exec::host_async::execute_async(store, instance, func_index, code, args, result_tys)
+            .await?;
+    validate_results(&mut store.inner, &out, result_tys)?;
+    Ok(out)
 }

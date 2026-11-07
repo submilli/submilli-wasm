@@ -200,12 +200,12 @@ pub(crate) fn ensure_values_match(
 pub(crate) fn coerce_args(
     inner: &mut StoreInner,
     params: &[Val],
-    ty: &FuncType,
+    param_tys: &[ValType],
 ) -> Result<Vec<Val>> {
     params
         .iter()
-        .zip(ty.params())
-        .map(|(&v, pty)| coerce_arg(inner, v, &pty))
+        .zip(param_tys)
+        .map(|(&v, pty)| coerce_arg(inner, v, pty))
         .collect()
 }
 

@@ -9,7 +9,7 @@ use crate::canon::IrHeap;
 
 pub(crate) use super::op_types::*;
 
-/// One internal instruction. 16 bytes (without `simd`) and **not** a drop type: wide immediates
+/// One internal instruction. 16 bytes and **not** a drop type: wide immediates
 /// live out of line (`br_table`/`br_on_cast` edges and rare 64-bit memarg offsets in per-function
 /// pools), `BranchTarget` packs its stack fixup into two `u16`s, and nothing inline is `Box`ed —
 /// a `Vec<Op>` frees in one shot at teardown, and the op stream is 33% smaller resident than the
@@ -371,8 +371,7 @@ pub(crate) enum Op {
 /// `module::op::CompiledFunc` path keeps resolving.
 pub(crate) use super::code::CompiledFunc;
 
-// The two load-bearing layout properties (see the enum doc). 16 bytes holds only without the
-// `simd` feature — `SimdOp`'s lane/memarg immediates widen the enum.
-#[cfg(not(feature = "simd"))]
+// The two load-bearing layout properties (see the enum doc). 16 bytes holds with the `simd`
+// feature too: `SimdOp`'s 16-byte immediates live in the `v128s` pool.
 const _: () = assert!(std::mem::size_of::<Op>() == 16);
 const _: () = assert!(!std::mem::needs_drop::<Op>());

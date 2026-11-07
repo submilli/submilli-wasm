@@ -2,17 +2,35 @@
 //! `Arc<CompiledFunc>` so the run loop can read ops without borrowing the store
 //! or the value/frame stacks.
 
+use std::sync::Arc;
+
 use crate::error::InternalError;
 use crate::instance::Instance;
-use crate::module::code::Code;
+use crate::module::code::{Code, Span};
 use crate::module::op::{BranchTarget, CompiledFunc};
+
+/// The part of a function's [`CompiledFunc`] the run loop reads on every frame switch, cached so
+/// it never re-resolves `functions[index]`. Not the whole 64-byte record: copying that into each
+/// frame and back out on every call/return was measurable in call-heavy code.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FrameFunc {
+    pub ops: Span,
+    pub n_results: u32,
+}
+
+impl FrameFunc {
+    fn of(func: &CompiledFunc) -> Self {
+        FrameFunc {
+            ops: func.ops,
+            n_results: func.n_results,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Frame {
     pub code: Code,
-    /// Cached copy of the function record (spans + scalar facts) so the run loop and call
-    /// paths never re-resolve `functions[index]` on frame switches.
-    pub func: CompiledFunc,
+    pub func: FrameFunc,
     /// Resume point in `code.ops` (saved when this frame makes a call).
     pub ip: u32,
     /// Index into `Execution.values` where this frame's locals begin.
@@ -40,6 +58,15 @@ pub(crate) enum Delimiter {
 }
 
 impl super::Execution {
+    /// Re-derives the cached operand floor after any frame push/pop (see `Execution::floor`).
+    #[inline]
+    pub(super) fn sync_floor(&mut self) {
+        self.floor = self
+            .frames
+            .last()
+            .map_or(usize::MAX, |frame| frame.operand_base as usize);
+    }
+
     #[inline]
     pub(super) fn push_call(
         &mut self,
@@ -75,7 +102,7 @@ impl super::Execution {
         }
         self.frames.push(Frame {
             code,
-            func,
+            func: FrameFunc::of(&func),
             ip: 0,
             locals_base,
             operand_base,
@@ -83,6 +110,7 @@ impl super::Execution {
             func_index,
             delimiter: None,
         });
+        self.sync_floor();
         Ok(())
     }
 
@@ -101,7 +129,7 @@ impl super::Execution {
         }
         let locals_base = u32::try_from(self.values.len())
             .map_err(|_| InternalError::FrameStack("operand stack length exceeds u32"))?;
-        let func = code.func();
+        let func = FrameFunc::of(&code.func());
         self.frames.push(Frame {
             code,
             func,
@@ -112,43 +140,86 @@ impl super::Execution {
             func_index: 0,
             delimiter: Some(kind),
         });
+        self.sync_floor();
         Ok(())
     }
 
     /// Moves the top `keep` operands down over `pop` discarded ones, then jumps.
     #[inline]
     pub(super) fn take_branch(&mut self, t: BranchTarget) -> crate::Result<()> {
-        if self.values.len() != self.shadow.len() {
-            return Err(InternalError::OperandStack("value/shadow length mismatch").into());
+        // The common case (loop back-edges, most forward branches): the kept values already sit
+        // on the label's floor, so there is nothing to move.
+        // A pop-free branch still checks that its kept values exist above the frame floor, so a
+        // miscompiled height fails here rather than at some later op.
+        if t.pop == 0 {
+            return self.ensure_operands(usize::from(t.keep)).map(|_| ());
         }
-        let len = self.values.len();
-        let keep = usize::from(t.keep);
+        self.drop_below(usize::from(t.keep), usize::from(t.pop))
+    }
+
+    /// Discards the `pop` operands beneath the top `keep`, sliding the kept ones down. The root
+    /// shadow moves in lockstep with the cell stack (same offsets/length).
+    fn drop_below(&mut self, keep: usize, pop: usize) -> crate::Result<()> {
         let needed = keep
-            .checked_add(usize::from(t.pop))
+            .checked_add(pop)
             .ok_or(InternalError::OperandStack("branch stack fixup overflow"))?;
-        let floor = self
-            .frames
-            .last()
-            .ok_or(InternalError::FrameStack("missing branch frame"))?
-            .operand_base as usize;
-        if len
-            .checked_sub(floor)
-            .is_none_or(|available| available < needed)
-        {
-            return Err(InternalError::OperandStack("branch stack fixup underflow").into());
+        let dst = self.ensure_operands(needed)?;
+        self.slide_down(dst + pop, dst, keep)
+    }
+
+    /// Moves the top `n` operands (starting at `src`) down to `dst < src` and drops everything
+    /// above them; the shared tail of branch fixups and returns. The root shadow moves in lockstep.
+    /// A single value (the common case) moves without the `memmove` call `copy_within` makes.
+    fn slide_down(&mut self, src: usize, dst: usize, n: usize) -> crate::Result<()> {
+        let len = self.values.len();
+        if src.checked_add(n) != Some(len) || dst > src || self.shadow.len() != len {
+            return Err(InternalError::OperandStack("stack fixup range out of bounds").into());
         }
-        let src = len - keep;
-        let dst = src - usize::from(t.pop);
+        if n <= 1 {
+            let top = self
+                .values
+                .get(src)
+                .copied()
+                .zip(self.shadow.get(src).copied());
+            self.values.truncate(dst);
+            self.shadow.truncate(dst);
+            if let (1, Some((cell, tag))) = (n, top) {
+                self.push_cell(cell, tag);
+            }
+            return Ok(());
+        }
         self.values.copy_within(src..len, dst);
-        self.values.truncate(dst + keep);
-        // The root shadow moves in lockstep with the cell stack (same offsets/length).
+        self.values.truncate(dst + n);
         self.shadow.copy_within(src..len, dst);
-        self.shadow.truncate(dst + keep);
+        self.shadow.truncate(dst + n);
         Ok(())
     }
 
     #[inline]
-    pub(super) fn top(&self) -> crate::Result<(Code, CompiledFunc, u32, u32, Instance)> {
+    pub(super) fn top(&self) -> crate::Result<(Code, FrameFunc, u32, u32, Instance)> {
+        let f = self.top_frame()?;
+        Ok((f.code.clone(), f.func, f.ip, f.locals_base, f.instance))
+    }
+
+    /// [`top`](Self::top) for the run loop's frame switches: retargets the loop's `code` handle
+    /// in place, bumping the module `Arc` only when the new frame runs in a different module.
+    /// Kept out of line: inlined into the dispatch loop it perturbed the hot ops' code layout
+    /// (same instruction count, 8–15% more cycles on loop-heavy code).
+    #[inline(never)]
+    pub(super) fn top_into(
+        &self,
+        code: &mut Code,
+    ) -> crate::Result<(FrameFunc, u32, u32, Instance)> {
+        let f = self.top_frame()?;
+        if Arc::ptr_eq(&code.module, &f.code.module) {
+            code.index = f.code.index;
+        } else {
+            *code = f.code.clone();
+        }
+        Ok((f.func, f.ip, f.locals_base, f.instance))
+    }
+
+    fn top_frame(&self) -> crate::Result<&Frame> {
         let f = self
             .frames
             .last()
@@ -156,7 +227,7 @@ impl super::Execution {
         if f.delimiter.is_some() {
             return Err(InternalError::FrameStack("delimiter used as executable frame").into());
         }
-        Ok((f.code.clone(), f.func, f.ip, f.locals_base, f.instance))
+        Ok(f)
     }
 
     /// Pops the current frame, moving its top `n_results` operands down to the
@@ -193,10 +264,8 @@ impl super::Execution {
             return Err(InternalError::ResultShape("wrong number of frame results").into());
         }
         self.frames.pop();
-        self.values.copy_within(len - n..len, dst);
-        self.values.truncate(dst + n);
-        self.shadow.copy_within(len - n..len, dst);
-        self.shadow.truncate(dst + n);
+        self.sync_floor();
+        self.slide_down(len - n, dst, n)?;
         Ok(self.frames.len() == stop_depth)
     }
 }

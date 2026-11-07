@@ -118,6 +118,9 @@ pub(crate) struct StoreInner {
     pub(super) gc_request: Arc<AtomicBool>,
 }
 
+/// Stack capacity a store keeps between top-level calls (see [`StoreInner::recycle_exec`]).
+const EXEC_RECYCLE_LIMIT: usize = 64 * 1024;
+
 impl StoreInner {
     pub(crate) fn new(engine: Engine) -> Self {
         let gc = GcHeap::new(engine.is_collecting(), engine.gc_heap_reservation());
@@ -163,6 +166,20 @@ impl StoreInner {
     /// Parks the shared execution back in its slot (see `exec_slot`).
     pub(crate) fn park_exec(&mut self, exec: crate::exec::Execution) {
         self.exec_slot = exec;
+    }
+
+    /// Keeps a finished top-level call's emptied execution so the next call reuses its stack
+    /// allocations (allocating and freeing three stacks per call dominated short calls). Only a
+    /// pristine execution is kept, so nothing from an earlier call survives, and only up to
+    /// [`EXEC_RECYCLE_LIMIT`] bytes of capacity, so one deep call doesn't pin a large stack for the
+    /// store's lifetime.
+    pub(crate) fn recycle_exec(&mut self, exec: crate::exec::Execution) {
+        if exec.is_pristine()
+            && !self.has_parked_execution()
+            && exec.retained_bytes() <= EXEC_RECYCLE_LIMIT
+        {
+            self.exec_slot = exec;
+        }
     }
 
     /// Swap-based park/unpark for the per-host-call crossing (no placeholder writes/drops).

@@ -61,7 +61,7 @@ impl Execution {
             inner.engine().add_gc_committed(granted);
             return Ok(None);
         }
-        Ok(Some(StepOutcome::DoGcGrow {
+        Ok(Some(StepOutcome::GcGrow {
             reserved_target,
             bytes_needed: charge as u64,
             return_ip: ip,

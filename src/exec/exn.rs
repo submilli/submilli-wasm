@@ -196,6 +196,7 @@ impl Execution {
         self.values.truncate(base as usize);
         self.shadow.truncate(base as usize);
         self.frames.pop();
+        self.sync_floor();
         Ok(())
     }
 

@@ -25,18 +25,44 @@ pub(crate) enum SimdOp {
     V128Load32Zero(MemArg),
     V128Load64Zero(MemArg),
     V128Store(MemArg),
-    V128Load8Lane { mem: MemArg, lane: u8 },
-    V128Load16Lane { mem: MemArg, lane: u8 },
-    V128Load32Lane { mem: MemArg, lane: u8 },
-    V128Load64Lane { mem: MemArg, lane: u8 },
-    V128Store8Lane { mem: MemArg, lane: u8 },
-    V128Store16Lane { mem: MemArg, lane: u8 },
-    V128Store32Lane { mem: MemArg, lane: u8 },
-    V128Store64Lane { mem: MemArg, lane: u8 },
+    V128Load8Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Load16Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Load32Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Load64Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Store8Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Store16Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Store32Lane {
+        mem: MemArg,
+        lane: u8,
+    },
+    V128Store64Lane {
+        mem: MemArg,
+        lane: u8,
+    },
 
     // --- const / lane access / shuffle / swizzle / splat ---
-    V128Const(u128),
-    I8x16Shuffle([u8; 16]),
+    /// Index of the constant in the module's [`v128s`](crate::module::code::CodeArenas::v128s) pool.
+    V128Const(u32),
+    /// Index of the 16 lane selectors in the module's `v128s` pool.
+    I8x16Shuffle(u32),
     I8x16ExtractLaneS(u8),
     I8x16ExtractLaneU(u8),
     I8x16ReplaceLane(u8),

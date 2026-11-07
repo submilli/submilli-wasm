@@ -28,8 +28,8 @@ pub(super) fn resolve(inner: &StoreInner, f: Func) -> ResolvedCall {
             func_index,
         } => {
             let def_inst = *instance;
-            let module = inner.instance(def_inst).module.clone();
-            ResolvedCall::Wasm(def_inst, *func_index, module.code(*func_index))
+            let code = inner.instance(def_inst).module.code(*func_index);
+            ResolvedCall::Wasm(def_inst, *func_index, code)
         }
         FuncEntity::Host { .. } => ResolvedCall::Host(f),
         #[cfg(feature = "async")]
@@ -114,24 +114,28 @@ pub(super) fn call_outcome(
     let n_params = |func| host_ty(inner, func).params().len() as u32;
     match resolved {
         ResolvedCall::Wasm(def_inst, func_index, code) => {
-            let req = |return_ip| CallReq {
+            let return_ip = match kind {
+                CallKind::Tail => 0,
+                CallKind::Nested(return_ip) => return_ip,
+            };
+            let req = CallReq {
                 return_ip,
                 instance: def_inst,
                 func_index,
-                code: code.clone(),
+                code,
             };
             match kind {
-                CallKind::Tail => StepOutcome::DoTailCall(req(0)),
-                CallKind::Nested(return_ip) => StepOutcome::DoCall(req(return_ip)),
+                CallKind::Tail => StepOutcome::TailCall(req),
+                CallKind::Nested(_) => StepOutcome::Call(req),
             }
         }
         ResolvedCall::Host(func) => match kind {
-            CallKind::Tail => StepOutcome::DoTailHostCall {
+            CallKind::Tail => StepOutcome::TailHostCall {
                 func,
                 instance,
                 n_params: n_params(func),
             },
-            CallKind::Nested(return_ip) => StepOutcome::DoHostCall {
+            CallKind::Nested(return_ip) => StepOutcome::HostCall {
                 func,
                 instance,
                 return_ip,
@@ -139,12 +143,12 @@ pub(super) fn call_outcome(
         },
         #[cfg(feature = "async")]
         ResolvedCall::HostAsync(func) => match kind {
-            CallKind::Tail => StepOutcome::DoTailHostAsyncCall {
+            CallKind::Tail => StepOutcome::TailHostAsyncCall {
                 func,
                 instance,
                 n_params: n_params(func),
             },
-            CallKind::Nested(return_ip) => StepOutcome::DoHostAsyncCall {
+            CallKind::Nested(return_ip) => StepOutcome::HostAsyncCall {
                 func,
                 instance,
                 return_ip,

@@ -174,8 +174,8 @@ pub(super) fn finish<T>(
             Err(cleanup_error) => Err(cleanup_error),
         },
     };
-    // A top-level call (no parked outer frames) drops the execution; a re-entry re-parks it so the
-    // outer driver resumes on the same — now restored — stacks.
+    // A top-level call (no parked outer frames) leaves the emptied execution for reuse; a re-entry
+    // re-parks it so the outer driver resumes on the same — now restored — stacks.
     if b.stop_depth != 0 {
         if let Err(error) = &result {
             if let Some(error) = error.downcast_ref::<crate::error::InternalError>() {
@@ -183,6 +183,8 @@ pub(super) fn finish<T>(
             }
         }
         store.inner.park_exec(exec);
+    } else {
+        store.inner.recycle_exec(exec);
     }
     result
 }

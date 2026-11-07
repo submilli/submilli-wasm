@@ -178,6 +178,7 @@ fn empty_inner() -> ModuleInner {
         group_handles: Vec::new(),
         layouts: Vec::new(),
         engine: None,
+        func_sigs: Vec::new(),
         debug: crate::module::debug::DebugSections::default(),
     }
 }

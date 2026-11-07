@@ -766,3 +766,57 @@ Round 5 — **amortized GC-pressure safepoints** (owner's design): the §14 fix 
 also add no pressure, and multi-tenant deployments run epoch/fuel regardless.
 Measured: threshold-configured CoreMark **727** (== the unconfigured fast path; the gated
 loop would have held it ~10% lower). Defaults unchanged (717/841 hostcall).
+
+## 15. Session 6 — the wasm.fyi gap: per-op checks, flat dispatch, call path
+
+Trigger: wasm.fyi (JairusSW/wasm.fyi#11) measured submilli 11–15× slower than wasmi at
+execution on x86. Two corrections to our own picture first:
+- **wasm.fyi builds wasmi with `auto-dispatch`** (tail-call threading) + `simd` + `memory64`
+  (`scripts/lib/wasmi-proposals.mjs`). Against that, the gap is 12–19× on Apple Silicon too —
+  not x86-specific. Comparing against `portable-dispatch` wasmi (~4× slower than tail-call)
+  is what once made it look like "~4×, x86-only".
+- The README's CoreMark ratio (vs the pinned `2.0.0-beta.4`) is stale: 2.0.0 is ~1.75× faster.
+
+Goal set with the owner: **wasmi 1.x speed** (same `loop { match }` dispatch as ours; no
+tail-call threading). Baseline gap vs wasmi 1.1 (M4 Pro, simd off): CoreMark 6.2×,
+memory/sum 9×, memory_tree 8×, linked_list 7.6×, fib 3.9×, per-call 20×.
+
+**Methodology.** A submilli-only driver over the wasm.fyi workloads (artifacts from
+`/api/artifacts/<sha>.wasm`), compared by **min cycles / instructions from `/usr/bin/time -l`**
+— wall time was unusable under a co-tenant's 10-core load, and cycle counts hold up under it.
+Address-level `xctrace` samples, symbolicated with `dsymutil` + `atos`, as in §12.
+
+| change | effect (cycles) |
+|---|---|
+| **Per-op stack checks**: `ensure_operands` re-walked the frame stack (`frames.last()`), compared value/shadow lengths and scanned shadow tags for every scalar op, out of line from 23 call sites — ~30% of CoreMark. Now inline: the lockstep compare + one compare against a **cached frame floor** (`Execution::floor`, re-synced at the 7 frame push/pop sites). The scalar tag scan is a debug assertion (reading a ref as a number can't forge one; ref pops keep their tag checks). The fail-closed underflow/lockstep tests pass unchanged — keeping them costs ~0 vs stripping them | loops **1.47–1.58×**, fib 1.13× |
+| **`take_branch` `pop == 0` early-out** — §12's fix had been lost; every branch paid the checks + two zero-length `memmove`s | (in the row above) |
+| **`Func::call`**: signature materialized ~6×/call (registry lock + `Vec`s each) → once, then cached per module type (`ModuleInner::func_sigs`, lazy `OnceLock`); top-level `Execution` stacks recycled in the store (≤ 64 KiB, emptied) | per-call **3.8×** |
+| **`step` returns the next `ip`** (`Result<u32>`); calls/grows leave a `StepOutcome` in `Execution::control` behind the `CONTROL` sentinel, instead of every op returning the large enum | instructions −16–19%, cycles ±0 alone |
+| **Flat dispatch**: numeric + load/store arms moved into `step`'s single `match`. §12 Round 3's "LLVM threads the secondary `match` into the primary" no longer held — the disassembly showed a second jump table per numeric/memory op | instructions −20–31% (with the row above); cycles ~neutral |
+| **SIMD immediates pooled** (`CodeArenas::v128s`): `V128Const(u128)` (16-aligned) made `Op` 48 B under `simd`; now 16 B with the size assert unconditional. Artifact v13 | `simd` build ≈ default-build gains |
+| **Call path**: one `Arc` bump per call (was ~6: `resolve`, `call_outcome`, push, `top`); `top_into` retargets the loop's `Code` in place (out of line — inlined it shifted the hot loop's layout: same instructions, +8–15% cycles); `Frame` caches only `{ops, n_results}` (120 → ~68 B); single-value return/branch fixups skip `memmove` | fib **1.12×** |
+
+Review hardening (code-review + security + no-panic passes) restored fail-closed checks
+cheaply: the scalar-op shadow-tag check runs in release again (the in-place binop/unop helpers
+keep the first operand's tag, so a ref reaching a numeric op would forge a root), pop-free
+branches check their `keep` underflow, a stray `CONTROL` is an internal error, `slide_down`
+validates its own range, recycling requires a pristine execution, and a debug assertion pins
+the cached floor to the frame stack. Instruction counts were unchanged by these.
+
+Cumulative vs `main`: instructions **1.86×** fewer on CoreMark, 1.89–1.96× on the loops,
+1.37× fib, 4.8× per call (simd build within ~5%). Cycles: default build CoreMark **1.92×**,
+loops 1.96–2.08×, fib 1.33×, per-call 3.9×; simd build 1.55× / 1.52–1.57× / 1.29× / 3.9×.
+**Treat the loop cycle numbers as ±20%:** the review hardening kept instruction counts flat
+yet moved default-build cycles 1.2–1.3× — hot-loop code layout/alignment, which a change
+anywhere in the giant dispatch function can shift (see also the `top_into` row). Instruction
+ratios are the stable signal. Gap vs wasmi 1.1 (wall, before the hardening layout shift):
+CoreMark **3.6×**, memory/sum 5.2×, memory_tree 5.7×, linked_list 4.1×, fib 2.8×, per-call
+5.2× (from 6.2× / 9× / 8× / 7.6× / 3.9× / 20×).
+
+Where it stands — **dispatch-bound**: instruction-level samples put ~48% of the CoreMark loop
+on three loop-control instructions (the post-op join, the jump-table load, the loop head):
+indirect-branch misprediction + dispatch latency, which no per-op trimming touches (hence
+the instruction cuts above not moving cycles). The lever left is *executing fewer ops*:
+50–58% of executed ops are `local.get/set/tee` + `i32.const` (CoreMark, memory_tree, fib).
+That is the register-IR step (static-height slots, operand providers, `local.set` fusion) —
+also where `v128`-as-two-cells removes the remaining ~18% `simd` cost (16-byte `Cell`).

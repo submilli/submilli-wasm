@@ -42,44 +42,50 @@ pub(crate) enum Outcome {
     },
 }
 
-/// What a single [`step`](super::Execution::step) decided: advance, or perform a
-/// call/grow that the run loop turns into an [`Outcome`].
+/// [`step`](super::Execution::step)'s return value when the op left a [`StepOutcome`] in
+/// `Execution::control` instead of naming the next ip. Ops index a validated function body, far
+/// below `u32::MAX`.
+pub(super) const CONTROL: u32 = u32::MAX;
+
+/// A call/grow the run loop must service after a [`step`](super::Execution::step), turning it
+/// into a frame switch or an [`Outcome`]. Passed out of line (see [`CONTROL`]): returning this
+/// large enum from every op kept the next ip off registers (~30% of CoreMark).
+#[derive(Debug)]
 pub(super) enum StepOutcome {
-    Advance(u32),
-    DoCall(CallReq),
+    Call(CallReq),
     /// Tail call to a wasm callee (#39): replace the current frame. `CallReq::return_ip` is unused.
-    DoTailCall(CallReq),
+    TailCall(CallReq),
     /// Tail call to a host fn (#39): pop the current frame, then run the host (its results return
     /// to the caller). `n_params` is needed to reposition the args before popping.
-    DoTailHostCall {
+    TailHostCall {
         func: Func,
         instance: Instance,
         n_params: u32,
     },
-    DoHostCall {
+    HostCall {
         func: Func,
         instance: Instance,
         return_ip: u32,
     },
     /// Tail call to an async host fn (#39, async only).
     #[cfg(feature = "async")]
-    DoTailHostAsyncCall {
+    TailHostAsyncCall {
         func: Func,
         instance: Instance,
         n_params: u32,
     },
     #[cfg(feature = "async")]
-    DoHostAsyncCall {
+    HostAsyncCall {
         func: Func,
         instance: Instance,
         return_ip: u32,
     },
-    DoGrow {
+    Grow {
         memory: Memory,
         delta: u64,
         return_ip: u32,
     },
-    DoTableGrow {
+    TableGrow {
         table: Table,
         delta: u64,
         init: Ref,
@@ -87,7 +93,7 @@ pub(super) enum StepOutcome {
     },
     /// Grow the GC reservation to `reserved_target` bytes (limiter-consulted), then re-execute the
     /// allocating op at `return_ip`. `bytes_needed` is the allocation's charge (reported on denial).
-    DoGcGrow {
+    GcGrow {
         reserved_target: usize,
         bytes_needed: u64,
         return_ip: u32,
@@ -104,6 +110,7 @@ pub(super) enum ResolvedCall {
 }
 
 /// A pending wasm call (frame to push) produced by [`step`](super::Execution::step).
+#[derive(Debug)]
 pub(super) struct CallReq {
     pub return_ip: u32,
     pub instance: Instance,

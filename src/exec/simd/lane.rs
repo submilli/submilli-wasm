@@ -5,16 +5,18 @@ use super::lanes::{
     i16x8, i32x4, i64x2, i8x16, u16x8, u32x4, u64x2, u8x16,
 };
 use super::Execution;
+use crate::module::code::Code;
 use crate::module::op_simd::SimdOp;
 use crate::value::Val;
 use crate::Result;
 
 impl Execution {
     #[allow(clippy::too_many_lines, clippy::many_single_char_names)]
-    pub(super) fn exec_simd_lane(&mut self, s: &SimdOp) -> Result<()> {
+    pub(super) fn exec_simd_lane(&mut self, code: &Code, s: &SimdOp) -> Result<()> {
         use SimdOp as S;
         match s {
-            S::V128Const(bits) => self.push_v128(*bits),
+            S::V128Const(index) => self.push_v128(u128::from_le_bytes(code.v128(*index)?)),
+            S::I8x16Shuffle(index) => self.i8x16_shuffle(code.v128(*index)?)?,
 
             S::I8x16Splat => {
                 let x = self.pop_i32()? as i8;
@@ -101,13 +103,6 @@ impl Execution {
                 self.push_v128(from_f64x2(a));
             }
 
-            S::I8x16Shuffle(idx) => {
-                let b = u8x16(self.pop_v128()?);
-                let a = u8x16(self.pop_v128()?);
-                let ab: [u8; 32] = core::array::from_fn(|i| if i < 16 { a[i] } else { b[i - 16] });
-                let r: [u8; 16] = core::array::from_fn(|i| ab[idx[i] as usize]);
-                self.push_v128(from_u8x16(r));
-            }
             S::I8x16Swizzle => {
                 let sel = u8x16(self.pop_v128()?);
                 let a = u8x16(self.pop_v128()?);
@@ -131,6 +126,17 @@ impl Execution {
     fn extract<T>(&mut self, f: impl Fn(u128) -> T, wrap: impl Fn(T) -> Val) -> Result<()> {
         let v = self.pop_v128()?;
         self.push(wrap(f(v)));
+        Ok(())
+    }
+
+    /// `i8x16.shuffle` with its lane selectors (validated `< 32`; masked anyway, so a corrupt
+    /// deserialized artifact can't index out of bounds).
+    fn i8x16_shuffle(&mut self, idx: [u8; 16]) -> Result<()> {
+        let b = u8x16(self.pop_v128()?);
+        let a = u8x16(self.pop_v128()?);
+        let ab: [u8; 32] = core::array::from_fn(|i| if i < 16 { a[i] } else { b[i - 16] });
+        let r: [u8; 16] = core::array::from_fn(|i| ab[usize::from(idx[i] & 31)]);
+        self.push_v128(from_u8x16(r));
         Ok(())
     }
 }

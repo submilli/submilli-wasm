@@ -113,40 +113,36 @@ impl Func {
         // Sync `call` is permitted even on an async-enabled store: this interpreter has no
         // fibers, so the sync driver runs fine. (If the call reaches an async host fn, the sync
         // driver still errors with "synchronous context" — the real constraint.)
-        let ty = self.ty(&store);
-        check_args(store.as_context().inner(), params, &ty)?;
-        if results.len() != ty.results().len() {
-            return Err(crate::Error::msg("wrong number of results"));
-        }
         // Copy out the entity's Copy fields, releasing the borrow before we
         // re-borrow the store mutably for the call.
         let out = match self.resolve_callee(store.as_context().inner()) {
-            Callee::Wasm(instance, func_index) => {
-                let mut ctx = store.as_context_mut();
-                let code = ctx.inner().instance(instance).module.code(func_index);
-                let result_tys: Vec<crate::value::ValType> = ty.results().collect();
-                let args = crate::extern_::coerce_args(&mut ctx.store_mut().inner, params, &ty)?;
-                crate::exec::host::execute(
-                    ctx.store_mut(),
-                    instance,
-                    func_index,
-                    code,
-                    args,
-                    &result_tys,
-                )?
-            }
+            Callee::Wasm(instance, func_index) => call_wasm(
+                store.as_context_mut().store_mut(),
+                instance,
+                func_index,
+                params,
+                results.len(),
+            )?,
             Callee::Host(host_index) => {
-                direct_call::call_direct_host(&mut store, host_index, params, &ty)?
+                let ty = self.ty(&store);
+                let result_tys = check_host_call(store.as_context().inner(), &ty, params, results)?;
+                let out = direct_call::call_direct_host(&mut store, host_index, params, &ty)?;
+                validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
+                out
             }
             #[cfg(feature = "async")]
             Callee::HostAsync(_) => {
+                check_host_call(
+                    store.as_context().inner(),
+                    &self.ty(&store),
+                    params,
+                    results,
+                )?;
                 return Err(crate::Error::msg(
                     "cannot call an async host function synchronously; use `call_async`",
                 ));
             }
         };
-        let result_tys: Vec<_> = ty.results().collect();
-        validate_results(store.as_context_mut().inner_mut(), &out, &result_tys)?;
         results.clone_from_slice(&out);
         Ok(())
     }
@@ -211,13 +207,64 @@ fn default_results(ty: &FuncType) -> Vec<Val> {
     ty.results().map(|t| Val::default_for_valtype(&t)).collect()
 }
 
+/// The wasm-callee half of [`Func::call`]. The signature comes from the module's per-type cache
+/// rather than being re-materialized on every call.
+fn call_wasm<T>(
+    store: &mut crate::store::Store<T>,
+    instance: Instance,
+    func_index: u32,
+    params: &[Val],
+    n_results: usize,
+) -> Result<Vec<Val>> {
+    let code = store.inner.instance(instance).module.code(func_index);
+    let module = Arc::clone(&code.module);
+    let (param_tys, result_tys) = module.func_sig(func_index)?;
+    check_call(&store.inner, params, n_results, param_tys, result_tys)?;
+    let args = crate::extern_::coerce_args(&mut store.inner, params, param_tys)?;
+    let out = crate::exec::host::execute(store, instance, func_index, code, args, result_tys)?;
+    validate_results(&mut store.inner, &out, result_tys)?;
+    Ok(out)
+}
+
+/// [`check_call`] against a host callee's signature (materialized here; host signatures aren't
+/// module-cached), returning its result types.
+fn check_host_call(
+    inner: &StoreInner,
+    ty: &FuncType,
+    params: &[Val],
+    results: &[Val],
+) -> Result<Vec<crate::value::ValType>> {
+    let (param_tys, result_tys) = ty.signature();
+    check_call(inner, params, results.len(), &param_tys, &result_tys)?;
+    Ok(result_tys)
+}
+
+/// Checks the arguments, then the results buffer's length, against a callee's signature.
+fn check_call(
+    inner: &StoreInner,
+    params: &[Val],
+    n_results: usize,
+    param_tys: &[crate::value::ValType],
+    result_tys: &[crate::value::ValType],
+) -> Result<()> {
+    check_args(inner, params, param_tys)?;
+    if n_results != result_tys.len() {
+        return Err(crate::Error::msg("wrong number of results"));
+    }
+    Ok(())
+}
+
 /// Checks the argument count and per-value types against `ty`'s parameters.
-fn check_args(inner: &StoreInner, params: &[Val], ty: &FuncType) -> Result<()> {
-    if params.len() != ty.params().len() {
+fn check_args(
+    inner: &StoreInner,
+    params: &[Val],
+    param_tys: &[crate::value::ValType],
+) -> Result<()> {
+    if params.len() != param_tys.len() {
         return Err(crate::Error::msg("wrong number of arguments"));
     }
-    for (val, pty) in params.iter().zip(ty.params()) {
-        if !crate::extern_::arg_matches_in_store(inner, val, &pty)? {
+    for (val, pty) in params.iter().zip(param_tys) {
+        if !crate::extern_::arg_matches_in_store(inner, val, pty)? {
             return Err(crate::Error::msg("argument type mismatch"));
         }
     }

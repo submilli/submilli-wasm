@@ -29,7 +29,8 @@ impl Span {
 /// Module-wide arenas for compiled code: every defined function's streams, back to back,
 /// addressed by the [`Span`]s in its [`CompiledFunc`]. Indices *within* a function
 /// (branch `ip`s, `br_table`/`br_on_cast` pool indices, `BigMemArg` pool indices) stay
-/// function-relative — the executor always works on the function's sub-slice.
+/// function-relative — the executor always works on the function's sub-slice. The exception is
+/// the `v128s` pool, indexed module-wide (still bounds-checked; no per-function span needed).
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CodeArenas {
     pub ops: Vec<Op>,
@@ -39,6 +40,9 @@ pub(crate) struct CodeArenas {
     pub big_memargs: Vec<BigMemArg>,
     /// Per-`Op` source wasm byte offsets (#29a); empty unless debug retention is on.
     pub offsets: Vec<u32>,
+    /// Pooled 16-byte SIMD immediates (`v128.const` values, `i8x16.shuffle` lanes), indexed
+    /// module-wide: inline they would widen every `Op` from 16 to 48 bytes.
+    pub v128s: Vec<[u8; 16]>,
 }
 
 /// A function compiled to internal bytecode: scalar facts plus [`Span`]s into the
@@ -91,10 +95,10 @@ impl Code {
         *self.f()
     }
 
-    /// The op stream of an already-copied record (the frame-cached fast path).
+    /// The op stream at a frame-cached span (the run loop's fast path).
     #[inline]
-    pub(crate) fn ops_of(&self, f: &CompiledFunc) -> &[Op] {
-        &self.module.code.ops[f.ops.range()]
+    pub(crate) fn ops_in(&self, span: Span) -> &[Op] {
+        &self.module.code.ops[span.range()]
     }
 
     /// The declared locals of an already-copied record (the `push_call` fast path).
@@ -133,6 +137,18 @@ impl Code {
     pub(crate) fn offsets(&self) -> Option<&[u32]> {
         let span = self.f().offsets;
         (span.len > 0).then(|| &self.module.code.offsets[span.range()])
+    }
+
+    /// A pooled SIMD immediate (see [`CodeArenas::v128s`]).
+    pub(crate) fn v128(&self, index: u32) -> crate::Result<[u8; 16]> {
+        self.module
+            .code
+            .v128s
+            .get(index as usize)
+            .copied()
+            .ok_or_else(|| {
+                crate::error::InternalError::Compiler("SIMD immediate index out of range").into()
+            })
     }
 
     #[inline]

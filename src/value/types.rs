@@ -212,7 +212,7 @@ impl FuncType {
 
     // This handle holds a reference on its type, so the lookup cannot miss while it lives; the
     // `wasmtime` signatures above have no error to report one with.
-    fn signature(&self) -> (Vec<ValType>, Vec<ValType>) {
+    pub(crate) fn signature(&self) -> (Vec<ValType>, Vec<ValType>) {
         self.engine
             .func_sig(self.id)
             .expect("live FuncType registration must retain its signature")
