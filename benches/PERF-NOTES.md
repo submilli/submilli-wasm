@@ -1127,3 +1127,27 @@ worktree and target dir: across build dirs, layout noise alone reached ±5%.
   A branchless `cmp_i32` (removing the fused compare-and-branch's second jump table) was neutral
   to −2%, and moved memory/sum (which has no such op) −6%: layout noise alone is that large, so
   only changes that remove real work (a call per op) are trusted.
+
+## 26. Session 8 — the host-call boundary after the 0.1.10 hardening
+
+The README's ~35 ns sync crossing had gone stale: bisected by instructions (load-proof) with a 2M
+`ping` loop, 0.1.9 ran 37 ns / 129 cycles per call and `d4505b9` (SUB-633 panic hardening, 0.1.10)
+68 ns; the Step 1/2 work had recovered it to ~51 ns / 181 cycles. Ablating each boundary piece
+(cycles per call) found the cost in plumbing around the new checks, not the checks:
+
+- **Host-root stack behind an `RwLock`** (`gc_roots`): marked, pushed and truncated on every call —
+  two lock/unlock pairs, ~12 cycles. The boundary holds `&mut StoreInner`, so it uses
+  `RwLock::get_mut` (`gc_roots_mut`): no atomics, same `Vec`.
+- **Parking the execution** (`swap_exec`, twice per call) moved all 184 bytes of `Execution`, 72 of
+  them the `control` slot, which is always `None` outside the dispatch loop. `swap_parked` swaps the
+  rest (exhaustive destructure; `debug_assert` of the invariant): ~9 cycles.
+- **`Arc<HostSig>` cloned into `HostCallState`** (two atomic RC ops): the state keeps the `Func` and
+  re-borrows the signature (`host_sig`; funcs are never freed while the store lives): ~7 cycles.
+- **Result validation** went through the reference-aware `val_matches_in_store` for plain numbers:
+  an inline numeric fast path decides exactly what the full check decides for them: ~4 cycles.
+- `catch_unwind` (panic containment) measured free.
+
+Result: 181 → 143 cycles per call (~1.26×); bench table `ping x100k` 5.42 → 4.34 ms, `async x100k`
+10.96 → 9.55 ms. What remains over 0.1.9 (~14 cycles) is mostly the 112-byte park/reclaim copy;
+shrinking it further means boxing the execution state (an extra load per op in the dispatch loop).
+

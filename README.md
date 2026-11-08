@@ -181,8 +181,8 @@ Cold start   coremark          59.54 us  718.62 us   98.75 us
 Run once     sieve(1k)        459.88 us    5.72 ms  823.04 us
 Run once     sieve(10k)       602.92 us    5.71 ms  926.96 us
 Run once     sieve(1M)         17.70 ms    7.30 ms   11.63 ms
-Host calls   ping x100k         5.42 ms  316.29 us    1.19 ms
-Host calls   async x100k       10.96 ms    2.53 ms        n/a
+Host calls   ping x100k         4.34 ms  316.21 us    1.16 ms
+Host calls   async x100k        9.55 ms    2.44 ms        n/a
 -------------------------------------------------------------
 CoreMark score (higher=fast)       1885      37833       3083
 ```
@@ -198,11 +198,11 @@ Reading it honestly:
   guest's own work is light (460 µs vs wasmi's 823 µs vs wasmtime's 5.7 ms), still
   win around a millisecond of guest compute (603 µs vs 927 µs), and lose the
   compute-heavy end (~1.5× behind wasmi at 1M). That's the trade we chose.
-- **The boundary is cheap, but not yet as cheap as it was.** ~54 ns per sync crossing;
-  ~110 ns async, where the premium is the suspend to a real await point plus the
-  `Box<dyn Future>` the wasmtime-style API requires. Under real IO the await dwarfs
-  all of it. (It was ~35 ns before 0.1.10's panic-hardening pass added validation
-  and GC rooting at the boundary; winning that back is on the list.)
+- **The boundary is cheap.** ~43 ns per sync crossing; ~95 ns async, where the
+  premium is the suspend to a real await point plus the `Box<dyn Future>` the
+  wasmtime-style API requires. Under real IO the await dwarfs all of it. (0.1.10's
+  panic-hardening pass — result validation and GC rooting at the boundary — took a
+  crossing from ~37 to ~68 ns; most of that is back, with every check kept.)
 - **Memory has room to improve — but look at the sizes first.** wasmi's
   variable-length IR packs code ~2× tighter than our fixed 16-byte ops, and that gap
   is real. It's also, for now, cheap: an LLM-generated module is typically tens of

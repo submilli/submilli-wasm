@@ -30,10 +30,24 @@ pub(super) struct HostCallState {
     pub(super) pending: Option<crate::value::Rooted<crate::value::ExnRef>>,
     pub(super) pending_generation: u64,
     pub(super) host_index: u32,
-    pub(super) sig: std::sync::Arc<crate::store::HostSig>,
+    /// The host function, whose signature is re-borrowed from the store where needed: holding an
+    /// `Arc<HostSig>` clone cost two atomic ref-count updates per call.
+    pub(super) func: Func,
     /// Where the results go (the popped args' slot): pinned here because a host re-entering wasm
     /// runs on the same execution and moves its stack window.
     pub(super) results_at: usize,
+}
+
+/// The signature of host function `func` (sync or async), borrowed from the store.
+fn host_sig(inner: &StoreInner, func: Func) -> Result<&crate::store::HostSig> {
+    match inner.func(func) {
+        FuncEntity::Host { sig, .. } => Ok(sig),
+        #[cfg(feature = "async")]
+        FuncEntity::HostAsync { sig, .. } => Ok(sig),
+        FuncEntity::Wasm { .. } => {
+            Err(InternalError::FrameStack("host call target is not a host function").into())
+        }
+    }
 }
 
 /// Roots every reference param for the host call's duration. `pop_params_into` removed them
@@ -44,9 +58,9 @@ pub(super) struct HostCallState {
 pub(super) fn root_ref_params(inner: &mut StoreInner, params: &[Val]) {
     for v in params {
         match v {
-            Val::AnyRef(Some(r)) => inner.push_gc_root(r.raw(), RefKind::Any),
-            Val::ExternRef(Some(r)) => inner.push_gc_root(r.raw(), RefKind::Extern),
-            Val::ExnRef(Some(r)) => inner.push_gc_root(r.raw(), RefKind::Exn),
+            Val::AnyRef(Some(r)) => inner.gc_roots_mut().push((r.raw(), RefKind::Any)),
+            Val::ExternRef(Some(r)) => inner.gc_roots_mut().push((r.raw(), RefKind::Extern)),
+            Val::ExnRef(Some(r)) => inner.gc_roots_mut().push((r.raw(), RefKind::Exn)),
             // Funcs are store entities (never collected); numerics and nulls carry no referent.
             _ => {}
         }
@@ -262,45 +276,47 @@ fn drive<T>(exec: &mut Execution, store: &mut Store<T>, run_stop: usize) -> Resu
 
 impl Execution {
     fn prep_host<T>(&mut self, store: &mut Store<T>, func: Func) -> Result<HostCallState> {
-        let (host_index, sig) = match store.inner.func(func) {
-            FuncEntity::Host {
-                sig, host_index, ..
-            } => (*host_index, sig.clone()),
+        let host_index = match store.inner.func(func) {
+            FuncEntity::Host { host_index, .. } => *host_index,
             FuncEntity::Wasm { .. } => unreachable!("HostCall only suspends on sync host funcs"),
             #[cfg(feature = "async")]
             FuncEntity::HostAsync { .. } => {
                 unreachable!("HostCall only suspends on sync host funcs")
             }
         };
-        self.prepare_host_call(store, host_index, sig)
+        self.prepare_host_call(store, func, host_index)
     }
 
     pub(super) fn prepare_host_call<T>(
         &mut self,
         store: &mut Store<T>,
+        func: Func,
         host_index: u32,
-        sig: std::sync::Arc<crate::store::HostSig>,
     ) -> Result<HostCallState> {
         let (mut params, mut results) = store.inner.take_host_scratch();
         results.clear();
-        results.extend_from_slice(&sig.result_defaults);
         params.clear();
         // Popped, the args leave the frame's live range (it now ends where the results will
         // land); the host holds them rooted (`root_ref_params`) for the call's duration. After a
         // host tail call they were the popped callee's, past this frame's end — a re-entry trims
         // the buffer there.
-        let popped = self
-            .pop_params_into(&sig.params, &mut params)
-            .and_then(|()| self.set_live_end(self.sp));
+        let popped = host_sig(&store.inner, func).and_then(|sig| {
+            results.extend_from_slice(&sig.result_defaults);
+            self.pop_params_into(&sig.params, &mut params)?;
+            self.set_live_end(self.sp)
+        });
         if let Err(error) = popped {
             store.inner.put_host_scratch(params, results);
             return Err(error);
         }
-        let roots_mark = store.inner.gc_roots_mark();
+        let roots_mark = store.inner.gc_roots_mut().len();
         let pending = store.inner.pending_exception();
         let pending_generation = store.inner.pending_exception_generation();
         if let Some(exception) = pending {
-            store.inner.push_gc_root(exception.raw(), RefKind::Exn);
+            store
+                .inner
+                .gc_roots_mut()
+                .push((exception.raw(), RefKind::Exn));
         }
         root_ref_params(&mut store.inner, &params);
         Ok(HostCallState {
@@ -310,13 +326,13 @@ impl Execution {
             pending,
             pending_generation,
             host_index,
-            sig,
+            func,
             results_at: self.sp,
         })
     }
 
     pub(super) fn discard_host_call<T>(store: &mut Store<T>, state: HostCallState) {
-        store.inner.gc_roots_truncate(state.roots_mark);
+        store.inner.gc_roots_mut().truncate(state.roots_mark);
         store.inner.put_host_scratch(state.params, state.results);
     }
 
@@ -352,12 +368,14 @@ impl Execution {
             Self::discard_host_call(store, state);
             return Err(error);
         }
-        if let Err(error) = crate::extern_::ensure_values_match(
-            &store.inner,
-            &state.results,
-            &state.sig.results,
-            "function attempted to return an incompatible value",
-        ) {
+        if let Err(error) = host_sig(&store.inner, state.func).and_then(|sig| {
+            crate::extern_::ensure_values_match(
+                &store.inner,
+                &state.results,
+                &sig.results,
+                "function attempted to return an incompatible value",
+            )
+        }) {
             store
                 .inner
                 .restore_pending_exception(state.pending, state.pending_generation);

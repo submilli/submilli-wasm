@@ -189,7 +189,7 @@ impl StoreInner {
     /// so the second swap always reclaims the (possibly updated) shared execution.
     #[inline]
     pub(crate) fn swap_exec(&mut self, exec: &mut crate::exec::Execution) {
-        std::mem::swap(&mut self.exec_slot, exec);
+        self.exec_slot.swap_parked(exec);
     }
 
     /// The parked execution (frames back `WasmBacktrace::capture`); empty outside a host call.

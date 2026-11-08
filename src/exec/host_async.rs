@@ -169,12 +169,10 @@ impl Execution {
     /// Sync front half of an async host call: decodes args into the reused buffers and returns
     /// everything the await needs. Same shape as `invoke_host`.
     fn prep_host_async<T>(&mut self, store: &mut Store<T>, func: Func) -> Result<HostCallState> {
-        let (host_index, sig) = match store.inner.func(func) {
-            FuncEntity::HostAsync {
-                sig, host_index, ..
-            } => (*host_index, sig.clone()),
+        let host_index = match store.inner.func(func) {
+            FuncEntity::HostAsync { host_index, .. } => *host_index,
             _ => unreachable!("HostAsync only suspends on async host funcs"),
         };
-        self.prepare_host_call(store, host_index, sig)
+        self.prepare_host_call(store, func, host_index)
     }
 }

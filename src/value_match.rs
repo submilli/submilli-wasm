@@ -186,7 +186,16 @@ pub(crate) fn ensure_values_match(
         return Err(crate::error::InternalError::ResultShape(context).into());
     }
     for (value, ty) in values.iter().zip(types) {
-        if !val_matches_in_store(inner, value, ty)? {
+        // A number matches exactly its own type — `val_matches_in_store` decides no more for
+        // it; inline here because every host-call result passes through (~6% of a host call).
+        let numeric = matches!(
+            (value, ty),
+            (Val::I32(_), ValType::I32)
+                | (Val::I64(_), ValType::I64)
+                | (Val::F32(_), ValType::F32)
+                | (Val::F64(_), ValType::F64)
+        );
+        if !numeric && !val_matches_in_store(inner, value, ty)? {
             return Err(crate::error::InternalError::ResultShape(context).into());
         }
     }

@@ -375,6 +375,16 @@ impl StoreInner {
             .push((handle, kind));
     }
 
+    /// The host-root stack itself, for paths holding the store mutably: `RwLock::get_mut` needs no
+    /// lock. The sync host-call boundary marks, pushes and truncates on every call, and the locked
+    /// forms (two atomic lock/unlock pairs per call) cost ~7% of a host call.
+    #[inline]
+    pub(crate) fn gc_roots_mut(&mut self) -> &mut Vec<(u32, crate::canon::RefKind)> {
+        self.gc_roots
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The current host-root high-water mark (recorded by `RootScope::new`).
     pub(crate) fn gc_roots_mark(&self) -> usize {
         self.gc_roots

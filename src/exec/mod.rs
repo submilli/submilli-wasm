@@ -198,6 +198,36 @@ impl Execution {
         self.is_empty() && self.native_charge == 0 && self.control.is_none() && self.code.is_none()
     }
 
+    /// Swaps everything but `control` with `other` — the per-host-call park/unpark
+    /// (`StoreInner::swap_exec`). `control` is `None` on both sides there (the run loop takes it
+    /// before acting on it), so leaving it in place changes nothing, but skips 72 of the struct's
+    /// 184 bytes on the four copies a host call makes (~5% of a host call). The destructuring is
+    /// exhaustive: a new field fails to compile until it is swapped here too.
+    pub(crate) fn swap_parked(&mut self, other: &mut Execution) {
+        debug_assert!(self.control.is_none() && other.control.is_none());
+        let Execution {
+            slots,
+            frames,
+            native_charge,
+            floor,
+            control: _,
+            sp,
+            mem0,
+            code,
+            stack_limit,
+            gates_passed,
+        } = self;
+        std::mem::swap(slots, &mut other.slots);
+        std::mem::swap(frames, &mut other.frames);
+        std::mem::swap(native_charge, &mut other.native_charge);
+        std::mem::swap(floor, &mut other.floor);
+        std::mem::swap(sp, &mut other.sp);
+        std::mem::swap(mem0, &mut other.mem0);
+        std::mem::swap(code, &mut other.code);
+        std::mem::swap(stack_limit, &mut other.stack_limit);
+        std::mem::swap(gates_passed, &mut other.gates_passed);
+    }
+
     /// Heap bytes held by the stacks' capacity (bounds what a store keeps between calls).
     pub(crate) fn retained_bytes(&self) -> usize {
         let slots = self

@@ -56,8 +56,8 @@ Cold start   coremark          59.54 us  718.62 us   98.75 us
 Run once     sieve(1k)        459.88 us    5.72 ms  823.04 us
 Run once     sieve(10k)       602.92 us    5.71 ms  926.96 us
 Run once     sieve(1M)         17.70 ms    7.30 ms   11.63 ms
-Host calls   ping x100k         5.42 ms  316.29 us    1.19 ms
-Host calls   async x100k       10.96 ms    2.53 ms        n/a
+Host calls   ping x100k         4.34 ms  316.21 us    1.16 ms
+Host calls   async x100k        9.55 ms    2.44 ms        n/a
 -------------------------------------------------------------
 CoreMark score (higher=fast)       1885      37833       3083
 ```
