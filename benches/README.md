@@ -43,23 +43,23 @@ absolutes. Lower = faster, except the CoreMark score (higher = faster).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark          51.12 us  792.71 us  100.71 us
-Module::new  pulldown-cmark     1.11 ms   22.16 ms    2.31 ms
-Module::new  spidermonkey      23.81 ms  192.81 ms   54.18 ms
-Module RAM   coremark          66.4 KiB  78.8 KiB*   30.2 KiB
+Module::new  coremark          57.62 us  732.00 us   97.12 us
+Module::new  pulldown-cmark     1.23 ms   22.64 ms    2.30 ms
+Module::new  spidermonkey      26.29 ms  196.80 ms   51.51 ms
+Module RAM   coremark          67.4 KiB  78.8 KiB*   30.2 KiB
 Module RAM   pulldown-cmark     1.5 MiB   1.4 MiB*  841.1 KiB
-Module RAM   spidermonkey      31.0 MiB   3.8 MiB*   16.5 MiB
-Module RAM   run-once         503.6 KiB  63.8 KiB*  216.7 KiB
+Module RAM   spidermonkey      31.1 MiB   3.8 MiB*   16.5 MiB
+Module RAM   run-once         503.8 KiB  63.8 KiB*  216.7 KiB
                             (* metadata only: wasmtime JIT code is mmap'd)
 Store::new                         0 ns     125 ns       0 ns
-Cold start   coremark          52.04 us  769.25 us  100.83 us
-Run once     sieve(1k)        468.96 us    5.72 ms  837.17 us
-Run once     sieve(10k)       918.71 us    5.86 ms  919.58 us
-Run once     sieve(1M)         57.39 ms    7.23 ms   11.30 ms
-Host calls   ping x100k         3.52 ms  325.92 us    1.15 ms
-Host calls   async x100k        7.33 ms    2.69 ms        n/a
+Cold start   coremark          59.54 us  718.62 us   98.75 us
+Run once     sieve(1k)        459.88 us    5.72 ms  823.04 us
+Run once     sieve(10k)       602.92 us    5.71 ms  926.96 us
+Run once     sieve(1M)         17.70 ms    7.30 ms   11.63 ms
+Host calls   ping x100k         5.42 ms  316.29 us    1.19 ms
+Host calls   async x100k       10.96 ms    2.53 ms        n/a
 -------------------------------------------------------------
-CoreMark score (higher=fast)        715      36996       3032
+CoreMark score (higher=fast)       1885      37833       3083
 ```
 
 The story: submilli's `Module::new`/cold-start beats wasmtime **~5–16×** (it

@@ -159,7 +159,8 @@ calls (sync and async), and "compile + instantiate + run once" end to end** — 
 instruction throughput as one row among many, not the headline.
 
 Numbers from the in-repo cross-engine benchmark, on one Apple Silicon dev machine —
-treat them as ratios. Every cell measures the same work: wasmtime runs Cranelift with
+treat them as ratios (the CoreMark row is self-timed and load-sensitive: best of
+several runs). Every cell measures the same work: wasmtime runs Cranelift with
 optimization *disabled* (the fairest floor for a startup comparison), wasmi runs eager
 compilation, and both non-JIT engines run with debug retention off. The fairness
 reasoning for each knob is in [`benches/README.md`](benches/README.md).
@@ -167,38 +168,41 @@ reasoning for each knob is in [`benches/README.md`](benches/README.md).
 ```
 phase                          submilli   wasmtime      wasmi
 -------------------------------------------------------------
-Module::new  coremark          51.12 us  792.71 us  100.71 us
-Module::new  pulldown-cmark     1.11 ms   22.16 ms    2.31 ms
-Module::new  spidermonkey      23.81 ms  192.81 ms   54.18 ms
-Module RAM   coremark          66.4 KiB  78.8 KiB*   30.2 KiB
+Module::new  coremark          57.62 us  732.00 us   97.12 us
+Module::new  pulldown-cmark     1.23 ms   22.64 ms    2.30 ms
+Module::new  spidermonkey      26.29 ms  196.80 ms   51.51 ms
+Module RAM   coremark          67.4 KiB  78.8 KiB*   30.2 KiB
 Module RAM   pulldown-cmark     1.5 MiB   1.4 MiB*  841.1 KiB
-Module RAM   spidermonkey      31.0 MiB   3.8 MiB*   16.5 MiB
-Module RAM   run-once         503.6 KiB  63.8 KiB*  216.7 KiB
+Module RAM   spidermonkey      31.1 MiB   3.8 MiB*   16.5 MiB
+Module RAM   run-once         503.8 KiB  63.8 KiB*  216.7 KiB
                             (* metadata only: wasmtime JIT code is mmap'd)
 Store::new                         0 ns     125 ns       0 ns
-Cold start   coremark          52.04 us  769.25 us  100.83 us
-Run once     sieve(1k)        468.96 us    5.72 ms  837.17 us
-Run once     sieve(10k)       918.71 us    5.86 ms  919.58 us
-Run once     sieve(1M)         57.39 ms    7.23 ms   11.30 ms
-Host calls   ping x100k         3.52 ms  325.92 us    1.15 ms
-Host calls   async x100k        7.33 ms    2.69 ms        n/a
+Cold start   coremark          59.54 us  718.62 us   98.75 us
+Run once     sieve(1k)        459.88 us    5.72 ms  823.04 us
+Run once     sieve(10k)       602.92 us    5.71 ms  926.96 us
+Run once     sieve(1M)         17.70 ms    7.30 ms   11.63 ms
+Host calls   ping x100k         5.42 ms  316.29 us    1.19 ms
+Host calls   async x100k       10.96 ms    2.53 ms        n/a
 -------------------------------------------------------------
-CoreMark score (higher=fast)        715      36996       3032
+CoreMark score (higher=fast)       1885      37833       3083
 ```
 
 Reading it honestly:
 
-- **Compilation is what we optimized for**, and on this benchmark it shows: 8–20×
-  faster than wasmtime, ~2× faster than eager wasmi, sitting ~1.4× above the raw
-  `wasmparser` validation floor. Cold-starting a small module takes ~52 µs.
+- **Compilation is what we optimized for**, and on this benchmark it shows: 7–18×
+  faster than wasmtime, 1.7–2× faster than eager wasmi, sitting under 2× the raw
+  `wasmparser` validation floor (validation is ~55% of `Module::new`). Cold-starting
+  a small module takes ~60 µs.
 - **"Run once" is our actual metric** — linker + compile + store + instantiate +
   execute, nothing reused, on a module that runs all of its code. We win while the
-  guest's own work is light (469 µs vs wasmi's 837 µs vs wasmtime's 5.7 ms), tie
-  wasmi around a millisecond of guest compute, and lose the compute-heavy end. That's
-  the trade we chose.
-- **The boundary is cheap.** ~35 ns per sync crossing; ~73 ns async, where the
-  premium is the suspend to a real await point plus the `Box<dyn Future>` the
-  wasmtime-style API requires. Under real IO the await dwarfs all of it.
+  guest's own work is light (460 µs vs wasmi's 823 µs vs wasmtime's 5.7 ms), still
+  win around a millisecond of guest compute (603 µs vs 927 µs), and lose the
+  compute-heavy end (~1.5× behind wasmi at 1M). That's the trade we chose.
+- **The boundary is cheap, but not yet as cheap as it was.** ~54 ns per sync crossing;
+  ~110 ns async, where the premium is the suspend to a real await point plus the
+  `Box<dyn Future>` the wasmtime-style API requires. Under real IO the await dwarfs
+  all of it. (It was ~35 ns before 0.1.10's panic-hardening pass added validation
+  and GC rooting at the boundary; winning that back is on the list.)
 - **Memory has room to improve — but look at the sizes first.** wasmi's
   variable-length IR packs code ~2× tighter than our fixed 16-byte ops, and that gap
   is real. It's also, for now, cheap: an LLM-generated module is typically tens of
@@ -206,10 +210,13 @@ Reading it honestly:
   ~500 KiB resident), so you fit thousands per gigabyte either way. Denser encoding
   is on the list, just not next — where memory actually bites at runtime is the GC
   heap, which is why it gets its own section below.
-- **Pure execution is where we pay.** A JIT beats us ~50× on CoreMark and wasmi's
-  register IR ~4× — wasmi has spent years earning that, and we're not pretending
-  otherwise. We paid the price on the axis our workload uses least, and tuned the
-  interpreter ~3.5× along the way.
+- **Pure execution is where we pay.** A JIT beats us ~20× on CoreMark and wasmi's
+  register IR ~1.6× in this table (against wasmi 2.0 built the way
+  [wasm.fyi](https://wasm.fyi) builds it, with SIMD, we measure 2.5–3× across its
+  workloads) — wasmi has spent years earning that, and we're not pretending
+  otherwise. We paid the price on the axis our workload uses least: execution is
+  slot-addressed register IR in safe Rust (every slot access bounds-checked, no
+  `unsafe`), and CoreMark went 715 → ~1900 since this table was first published.
 
 ## The GC, briefly
 
@@ -233,16 +240,17 @@ hot-path cost.
   a request to every store, honored at amortized safepoints (every 1024 guest calls
   and after each async host call, never per instruction); and whenever you call
   `Store::gc()` yourself.
-- **Roots without tags**: the operand stack is untyped 8-byte cells for speed, with
-  a one-byte-per-slot shadow recording which slots hold references — the collector
-  reads the shadow, so the interpreter never pays for GC bookkeeping in its value
-  representation.
+- **Roots without typed values**: operand slots are untyped 8-byte cells for speed
+  (16 with the `simd` feature), each with a one-byte shadow tag recording whether it
+  holds a reference — the collector reads the tags, so values carry no type and the
+  interpreter's only GC bookkeeping is writing that byte.
 
 ## Things worth knowing before embedding
 
-- The dispatch loop is generic over your `Store<T>` data type (that's how sync host
-  calls run loop-resident). It means the interpreter monomorphizes in *your* crate,
-  once per store type — a little compile time traded for a much cheaper boundary.
+- The dispatch loop is compiled once, inside this crate — not per `Store<T>` data
+  type in yours (sync host calls reach your `T` through a trait object). So its
+  speed and native stack use don't depend on your crate's opt level: a common
+  `[profile.dev.package."*"] opt-level = 3` setup gets the optimized interpreter.
 - Backtraces are the default (wasmtime-compatible) and they're priced honestly: the
   per-op offset table behind them costs ~20% module RAM and ~10% startup. Density-
   sensitive deployments turn it off with `Config::wasm_backtrace(false)`.
