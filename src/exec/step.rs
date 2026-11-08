@@ -11,7 +11,7 @@ use super::stack::{Bin, Un};
 use super::{arith, cell, convert, memory, Execution, StepOutcome, CONTROL};
 use crate::instance::Instance;
 use crate::module::code::Code;
-use crate::module::op::{CmpKind, Op, Slot};
+use crate::module::op::{BranchTarget, CmpKind, Op, Slot};
 use crate::store::StoreInner;
 use crate::trap::Trap;
 use crate::Result;
@@ -66,22 +66,17 @@ impl Execution {
                 let v = self.take_typed(slot(base, *s), inner.global(handle).ty.content())?;
                 inner.global_mut(handle).value = v;
             }
-            Op::Br(t, s) => {
-                self.take_branch(*t, slot(base, *s))?;
-                return Ok(t.ip);
-            }
+            Op::Br(t, s) => return self.branch_to(*t, slot(base, *s)),
             Op::BrIf(t, s) => {
                 let at = slot(base, *s);
                 if self.cond_at(at)? != 0 {
-                    self.take_branch(*t, at)?;
-                    return Ok(t.ip);
+                    return self.branch_to(*t, at);
                 }
             }
             Op::BrIfNot(t, s) => {
                 let at = slot(base, *s);
                 if self.cond_at(at)? == 0 {
-                    self.take_branch(*t, at)?;
-                    return Ok(t.ip);
+                    return self.branch_to(*t, at);
                 }
             }
             Op::BrIfCmp {
@@ -123,9 +118,7 @@ impl Execution {
                 ))?;
                 let at = slot(base, *s);
                 let i = self.cond_at(at)? as u32 as usize;
-                let t = cases.get(i).unwrap_or(default);
-                self.take_branch(*t, at)?;
-                return Ok(t.ip);
+                return self.branch_to(*cases.get(i).unwrap_or(default), at);
             }
             // The run loop makes the call (it re-reads the op): see `CALL_INTERNAL`.
             Op::CallInternal(..) => return Ok(CALL_INTERNAL),
@@ -692,6 +685,18 @@ impl Execution {
                 "op has no operand window",
             ))?;
         self.enter_window(slot(base, top))
+    }
+
+    /// Takes branch `t` (its condition/index operand at `at`) and returns the target ip. The usual
+    /// keep-nothing branch moves nothing, so it is tested here: left to `take_branch` it cost an
+    /// out-of-line call on every loop back-edge (CoreMark/memory loops ~5%, PERF-NOTES §25).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn branch_to(&mut self, t: BranchTarget, at: usize) -> Result<u32> {
+        if t.keep != 0 {
+            self.take_branch(t, at)?;
+        }
+        Ok(t.ip)
     }
 
     /// Leaves `outcome` for the run loop and returns the [`CONTROL`] marker.

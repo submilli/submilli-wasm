@@ -209,6 +209,10 @@ impl Execution {
     }
 
     /// An `N`-byte load from the address at slot `at` (the caller writes the result over it).
+    /// Inlined into each load arm: out of line, every load paid a call/return plus a stack
+    /// round-trip for the `Result<[u8; N]>` (~1.05–1.1× on memory-heavy loops, PERF-NOTES §25).
+    #[allow(clippy::inline_always)] // one hot caller per load inside the fused dispatch
+    #[inline(always)]
     pub(super) fn load_at<const N: usize>(
         &mut self,
         inner: &StoreInner,
@@ -257,6 +261,9 @@ impl Execution {
     }
 
     /// An `N`-byte store of `data` (the value operand at `at + 1`) to the address at slot `at`.
+    /// Inlined like [`Execution::load_at`].
+    #[allow(clippy::inline_always)] // one hot caller per store inside the fused dispatch
+    #[inline(always)]
     pub(super) fn store_at<const N: usize>(
         &mut self,
         inner: &mut StoreInner,

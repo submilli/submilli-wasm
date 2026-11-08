@@ -1077,3 +1077,31 @@ worth CoreMark 1.06×, memory_tree 1.04×, linked_list 1.045×, fib 1.02×.
 
 **Cost of the stack-bound fixes** (`d90c40c`, `bfd51b9`): the thread-local native-stack entry on
 every `Func::call` costs tiny ~8% instructions / ~4% cycles per call; nothing else moved.
+
+## 25. Session 8 — instrumented dispatch costs: out-of-line calls on the hot path
+
+Method (instrumentation, not sampling): a scratch build counting every executed op (histogram,
+adjacent pairs, taken-branch rate, hottest sites with their IR), plus exact per-op machine
+instruction counts read from the disassembly of `dispatch_loop` (the jump table in
+`__TEXT,__const`, each arm's fast path walked by hand). A/B baselines are built from the same
+worktree and target dir: across build dirs, layout noise alone reached ±5%.
+
+- **Op mix.** CoreMark: `I32AddImm` 14%, `I32Load` 10%, `Copy` 10%, `I32Add` 8%, `BrIf` 7%
+  (92% taken); loads+stores ~30%. memory_tree's loop is 10 ops/iteration, memory/sum's 5, with
+  nothing left to fuse; CoreMark's hottest copies (a list reversal) are already at the minimum
+  for a register IR. The gap to wasmi there is cost per op, not op count.
+- **Per-op cost.** Dispatch head 11 instructions; `I32Const` 15, `Copy` 18, `I32AddImm` 25,
+  `I32Add` 33 more. But a taken `BrIf` called `take_branch` out of line even when the branch keeps
+  nothing (almost every loop back-edge), and every scalar load/store called `load_at`/`store_at`
+  out of line, returning `Result<[u8; N]>` through the stack: `I32Load` cost ~76 instructions.
+- **Fix:** test the keep-nothing case in the arm (`branch_to`) and inline `load_at`/`store_at`.
+  CoreMark 1.10×, memory_tree 1.09×, memory/sum 1.09×, linked_list 1.05×, fib/tiny flat.
+  `dispatch_loop`'s native frame (live under every host re-entry, so charged per re-entry) is
+  unchanged or smaller at opt-level 3 (0x320–0x350 bytes). At opt-level 1 it grows ~0.9 KB (fewer
+  nested host↔wasm re-entries fit in `max_wasm_stack`; still measured, so it fails closed). At
+  opt-level 0 only `step`'s out-of-line frame grows, which is never live under a re-entry.
+- **What costs cycles on the M4 Pro is taken branches, not instructions.** Refuted: single-store
+  slot writes (so a 16-byte `Copy` read could forward from one store) — neutral; a tighter
+  memory-0 load path that removed 11 more instructions per load — neutral. Removing a call/return
+  pair gained 5–10%; disabling LLVM tail merging globally (arms jump to shared write-back tails)
+  gained another 4–7% on CoreMark/linked_list — but that is a compiler flag a library can't set.
