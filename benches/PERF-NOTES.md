@@ -1096,12 +1096,28 @@ worktree and target dir: across build dirs, layout noise alone reached ±5%.
   out of line, returning `Result<[u8; N]>` through the stack: `I32Load` cost ~76 instructions.
 - **Fix:** test the keep-nothing case in the arm (`branch_to`) and inline `load_at`/`store_at`.
   CoreMark 1.10×, memory_tree 1.09×, memory/sum 1.09×, linked_list 1.05×, fib/tiny flat.
-  `dispatch_loop`'s native frame (live under every host re-entry, so charged per re-entry) is
-  unchanged or smaller at opt-level 3 (0x320–0x350 bytes). At opt-level 1 it grows ~0.9 KB (fewer
-  nested host↔wasm re-entries fit in `max_wasm_stack`; still measured, so it fails closed). At
-  opt-level 0 only `step`'s out-of-line frame grows, which is never live under a re-entry.
-- **What costs cycles on the M4 Pro is taken branches, not instructions.** Refuted: single-store
+- **Frame cost.** `dispatch_loop`'s native frame is live under every host re-entry, so it is
+  charged per re-entry. At opt-level 3 the forced inlines leave it unchanged (0x320–0x350 bytes);
+  at opt-level 1, which doesn't share stack slots across inlined code, they grew it (0xa30 →
+  0xda0). So `build.rs` sets `cfg(submilli_inline_hot)` only at opt-level 2/3 and the forced
+  inlines key on it.
+- **Mixed profiles.** `dispatch_loop` is generic over the store's data type, so it is compiled in
+  the embedder's crate at the embedder's opt level. With `[profile.dev.package."*"] opt-level = 3`
+  and the embedder at 0, the forced inlines land in an unoptimized loop: per-crossing native use
+  42.9 KB before this section, 48.7 KB after (still under the 64 KiB one-crossing headroom
+  `tests/stack_limit.rs` assumes).
+- **Tried and dropped: forcing the typed arithmetic wrappers inline** (`i64_binop`, `f64_relop`,
+  …). Whether LLVM inlines them depends on the instantiating binary (the bench left every i64/f64
+  binop/relop as a call; the reentry test binary didn't). Forcing them gave the bench memory/sum
+  1.10×, memory_tree 1.04×, fib 1.03× — but in the mixed profile above it grew a crossing to
+  108 KB, past the 64 KiB headroom. A dispatch loop compiled once inside this crate (not generic
+  over `T`) would make both deterministic.
+- **What costs cycles on the M4 Pro is out-of-line calls and taken branches, not instructions.**
+  Refuted: single-store
   slot writes (so a 16-byte `Copy` read could forward from one store) — neutral; a tighter
   memory-0 load path that removed 11 more instructions per load — neutral. Removing a call/return
   pair gained 5–10%; disabling LLVM tail merging globally (arms jump to shared write-back tails)
   gained another 4–7% on CoreMark/linked_list — but that is a compiler flag a library can't set.
+  A branchless `cmp_i32` (removing the fused compare-and-branch's second jump table) was neutral
+  to −2%, and moved memory/sum (which has no such op) −6%: layout noise alone is that large, so
+  only changes that remove real work (a call per op) are trusted.
