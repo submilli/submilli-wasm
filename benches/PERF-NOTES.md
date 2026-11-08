@@ -1101,17 +1101,23 @@ worktree and target dir: across build dirs, layout noise alone reached ±5%.
   at opt-level 1, which doesn't share stack slots across inlined code, they grew it (0xa30 →
   0xda0). So `build.rs` sets `cfg(submilli_inline_hot)` only at opt-level 2/3 and the forced
   inlines key on it.
-- **Mixed profiles.** `dispatch_loop` is generic over the store's data type, so it is compiled in
-  the embedder's crate at the embedder's opt level. With `[profile.dev.package."*"] opt-level = 3`
-  and the embedder at 0, the forced inlines land in an unoptimized loop: per-crossing native use
-  42.9 KB before this section, 48.7 KB after (still under the 64 KiB one-crossing headroom
-  `tests/stack_limit.rs` assumes).
-- **Tried and dropped: forcing the typed arithmetic wrappers inline** (`i64_binop`, `f64_relop`,
-  …). Whether LLVM inlines them depends on the instantiating binary (the bench left every i64/f64
-  binop/relop as a call; the reentry test binary didn't). Forcing them gave the bench memory/sum
-  1.10×, memory_tree 1.04×, fib 1.03× — but in the mixed profile above it grew a crossing to
-  108 KB, past the 64 KiB headroom. A dispatch loop compiled once inside this crate (not generic
-  over `T`) would make both deterministic.
+- **Mixed profiles, and a non-generic loop.** `dispatch_loop` was generic over the store's data
+  type, so it compiled in the embedder's crate at the embedder's opt level. With
+  `[profile.dev.package."*"] opt-level = 3` and the embedder at 0 the forced inlines landed in an
+  unoptimized loop (48.7 KB per host↔wasm crossing; forcing the arithmetic wrappers too made it
+  108 KB, past the 64 KiB one-crossing headroom `tests/stack_limit.rs` assumes), and which helpers
+  got inlined depended on the instantiating binary. The loop now takes the store as a `HostStore`
+  trait object (its one typed operation is the sync host call, a virtual call), so it is compiled
+  once, here. Moving the loop exposed LLVM leaving `mem_ea` and `finish_return` out of line in
+  this crate's codegen, so the hot helpers carry explicit (`submilli_inline_hot`) inlines,
+  arithmetic wrappers included. Per crossing (downstream crate, ping-pong re-entry): mixed
+  48.7 → 8.1 KB (11 → 63 nested re-entries at the default budget); uniform opt-level 0 and 3
+  ≈unchanged (10.2 → 10.4 / 2.9 KB). Speed vs `307fcff`: fib 1.06×, memory_tree 1.02×, others flat; host
+  call 51.8 → 50.8 ns.
+- **Tried first: exiting the loop for each sync host call** (a thin generic driver makes the call
+  and re-enters). It took the loop frame off the re-entry path (2.0 KB per crossing at
+  opt-level 3), but the exit/re-entry cost ~20 cycles: host calls 51.7 → 56.4 ns, and host calls
+  are the IO-heavy product workload.
 - **What costs cycles on the M4 Pro is out-of-line calls and taken branches, not instructions.**
   Refuted: single-store
   slot writes (so a 16-byte `Copy` read could forward from one store) — neutral; a tighter

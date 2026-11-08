@@ -342,7 +342,9 @@ impl super::Execution {
     /// Returns from the current frame: its `n_results` results (at its operand base — static
     /// heights put them there) move to the frame base, the caller's results position. Returns true
     /// if the frame stack has fallen back to `stop_depth` (the call this `run` drove finished).
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     pub(super) fn do_return(&mut self, n_results: u32, stop_depth: usize) -> crate::Result<bool> {
         if self.frames.len() <= stop_depth {
             return Err(InternalError::FrameStack("invalid return boundary").into());
@@ -367,7 +369,9 @@ impl super::Execution {
         self.finish_return(src, dst, n, stop_depth)
     }
 
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     fn finish_return(
         &mut self,
         src: usize,

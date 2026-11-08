@@ -258,7 +258,9 @@ impl Execution {
 
     /// An index/length/address operand at slot `at`, widened to `u64`. `is_64` (from the target
     /// memory/table's type) selects the width — there is no runtime tag to read (#42).
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     pub(super) fn index_at(&self, at: usize, is_64: bool) -> Result<u64> {
         let cell = self.scalar_at(at)?;
         Ok(if is_64 {
@@ -281,7 +283,9 @@ impl Execution {
     }
 
     /// Consumes the i32 condition/index at slot `at` (the stack top).
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     pub(super) fn cond_at(&self, at: usize) -> Result<i32> {
         let v = self.scalar_at(at)?.unwrap_i32();
         Ok(v)
@@ -333,7 +337,9 @@ impl Execution {
 
     /// Binary scalar op: `dst` ← `f(lhs, rhs)` (operands read before the result is written, so
     /// `dst` may alias either).
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     pub(super) fn binop_at(
         &mut self,
         (dst, lhs, rhs): Bin,
@@ -355,7 +361,9 @@ impl Execution {
     }
 
     /// Unary scalar op: `dst` ← `f(src)`.
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     pub(super) fn unop_at(&mut self, (dst, src): Un, f: impl FnOnce(Cell) -> Cell) -> Result<()> {
         let a = self.scalar_at(src)?;
         self.set_scalar(dst, f(a))

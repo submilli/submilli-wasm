@@ -393,7 +393,7 @@ Trap (enum, downcast from Error); WasmBacktrace; Error, Result, bail!, ensure!, 
 - **`Caller<'_, T>`** is passed as the optional first parameter; gives `data()/data_mut()` and `get_export("memory")` to read/write guest memory. Implements `AsContext[Mut]`.
 - Host fns return our `Result<_>` (= `Result<_, Error>`); `Err` unwinds wasm as a trap and surfaces from the outer `call` (recover a specific `Trap` via `err.downcast_ref::<Trap>()`).
 
-When a host function is invoked, the interpreter pushes a host-call boundary, runs the Rust closure, and pushes results back onto the operand stack. (Sync host calls do not suspend; async ones can — §11.)
+When a host function is invoked, the interpreter pushes a host-call boundary, runs the Rust closure, and pushes results back onto the operand stack. (Sync host calls do not suspend; async ones can — §11.) Sync host calls run *inside* the dispatch loop, yet the loop is not generic over the store's data type `T`: it takes the store as a `HostStore` trait object whose one typed operation is the host call (a virtual call per host call). So the loop is compiled once, in this crate, at this crate's opt level, rather than in each embedder's crate at theirs — which makes its inlining (and its native frame, live under every host re-entry) independent of the embedder crate's opt level, e.g. with dependencies optimized and the embedder at opt-level 0 (barring cross-crate LTO, which re-optimizes at link time).
 
 ## 11. Async & resumability
 

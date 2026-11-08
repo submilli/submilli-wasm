@@ -114,27 +114,36 @@ pub(super) fn div_s_i64(a: i64, b: i64) -> Result<i64> {
     }
 }
 
+// The infallible typed wrappers are forced inline (opt-level 2/3, see build.rs): each has one hot
+// arm in the dispatch, and LLVM's budget there leaves some out of line (a call per op, PERF-NOTES
+// §25).
+#[allow(clippy::inline_always)]
 impl Execution {
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn i32_binop(&mut self, at: Bin, f: impl Fn(i32, i32) -> i32) -> Result<()> {
         self.binop_at(at, |a, b| Cell::from_i32(f(a.unwrap_i32(), b.unwrap_i32())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn i32_unop(&mut self, at: Un, f: impl Fn(i32) -> i32) -> Result<()> {
         self.unop_at(at, |a| Cell::from_i32(f(a.unwrap_i32())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn i32_relop(&mut self, at: Bin, f: impl Fn(i32, i32) -> bool) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(i32::from(f(a.unwrap_i32(), b.unwrap_i32())))
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn u32_binop(&mut self, at: Bin, f: impl Fn(u32, u32) -> u32) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(f(a.unwrap_i32() as u32, b.unwrap_i32() as u32) as i32)
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn u32_relop(&mut self, at: Bin, f: impl Fn(u32, u32) -> bool) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(i32::from(f(a.unwrap_i32() as u32, b.unwrap_i32() as u32)))
@@ -163,26 +172,31 @@ impl Execution {
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn i64_binop(&mut self, at: Bin, f: impl Fn(i64, i64) -> i64) -> Result<()> {
         self.binop_at(at, |a, b| Cell::from_i64(f(a.unwrap_i64(), b.unwrap_i64())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn i64_unop(&mut self, at: Un, f: impl Fn(i64) -> i64) -> Result<()> {
         self.unop_at(at, |a| Cell::from_i64(f(a.unwrap_i64())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn i64_relop(&mut self, at: Bin, f: impl Fn(i64, i64) -> bool) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(i32::from(f(a.unwrap_i64(), b.unwrap_i64())))
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn u64_binop(&mut self, at: Bin, f: impl Fn(u64, u64) -> u64) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i64(f(a.unwrap_i64() as u64, b.unwrap_i64() as u64) as i64)
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn u64_relop(&mut self, at: Bin, f: impl Fn(u64, u64) -> bool) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(i32::from(f(a.unwrap_i64() as u64, b.unwrap_i64() as u64)))
@@ -211,6 +225,7 @@ impl Execution {
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f32_arith(&mut self, at: Bin, f: impl Fn(f32, f32) -> f32) -> Result<()> {
         self.binop_at(at, |ac, bc| {
             let (a, b) = (ac.unwrap_f32(), bc.unwrap_f32());
@@ -218,14 +233,17 @@ impl Execution {
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f32_binop(&mut self, at: Bin, f: impl Fn(f32, f32) -> f32) -> Result<()> {
         self.binop_at(at, |a, b| Cell::from_f32(f(a.unwrap_f32(), b.unwrap_f32())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f32_unop(&mut self, at: Un, f: impl Fn(f32) -> f32) -> Result<()> {
         self.unop_at(at, |a| Cell::from_f32(f(a.unwrap_f32())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f32_unop_canon(&mut self, at: Un, f: impl Fn(f32) -> f32) -> Result<()> {
         self.unop_at(at, |ac| {
             let a = ac.unwrap_f32();
@@ -233,12 +251,14 @@ impl Execution {
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f32_relop(&mut self, at: Bin, f: impl Fn(f32, f32) -> bool) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(i32::from(f(a.unwrap_f32(), b.unwrap_f32())))
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f64_arith(&mut self, at: Bin, f: impl Fn(f64, f64) -> f64) -> Result<()> {
         self.binop_at(at, |ac, bc| {
             let (a, b) = (ac.unwrap_f64(), bc.unwrap_f64());
@@ -246,14 +266,17 @@ impl Execution {
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f64_binop(&mut self, at: Bin, f: impl Fn(f64, f64) -> f64) -> Result<()> {
         self.binop_at(at, |a, b| Cell::from_f64(f(a.unwrap_f64(), b.unwrap_f64())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f64_unop(&mut self, at: Un, f: impl Fn(f64) -> f64) -> Result<()> {
         self.unop_at(at, |a| Cell::from_f64(f(a.unwrap_f64())))
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f64_unop_canon(&mut self, at: Un, f: impl Fn(f64) -> f64) -> Result<()> {
         self.unop_at(at, |ac| {
             let a = ac.unwrap_f64();
@@ -261,6 +284,7 @@ impl Execution {
         })
     }
 
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     pub(super) fn f64_relop(&mut self, at: Bin, f: impl Fn(f64, f64) -> bool) -> Result<()> {
         self.binop_at(at, |a, b| {
             Cell::from_i32(i32::from(f(a.unwrap_f64(), b.unwrap_f64())))

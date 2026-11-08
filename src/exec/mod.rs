@@ -50,10 +50,11 @@ mod table;
 pub(crate) mod trace;
 
 use crate::error::InternalError;
+use crate::func::Func;
 use crate::instance::Instance;
 use crate::module::code::Code;
 use crate::module::op::Op;
-use crate::store::Store;
+use crate::store::{Store, StoreInner};
 use crate::trap::Trap;
 use crate::value::{Val, ValType};
 use crate::Result;
@@ -114,6 +115,36 @@ pub(crate) struct Execution {
 /// allocation/reservation path (allocators respond immediately via `GcGrow`) and by the
 /// async-host-call safepoint; a non-calling, non-allocating spin adds no GC pressure.
 const GC_CHECK_INTERVAL: u32 = 1024;
+
+/// A `Store<T>` with its data type erased, for the dispatch loop (see [`Execution::run`]): the
+/// loop runs on the untyped [`StoreInner`]; a sync host call is the one thing that needs `T`.
+trait HostStore {
+    fn inner(&mut self) -> &mut StoreInner;
+    /// Runs sync host function `func` (its arguments in `exec`'s current window) loop-resident.
+    fn call_host(
+        &mut self,
+        exec: &mut Execution,
+        func: Func,
+        instance: Instance,
+        stop_depth: usize,
+    ) -> Result<()>;
+}
+
+impl<T> HostStore for Store<T> {
+    fn inner(&mut self) -> &mut StoreInner {
+        &mut self.inner
+    }
+
+    fn call_host(
+        &mut self,
+        exec: &mut Execution,
+        func: Func,
+        instance: Instance,
+        stop_depth: usize,
+    ) -> Result<()> {
+        exec.invoke_host(self, func, instance, stop_depth)
+    }
+}
 
 /// Headroom charged on top of a nested entry's measured native-stack use (see `native_charge`):
 /// the measurement is taken at entry, before the entered call pushes its own interpreter frames —
@@ -325,9 +356,20 @@ impl Execution {
 
     /// Runs frames until the stack falls back to `stop_depth` (the boundary this `run` is
     /// responsible for): `0` for a top-level call, or the parked outer depth for a host re-entry.
-    /// Generic over the store's data type so *sync host calls run loop-resident* — the callback
-    /// needs a `Caller<T>`; only async host fns still suspend out through an [`Outcome`].
+    ///
+    /// The dispatch loop behind it is *not* generic over the store's data type: it takes the store
+    /// as a [`HostStore`] trait object, needed only to run a sync host call (which wants a
+    /// `Caller<T>`) loop-resident. So the loop is compiled once, in this crate, at this crate's
+    /// opt level — not in each embedder's crate at theirs, where a mixed profile (this crate
+    /// optimized, the embedder at 0) once put the forced inlines into an unoptimized loop: ~50 KB
+    /// per host re-entry (~100 KB with the arithmetic wrappers forced too).
     fn run<T>(&mut self, store: &mut Store<T>, stop_depth: usize) -> Result<Outcome> {
+        self.run_erased(store, stop_depth)
+    }
+
+    /// [`run`](Self::run) on the type-erased store. Not `#[inline]`, and only `const`-generic, so
+    /// it and the loop are codegened here (see `run`).
+    fn run_erased(&mut self, store: &mut dyn HostStore, stop_depth: usize) -> Result<Outcome> {
         // A `return_call` to a host fn from the boundary frame pops it, then the host pushes its
         // results; re-entering here at `stop_depth` means the call finished (#39).
         if self.frames.len() == stop_depth {
@@ -340,10 +382,10 @@ impl Execution {
         // than abort the native stack (#30).
         if self.stack_bytes() >= self.stack_limit {
             let ip = self.frames.last().map_or(0, |f| f.ip);
-            return Err(self.attach_trap_backtrace(&store.inner, Trap::StackOverflow.into(), ip));
+            return Err(self.attach_trap_backtrace(store.inner(), Trap::StackOverflow.into(), ip));
         }
-        let fuel_enabled = store.inner.engine().consume_fuel();
-        let epoch_enabled = store.inner.engine().epoch_interruption();
+        let engine = store.inner().engine();
+        let (fuel_enabled, epoch_enabled) = (engine.consume_fuel(), engine.epoch_interruption());
         // Monomorphize the dispatch loop on whether a *per-op* gate is live (fuel metering /
         // epoch deadlines), so other configurations run a loop with no gate branch at all. The
         // engine-wide GC-pressure mailbox is deliberately NOT a per-op gate: it is advisory
@@ -352,43 +394,45 @@ impl Execution {
         // the fast loop. (Its predecessor armed per-op on `is_collecting()` alone, taxing every
         // default engine — see PERF-NOTES §14.)
         if fuel_enabled || epoch_enabled {
-            self.dispatch::<T, true>(store, stop_depth, (fuel_enabled, epoch_enabled))
+            self.dispatch::<true>(store, stop_depth, (fuel_enabled, epoch_enabled))
         } else {
-            self.dispatch::<T, false>(store, stop_depth, (false, false))
+            self.dispatch::<false>(store, stop_depth, (false, false))
         }
     }
 
     /// Runs the dispatch loop with the running frame's [`Code`] handle: the one stashed when the
     /// loop last suspended (re-pointed at the top frame), else looked up from its instance.
-    fn dispatch<T, const GATED: bool>(
+    fn dispatch<const GATED: bool>(
         &mut self,
-        store: &mut Store<T>,
+        store: &mut dyn HostStore,
         stop_depth: usize,
         gates: (bool, bool),
     ) -> Result<Outcome> {
         let mut code = match self.code.take() {
             Some(code) => code,
-            None => self.top_frame()?.code_in(&store.inner)?,
+            None => self.top_frame()?.code_in(store.inner())?,
         };
-        let outcome = self.dispatch_loop::<T, GATED>(store, stop_depth, gates, &mut code);
+        let outcome = self.dispatch_loop::<GATED>(store, stop_depth, gates, &mut code);
         self.code = Some(code);
         outcome
     }
 
     #[allow(clippy::too_many_lines)] // the resumable dispatch loop; arms are short
-    fn dispatch_loop<T, const GATED: bool>(
+    fn dispatch_loop<const GATED: bool>(
         &mut self,
-        store: &mut Store<T>,
+        store: &mut dyn HostStore,
         stop_depth: usize,
         gates: (bool, bool),
         code: &mut Code,
     ) -> Result<Outcome> {
+        // The loop runs on the untyped store; only a sync host call needs `store` itself, after
+        // which `inner` is re-derived.
+        let mut inner = store.inner();
         // Amortized GC-pressure safepoint: armed only when the engine-wide axis exists, and
         // anchored to guest *calls* (zero per-op cost; call sites are already heavyweight).
-        let gc_watch =
-            store.inner.gc.is_collecting() && store.inner.engine().gc_memory_threshold().is_some();
+        let gc_watch = inner.gc.is_collecting() && inner.engine().gc_memory_threshold().is_some();
         let mut gc_countdown: u32 = GC_CHECK_INTERVAL;
-        let (mut func, mut ip, mut base, mut instance) = self.top_into(&store.inner, code)?;
+        let (mut func, mut ip, mut base, mut instance) = self.top_into(inner, code)?;
         // Two-level loop: the outer level re-derives the current frame's `ops` slice whenever the
         // frame changes; the inner level then fetches each op with a single `.get` — no per-op
         // `Arc`→`Vec`→len pointer chase, and the `None` case doubles as the end-of-function return
@@ -400,22 +444,22 @@ impl Execution {
                     if self.do_return(func.n_results, stop_depth)? {
                         return Ok(Outcome::Finished);
                     }
-                    (func, ip, base, instance) = self.top_into(&store.inner, code)?;
+                    (func, ip, base, instance) = self.top_into(inner, code)?;
                     continue 'frame;
                 };
                 if GATED {
-                    if let Some(out) = self.service_gates(&mut store.inner, gates, ip)? {
+                    if let Some(out) = self.service_gates(inner, gates, ip)? {
                         return Ok(out);
                     }
                 }
-                let next = match self.step(&mut store.inner, code, op, ip + 1, base, instance) {
+                let next = match self.step(inner, code, op, ip + 1, base, instance) {
                     Ok(next) => next,
-                    Err(e) => match self.unwind(&mut store.inner, e, ip, stop_depth) {
+                    Err(e) => match self.unwind(inner, e, ip, stop_depth) {
                         Ok(()) => {
-                            (func, ip, base, instance) = self.top_into(&store.inner, code)?;
+                            (func, ip, base, instance) = self.top_into(inner, code)?;
                             continue 'frame;
                         }
-                        Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
+                        Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
                     },
                 };
                 if next < CALL_INTERNAL {
@@ -430,13 +474,13 @@ impl Execution {
                     };
                     match self.call_internal(code, instance, index, step::slot(base, s), ip + 1) {
                         Ok((f, b)) => (func, ip, base) = (f, 0, b),
-                        Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
+                        Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
                     }
                     if gc_watch {
                         gc_countdown -= 1;
                         if gc_countdown == 0 {
                             gc_countdown = GC_CHECK_INTERVAL;
-                            self.service_gc_pressure(&mut store.inner)?;
+                            self.service_gc_pressure(inner)?;
                         }
                     }
                     continue 'frame;
@@ -459,17 +503,17 @@ impl Execution {
                         // The callee's frame is known: switch to it directly (no `top_into`). A
                         // frame push past `max_wasm_stack` traps (`StackOverflow`) at this call.
                         let callee = req.callee;
-                        frame::switch_code(&store.inner, code, &callee);
+                        frame::switch_code(inner, code, &callee);
                         match self.push_call(callee.instance, callee.func_index, code, req.args_at)
                         {
                             Ok((f, b)) => (func, ip, base, instance) = (f, 0, b, callee.instance),
-                            Err(e) => return Err(self.attach_trap_backtrace(&store.inner, e, ip)),
+                            Err(e) => return Err(self.attach_trap_backtrace(inner, e, ip)),
                         }
                         if gc_watch {
                             gc_countdown -= 1;
                             if gc_countdown == 0 {
                                 gc_countdown = GC_CHECK_INTERVAL;
-                                self.service_gc_pressure(&mut store.inner)?;
+                                self.service_gc_pressure(inner)?;
                             }
                         }
                         continue 'frame;
@@ -480,16 +524,16 @@ impl Execution {
                         let dst = self.frame_base()?;
                         let callee = req.callee;
                         self.return_from(req.args_at, callee.n_params as usize, stop_depth)?;
-                        frame::switch_code(&store.inner, code, &callee);
+                        frame::switch_code(inner, code, &callee);
                         match self.push_call(callee.instance, callee.func_index, code, dst) {
                             Ok((f, b)) => (func, ip, base, instance) = (f, 0, b, callee.instance),
-                            Err(e) => return Err(self.attach_suspension_backtrace(&store.inner, e)),
+                            Err(e) => return Err(self.attach_suspension_backtrace(inner, e)),
                         }
                         if gc_watch {
                             gc_countdown -= 1;
                             if gc_countdown == 0 {
                                 gc_countdown = GC_CHECK_INTERVAL;
-                                self.service_gc_pressure(&mut store.inner)?;
+                                self.service_gc_pressure(inner)?;
                             }
                         }
                         continue 'frame;
@@ -505,11 +549,12 @@ impl Execution {
                         let dst = self.frame_base()?;
                         self.return_from(args_at, n_params, stop_depth)?;
                         self.enter_window(dst.saturating_add(n_params))?;
-                        self.invoke_host(store, host_fn, host_inst, stop_depth)?;
+                        store.call_host(self, host_fn, host_inst, stop_depth)?;
+                        inner = store.inner();
                         if self.frames.len() == stop_depth {
                             return Ok(Outcome::Finished);
                         }
-                        (func, ip, base, instance) = self.top_into(&store.inner, code)?;
+                        (func, ip, base, instance) = self.top_into(inner, code)?;
                         continue 'frame;
                     }
                     #[cfg(feature = "async")]
@@ -540,11 +585,12 @@ impl Execution {
                             .ok_or(InternalError::FrameStack("missing caller frame"))?
                             .ip = return_ip;
                         self.enter_window(top)?; // the host pops its args from here
-                        self.invoke_host(store, host_fn, host_inst, stop_depth)?;
+                        store.call_host(self, host_fn, host_inst, stop_depth)?;
+                        inner = store.inner();
                         if self.frames.len() == stop_depth {
                             return Ok(Outcome::Finished);
                         }
-                        (func, ip, base, instance) = self.top_into(&store.inner, code)?;
+                        (func, ip, base, instance) = self.top_into(inner, code)?;
                         continue 'frame;
                     }
                     #[cfg(feature = "async")]

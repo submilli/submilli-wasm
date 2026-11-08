@@ -177,6 +177,8 @@ impl Execution {
 
     /// Bounds-checks the `N`-byte access whose address operand is at slot `at`, on an
     /// already-resolved memory (one handle lookup per load/store).
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
     fn mem_ea<const N: usize>(
         &self,
         entity: &crate::store::MemoryEntity,
@@ -195,7 +197,9 @@ impl Execution {
     /// The arena index of `instance`'s memory `memory`. Memory 0 of the instance used last comes
     /// from the cache (`Execution::mem0`); anything else resolves through the instance (its handle
     /// checked), refreshing the cache when it is a memory 0.
-    #[inline]
+    #[allow(clippy::inline_always)] // opt-level 2/3 (build.rs)
+    #[cfg_attr(submilli_inline_hot, inline(always))]
+    #[cfg_attr(not(submilli_inline_hot), inline)]
     fn memory_index(&mut self, inner: &StoreInner, instance: Instance, memory: u32) -> Result<u32> {
         if memory == 0 && self.mem0.0 == instance.index {
             return Ok(self.mem0.1);

@@ -7,9 +7,9 @@
 //!   inlines grow the dispatch frame — live under every host re-entry, so charged against
 //!   `max_wasm_stack` per re-entry. (`s`/`z` would be fine; they're left out to keep code small.)
 //!
-//! Caveat: the dispatch loop is generic over the store's data type, so it is compiled in the
-//! embedder's crate at *its* opt level; a mixed profile (this crate optimized, the embedder at 0)
-//! still inlines into an unoptimized loop. See PERF-NOTES §25.
+//! Both describe the dispatch loop, which is not generic over the store's data type (see
+//! `exec::Execution::run`): it is compiled in this crate, at the opt level these cfgs see
+//! (barring cross-crate LTO, which re-optimizes it at link time).
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(submilli_unoptimized)");
     println!("cargo::rustc-check-cfg=cfg(submilli_inline_hot)");
