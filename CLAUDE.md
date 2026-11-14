@@ -55,3 +55,7 @@ path as adversarial. See `SECURITY.md` (threat model).
 
 ## Workflow
 Pinned reference: `wasmtime` 45.x (dev-dependency for compatibility/differential tests).
+
+## Reuse over duplication
+
+Reuse over duplication, always. Before creating anything (code, packages, secrets, docs, tickets, PRs, configs, agents), check what already exists and reuse or extend it. Create something new only when nothing usable exists, and say what you checked.
