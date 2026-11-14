@@ -133,8 +133,7 @@ fn file_path(
     let name = attr_str(dwarf, unit, file.path_name());
     let dir = file
         .directory(header)
-        .map(|d| attr_str(dwarf, unit, d))
-        .unwrap_or_default();
+        .map_or_default(|d| attr_str(dwarf, unit, d));
     match (dir.is_empty(), name.is_empty()) {
         (_, true) => "<unknown>".to_string(),
         (true, false) => name,
