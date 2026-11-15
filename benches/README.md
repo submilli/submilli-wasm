@@ -38,7 +38,8 @@ execution for that reason and covers only the fast startup phases.
 ## Sample output
 
 Numbers are from one dev machine (Apple Silicon); treat them as ratios, not
-absolutes. Lower = faster, except the CoreMark score (higher = faster).
+absolutes. CoreMark is load-sensitive. Lower = faster, except the CoreMark
+score (higher = faster).
 
 ```
 phase                          submilli   wasmtime      wasmi
@@ -62,67 +63,22 @@ Host calls   async x100k        9.55 ms    2.44 ms        n/a
 CoreMark score (higher=fast)       1885      37833       3083
 ```
 
-The story: submilli's `Module::new`/cold-start beats wasmtime **~5–16×** (it
-skips the Cranelift JIT), while wasmtime wins execution **~59×** — exactly the
-trade this project makes on purpose. Note wasmtime here runs Cranelift with
-**optimization disabled** (`OptLevel::None`, see below), yet its `Module::new`
-barely moves versus the optimized build — the JIT's compile cost dominates
-regardless of opt level, which is the whole point. Against wasmi — the other
-non-JIT, forced to **eager compilation** so its compile column measures the
-same work (see below) — submilli compiles **~2× faster at every module size**
-(coremark 50 vs 98 µs, spidermonkey 24 vs 53 ms) and wins the small-module
-cold start (51 vs 100 µs), while wasmi executes ~4.2× faster. The compile lead
-comes from fusing validation into lowering, writing every op once straight
-into module-wide arenas, and a compact 16-byte non-drop `Op`; the execution
-gap (was ~17×) shrank ~3.5× across the interpreter-loop optimization passes —
-see `PERF-NOTES.md` (§12–13).
+In this sample, submilli compiles each module and cold-starts CoreMark faster
+than the other two engines. Wasmtime has the highest CoreMark score, followed
+by wasmi. Wasmtime uses `OptLevel::None` and wasmi uses eager compilation, as
+described in the methodology.
 
-The **run-once rows** are the project's target use case measured end to end:
-one window covering empty linker + `Module::new` + fresh `Store` + instantiate
-+ execution, on a generated ~70 KiB, ~1200-function module whose `run` executes
-essentially *all* of its code (see below — generated code is written to be
-used, so a run-once engine doesn't get to skip translating it), with three
-sieve sizes spanning the execution-weight curve. They locate the crossovers
-honestly. While execution is light, **submilli wins the total** — 469 µs vs
-wasmi's 837 µs (its ~740 µs eager compile dominates) and wasmtime's 5.7 ms
-(the JIT's compile bill) — and at sieve(10k) the totals are now a dead tie
-(919 vs 920 µs). Only past that does the ~4.2× interpreter gap hand wasmi the
-total (57 ms vs 11 ms at sieve(1M); wasmtime flattens at ~6–7 ms regardless).
-The interpreter passes in `PERF-NOTES.md` §12 cut these totals ~4×
-(sieve(1M) 236 → 57 ms); pushing the crossover further out is the
-tail-call-dispatch class of work.
+The **run-once rows** measure the complete pipeline for a generated module
+that executes its code once. Submilli has the lowest total at sieve(1k) and
+sieve(10k). Wasmtime has the lowest total at sieve(1M).
 
-The **host-call row** measures the guest→host→guest boundary — 100k
-data-dependent calls to a trivial imported function, execution only. For
-IO-heavy orchestration guests (the product workload: thin glue around host
-stdlib calls) this, not compute throughput, is the runtime number that
-matters. Three optimization passes (cache each host fn's signature at
-registration; reuse arg/result buffers so the boundary is allocation-free in
-steady state; a direct scalar codec; swap-based execution parking; and
-finally *loop-resident* sync host calls — the dispatch loop invokes the
-callback directly instead of suspending out through an `Outcome`) took
-submilli from 189 → ~35 ns/call, ~3× from wasmi (~12 ns) with
-panic-containment still on every crossing. The **async row** (awaited calls
-to an immediately-ready host future — the machinery under the product's real
-IO path) got the same treatment plus its own pass: 200 → ~73 ns/call, ~2.7×
-from wasmtime (~27 ns; wasmi has no async host functions — its answer is
-resumable calls, so its cell is n/a). An async call's extra ~38 ns over sync
-is the `Outcome` suspend to the driver's await point (structurally required —
-a sync loop can't await) plus the per-call `Box<dyn Future>` both engines'
-APIs mandate.
+The **host-call rows** measure 100,000 guest-to-host-to-guest calls to a trivial
+function. The async row awaits an immediately-ready future. Wasmi has no async
+host functions, so its cell is n/a. The timings exclude work by a host service.
 
-The **Module RAM rows** are the density axis: heap bytes a compiled module
-keeps resident, which bounds how many tenants fit on a host. Both non-JIT
-engines run with debug/name retention **off** (see below) so the rows compare
-pure compiled-code density, and the story is uniform: **wasmi is ~2× denser
-at every size** (coremark 66 vs 30 KiB, pulldown 1.5 MiB vs 841 KiB,
-spidermonkey 31.0 vs 16.5 MiB) — its variable-length byte IR averages ~9
-bytes/op against submilli's fixed 16-byte `Op`. Recent work already cut
-submilli's footprint sharply (24→16-byte ops, then module-wide arenas: peak
-compile RSS 162 → 44.5 MB, `PERF-NOTES.md` §13); closing the remaining ~2× is
-the 8–12-byte encoding rung (pool the wide constants, wasmi-style). The
-starred wasmtime cells are floor values — its JIT code lives in mmap'd
-executable regions the heap counter cannot see.
+The **Module RAM rows** measure heap retained by compiled modules. Wasmi uses
+less retained heap than submilli in each displayed row. Wasmtime's starred
+cells count metadata only. The heap counter excludes memory mapped for JIT code.
 
 ## Methodology & fairness
 
@@ -130,24 +86,13 @@ executable regions the heap counter cannot see.
   shared object (config + compiled-code cache); it's built once and reused, so
   it's excluded from every timed phase — matching how embedders actually use it.
 - **wasmtime runs Cranelift with optimization disabled** (`OptLevel::None`, set
-  in `support.rs`). Since optimization is exactly the compile-time cost this
-  project skips, disabling it is the *fairest* floor for a startup comparison —
-  yet wasmtime's `Module::new` barely changes from the optimized default (the
-  register allocation / lowering / encoding that dominate a JIT run at every opt
-  level), so it stays ~5–16× slower to start. wasmtime 45 also ships a baseline
-  compiler (Winch) and an interpreter (Pulley) that trade compile time for
-  execution speed; we don't use them, to keep the default `Engine` honest.
+  in `support.rs`). The benchmark does not use wasmtime 45's Winch baseline
+  compiler or Pulley interpreter.
 - **wasmi runs with eager compilation** (`CompilationMode::Eager`, set in
-  `support.rs`). wasmi's *default* is `LazyTranslation`: `Module::new` only
-  validates, deferring each function's translation to its first call — a
-  validate-only number that would sit next to the other engines' full compiles.
-  Forcing eager makes every `Module::new` cell measure the same work (the same
-  fairness reasoning as the wasmtime opt-level choice, applied in the opposite
-  direction). The deferred cost is real, not noise: wasmi-lazy handles
-  spidermonkey in ~18 ms vs ~52 ms eager — the difference is simply paid later,
-  at first-call time. In the run-once rows eager is also the *representative*
-  mode, not just the fair one: the fixture executes all of its code, so lazy
-  translation would do the same total work inside the same timed window.
+  `support.rs`). Its default `LazyTranslation` defers function translation
+  until first call. Eager compilation includes translation in `Module::new`.
+  The run-once fixture executes all its code, so lazy translation would perform
+  that work inside the timed window.
 - **The run-once fixture is generated, not fetched** (`run_once_wasm()` in
   `support.rs`, assembled from WAT in setup, never in a timed window). Shape:
   ~1200 distinct small helper functions in call chains of 100 (capped to stay
@@ -163,8 +108,9 @@ executable regions the heap counter cannot see.
   (`pulldown-cmark` 1.6 MiB, `spidermonkey` 4.0 MiB). The small-module cold start
   is where a fast-startup interpreter looks best; showing both avoids
   cherry-picking.
-- **Best-of-N** for startup phases (resists upward scheduler noise); **criterion**
-  for the statistically-rigorous, regression-tracking numbers.
+- **Best-of-N** for startup, run-once, and host-call timings (resists upward
+  scheduler noise). Each invocation runs CoreMark once per engine. **criterion**
+  provides statistical measurements for startup regression tracking.
 - **Debug/name retention is off on both non-JIT engines.** submilli runs
   `wasm_backtrace(false)` (drops its per-op backtrace offset table + `name`
   section — the wasmtime-compatible default keeps them, costing ~+20% module
