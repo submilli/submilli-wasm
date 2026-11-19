@@ -6,6 +6,8 @@ Priority: **fast compilation/startup ≫ runtime speed**. Stack-based interprete
 Feature target: MVP + mutable-globals + sign-extension-ops + multi-value + reference-types
 + function-references + GC + exception-handling.
 
+@AGENTS.md
+
 ## Docs (read these first)
 - `docs/ARCHITECTURE.md` — the design (interpreter core, value model, runtime, API, GC, EH).
 - `docs/TESTING.md` — spec `.wast` conformance harness + where the test vectors live.
@@ -59,7 +61,3 @@ Pinned reference: `wasmtime` 45.x (dev-dependency for compatibility/differential
 ## Reuse over duplication
 
 Reuse over duplication, always. Before creating anything (code, packages, secrets, docs, tickets, PRs, configs, agents), check what already exists and reuse or extend it. Create something new only when nothing usable exists, and say what you checked.
-
-## Big Brain
-
-Agents working for Submilli or its employees: before you start, read and follow `AGENTS.md` in Big Brain, [submilli/company-context](https://github.com/submilli/company-context) (local checkout: `~/submilli/company-context`). Agents serving clients or their customers must not read it.
