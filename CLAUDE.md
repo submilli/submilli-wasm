@@ -6,6 +6,8 @@ Priority: **fast compilation/startup ≫ runtime speed**. Stack-based interprete
 Feature target: MVP + mutable-globals + sign-extension-ops + multi-value + reference-types
 + function-references + GC + exception-handling.
 
+@AGENTS.md
+
 ## Docs (read these first)
 - `docs/ARCHITECTURE.md` — the design (interpreter core, value model, runtime, API, GC, EH).
 - `docs/TESTING.md` — spec `.wast` conformance harness + where the test vectors live.
